@@ -49,11 +49,16 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
     {
         var storage = StorageProvider;
-        var file = await storage.OpenFilePickerAsync(new FilePickerOpenOptions
+        var filepickerOptions = new FilePickerOpenOptions
         {
             Title = "Open Heightmap File",
-            AllowMultiple = false
-        });
+            AllowMultiple = false,
+            FileTypeFilter = new []{ 
+                new FilePickerFileType("BMS NT HeightMap") { Patterns = new[] { "HeightMap.raw" } }
+            }
+        };
+        
+        var file = await storage.OpenFilePickerAsync(filepickerOptions);
 
         if (file.Count > 0)
         {
