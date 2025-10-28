@@ -187,6 +187,11 @@ namespace BMSAudioSim
         {
             AudioParams ap = new AudioParams();
 
+            // -- Earth curvature --
+            const double earthRadius = 6371000.0; // meters
+            const double refractivityK = 4.0 / 3.0; // standard effective earth radius factor
+            double R_eff = earthRadius * refractivityK;
+
             // --- Basic geometry ---
             double dx = rxX - txX, dy = rxY - txY;
             double dist = Math.Sqrt(dx * dx + dy * dy);
@@ -215,10 +220,19 @@ namespace BMSAudioSim
 
             foreach (var pt in profile)
             {
-                if (pt.elev < 0.0) oceanFrac += 1.0;
+                // pt.dist = distance from TX to sample (meters)
+                // Compute curvature bulge (meters) at this sample relative to straight chord
+                // bulge = x * (D - x) / (2 * R_eff)
+                double bulge = (pt.dist * (dist - pt.dist)) / (2.0 * R_eff);
 
+                // effective ground elevation includes curvature bulge
+                double effectiveGround = pt.elev + bulge;
+
+                // LOS line between antenna tops (straight line)
                 double zLine = txTop + (pt.dist / dist) * (rxTop - txTop);
-                double excess = pt.elev - zLine;
+
+                // compare effective ground to LOS
+                double excess = effectiveGround - zLine;
                 if (excess > worstExcess)
                 {
                     worstExcess = excess;
@@ -258,18 +272,43 @@ namespace BMSAudioSim
 // Only proceed if path is mostly over water (oceanFrac computed earlier)
             if (oceanFrac > 0.2)
             {
-                // basic geometry for reflected path
-                double dx1 = txX - specX, dy1 = txY - specY, dz1 = (txTop - specElev);
-                double L1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1);
-                double dx2 = rxX - specX, dy2 = rxY - specY, dz2 = (rxTop - specElev);
-                double L2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
-                double Lr = L1 + L2;
-                double Ld = dist; // approximate direct path
-                double delta = Lr - Ld;
-                double phi = 2.0 * Math.PI * delta / lambda;
+                // --------------------------------------------------------------------
+                // Two-ray model with Earth curvature and standard refraction
+                // --------------------------------------------------------------------
+                const double Re = 6371000.0; // mean Earth radius (m)
+                const double kRef = 4.0 / 3.0; // effective refraction factor
+                double Reff = Re * kRef;
 
-                // incidence cosine approx (avoid divide-by-zero)
-                double cosInc = Math.Abs(dz1 / Math.Max(1e-6, L1));
+                // Compute central angle between antennas (surface arc)
+                double theta = dist / Reff; // radians
+
+                // Direct (chord) path length between antenna tops
+                double Ld = Math.Sqrt(
+                    (Reff + txTop) * (Reff + txTop) +
+                    (Reff + rxTop) * (Reff + rxTop) -
+                    2.0 * (Reff + txTop) * (Reff + rxTop) * Math.Cos(theta)
+                );
+
+                // Approximate specular reflection at midpoint on curved Earth
+                double phi = theta / 2.0;
+
+                double L1 = Math.Sqrt(
+                    (Reff + txTop) * (Reff + txTop) + Reff * Reff -
+                    2.0 * (Reff + txTop) * Reff * Math.Cos(phi)
+                );
+
+                double L2 = Math.Sqrt(
+                    (Reff + rxTop) * (Reff + rxTop) + Reff * Reff -
+                    2.0 * (Reff + rxTop) * Reff * Math.Cos(theta - phi)
+                );
+
+                double Lr = L1 + L2; // reflected total path
+                double delta = Lr - Ld; // path length difference
+                double phiRad = 2.0 * Math.PI * delta / lambda; // phase shift
+
+                // incidence cosine at TX (approx)
+                double cosInc = Math.Abs((Reff + txTop - Reff * Math.Cos(phi)) / Math.Max(1e-6, L1));
+
 
                 // simple sea sigma (we don't have wind/roughness data)
                 double sigmaSea = sigmaSeaDefault;
@@ -290,16 +329,12 @@ namespace BMSAudioSim
                 double ReffMag = seaR0 * debAmp * altSoft * distSoft * oceanScale;
                 double R = -ReffMag; // negative for typical phase inversion at grazing (tunable)
 
-                // coherent sum: direct (1) + reflected R*e^{j phi}
-                double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phi));
+                double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
 
-                // dB adjustment: positive = constructive; negative = destructive
                 double twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
-
-                // apply small clamp so we don't get ridiculous gains
                 twoRayDb = Math.Clamp(twoRayDb, -20.0, 6.0);
 
-                // reduce pathLossDb by the coherent gain (i.e., increase received power)
+                // Adjust total path loss
                 pathLossDb -= twoRayDb;
             }
 

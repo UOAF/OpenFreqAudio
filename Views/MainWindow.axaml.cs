@@ -383,7 +383,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             txH: ViewModel.TXAltitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y), 
-            ViewModel.RXAltitude, ViewModel.TxDbm, ViewModel.RxDbm, ViewModel.FrequencyMhz * 10e6);
+            ViewModel.RXAltitude, ViewModel.TxDbm, ViewModel.RxDbm, ViewModel.FrequencyMhz * 10e5);
 
         if (audioParams == null) throw new Exception("audioParams is null"); 
         if (audioParams.TerrainProfile == null) throw new Exception("terrainProfile is null");
