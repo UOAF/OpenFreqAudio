@@ -359,12 +359,21 @@ namespace BMSAudioSim
             double noise = Math.Clamp((30.0 - snrDb) / 50.0, 0.0, 1.0);
             ap.NoiseLevel = (float)noise;
 
-            double dropout = 0.0;
-            if (snrDb < 10.0)
-                dropout = Math.Clamp(Math.Exp(-(snrDb - 5.0) / 3.0), 0.0, 1.0);
+            // --- Dropout probability mapping tuned for FM voice realism ---
+            double dropout;
+
+            // Logistic curve centered lower (~5 dB) and shallower slope (~3 dB)
+            dropout = 1.0 / (1.0 + Math.Exp((snrDb - 5.0) / 3.0));
+
+            // Slightly soften the curve to keep comms intelligible down to ~3 dB
+            dropout = Math.Pow(dropout, 1.8);
+
+            // Add diffraction penalty if significant terrain obstruction exists
             if (worstExcess > 50.0)
-                dropout = Math.Min(1.0, dropout + 0.4);
-            ap.DropoutProb = (float)dropout;
+                dropout = Math.Min(1.0, dropout + 0.25);
+
+            // Clamp final result
+            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.0);
 
             double flutter = Math.Min(1.0, Math.Abs(diffLoss) / 25.0);
             ap.FlutterDepth = (float)flutter;
