@@ -67,6 +67,7 @@ namespace BMSAudioSim
     // ================================================================
     public class FastPathAudioSim
     {
+        private const double EarthRadius = 6378000.0;
         private readonly DEMReader dem;
         private readonly double originX, originY, cellSizeMeters;
         private readonly int maxSamplesPerPath = 4096;
@@ -188,9 +189,9 @@ namespace BMSAudioSim
             AudioParams ap = new AudioParams();
 
             // -- Earth curvature --
-            const double earthRadius = 6371000.0; // meters
-            const double refractivityK = 4.0 / 3.0; // standard effective earth radius factor
-            double R_eff = earthRadius * refractivityK;
+            double refractivityK = CalculateKAvg(txH, rxH);
+            double R_eff = EarthRadius * refractivityK;
+            Console.Out.WriteLine($"refractivityK = {refractivityK}");
 
             // --- Basic geometry ---
             double dx = rxX - txX, dy = rxY - txY;
@@ -264,42 +265,39 @@ namespace BMSAudioSim
             const double Dscale = 200000.0; // distance softening scale (meters) - larger => slower softening
             const double sigmaSeaDefault = 0.05; // default sea rms (m) when no data (calm sea)
 
-// --- Cheap specular point: midpoint approximation ---
+            // --- Cheap specular point: midpoint approximation ---
             double specX = 0.5 * (txX + rxX);
             double specY = 0.5 * (txY + rxY);
             double specElev = SampleElevation(specX, specY);
 
-// Only proceed if path is mostly over water (oceanFrac computed earlier)
+            // Only proceed if path is mostly over water (oceanFrac computed earlier)
             if (oceanFrac > 0.2)
             {
                 // --------------------------------------------------------------------
                 // Two-ray model with Earth curvature and standard refraction
                 // --------------------------------------------------------------------
-                const double Re = 6371000.0; // mean Earth radius (m)
-                const double kRef = 4.0 / 3.0; // effective refraction factor
-                double Reff = Re * kRef;
 
                 // Compute central angle between antennas (surface arc)
-                double theta = dist / Reff; // radians
+                double theta = dist / R_eff; // radians
 
                 // Direct (chord) path length between antenna tops
                 double Ld = Math.Sqrt(
-                    (Reff + txTop) * (Reff + txTop) +
-                    (Reff + rxTop) * (Reff + rxTop) -
-                    2.0 * (Reff + txTop) * (Reff + rxTop) * Math.Cos(theta)
+                    (R_eff + txTop) * (R_eff + txTop) +
+                    (R_eff + rxTop) * (R_eff + rxTop) -
+                    2.0 * (R_eff + txTop) * (R_eff + rxTop) * Math.Cos(theta)
                 );
 
                 // Approximate specular reflection at midpoint on curved Earth
                 double phi = theta / 2.0;
 
                 double L1 = Math.Sqrt(
-                    (Reff + txTop) * (Reff + txTop) + Reff * Reff -
-                    2.0 * (Reff + txTop) * Reff * Math.Cos(phi)
+                    (R_eff + txTop) * (R_eff + txTop) + R_eff * R_eff -
+                    2.0 * (R_eff + txTop) * R_eff * Math.Cos(phi)
                 );
 
                 double L2 = Math.Sqrt(
-                    (Reff + rxTop) * (Reff + rxTop) + Reff * Reff -
-                    2.0 * (Reff + rxTop) * Reff * Math.Cos(theta - phi)
+                    (R_eff + rxTop) * (R_eff + rxTop) + R_eff * R_eff -
+                    2.0 * (R_eff + rxTop) * R_eff * Math.Cos(theta - phi)
                 );
 
                 double Lr = L1 + L2; // reflected total path
@@ -307,8 +305,7 @@ namespace BMSAudioSim
                 double phiRad = 2.0 * Math.PI * delta / lambda; // phase shift
 
                 // incidence cosine at TX (approx)
-                double cosInc = Math.Abs((Reff + txTop - Reff * Math.Cos(phi)) / Math.Max(1e-6, L1));
-
+                double cosInc = Math.Abs((R_eff + txTop - R_eff * Math.Cos(phi)) / Math.Max(1e-6, L1));
 
                 // simple sea sigma (we don't have wind/roughness data)
                 double sigmaSea = sigmaSeaDefault;
@@ -381,5 +378,33 @@ namespace BMSAudioSim
             ap.TerrainProfile = profile;
             return ap;
         }
+        
+        public static double CalculateKAvg(double senderAltitude, double receiverAltitude)
+        {
+            // calculates k_avg according to SAND2012-10690, section 3.2.3
+            // Constants
+            // senderAltitude = h_a, receiverAltitude = h_s
+            // earthRadius = R_e
+
+            if (senderAltitude < 0) senderAltitude = 0;
+            if (receiverAltitude < 0) receiverAltitude = 0;
+            if (senderAltitude - receiverAltitude == 0) return 1;
+
+            const double N_s = 324.8; // Average global surface refractivity according to Altshuler
+            const double psi_g = 0; // neglible according to 3.2
+            
+            // Calculate H_b according to (24)
+            const double h_b = 12192; // breakpoint altitude in meters - 40k ft
+            const double N_b = 66.65; // breakpoint refractivity
+            double H_b = (h_b - receiverAltitude) / Math.Log(N_s / N_b);
+            
+            double term1 = (1e-6 * N_s * Math.Cos(psi_g) * EarthRadius) / H_b;
+            double term2 = (senderAltitude - receiverAltitude) / H_b;
+            double term3 = Math.Pow(Math.E, (senderAltitude - receiverAltitude) / H_b) - 1;
+            double kAvg = 1 / (1 - term1 * (term2 / term3));
+
+            return kAvg;
+        }
+
     }
 }
