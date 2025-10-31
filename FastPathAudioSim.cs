@@ -191,7 +191,6 @@ namespace BMSAudioSim
             // -- Earth curvature --
             double refractivityK = CalculateKAvg(txH, rxH);
             double R_eff = EarthRadius * refractivityK;
-            Console.Out.WriteLine($"refractivityK = {refractivityK}");
 
             // --- Basic geometry ---
             double dx = rxX - txX, dy = rxY - txY;
