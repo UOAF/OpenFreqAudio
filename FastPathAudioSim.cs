@@ -269,6 +269,7 @@ namespace BMSAudioSim
             double specY = 0.5 * (txY + rxY);
             double specElev = SampleElevation(specX, specY);
 
+            double twoRayDb = 0;
             // Only proceed if path is mostly over water (oceanFrac computed earlier)
             if (oceanFrac > 0.2)
             {
@@ -327,7 +328,7 @@ namespace BMSAudioSim
 
                 double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
 
-                double twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
+                twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
                 twoRayDb = Math.Clamp(twoRayDb, -20.0, 6.0);
 
                 // Adjust total path loss
@@ -344,40 +345,97 @@ namespace BMSAudioSim
             // --- Received power and SNR ---
             double prDbm = txPowerDbm - pathLossDb;
             double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
-
+            
             // === Audio mappings ===
             double gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
             ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
 
-            double cutoff = 300.0 * Math.Pow(2.0, (snrDb + 20.0) / 10.0);
-            ap.LowpassHz = (float)Math.Clamp(cutoff, 300.0, 8000.0);
+            double cutoff;
+            if (snrDb < 5.0)
+            {
+                // Very poor signal: narrow bandwidth (500-2000 Hz)
+                cutoff = 500.0 + (snrDb + 20.0) * 60.0; // -20 dB → 500 Hz, 5 dB → 2000 Hz
+            }
+            else if (snrDb < 15.0)
+            {
+                // Marginal signal: ramp up to nominal (2000-3000 Hz)
+                cutoff = 2000.0 + (snrDb - 5.0) * 100.0;
+            }
+            else
+            {
+                // Good signal: fixed nominal bandwidth
+                cutoff = 3000.0;
+            }
 
-            double noise = Math.Clamp((30.0 - snrDb) / 50.0, 0.0, 1.0);
+            ap.LowpassHz = (float)Math.Clamp(cutoff, 500.0, 3500.0);
+
+            double noise = Math.Clamp((30.0 - snrDb) / 50.0, 0.02, 1.0);
             ap.NoiseLevel = (float)noise;
 
-            // --- Dropout probability mapping tuned for FM voice realism ---
             double dropout;
+            const double fmThreshold = 10.0; // typical FM capture threshold
+            const double transitionWidth = 5.0; // dB
 
-            // Logistic curve centered lower (~5 dB) and shallower slope (~3 dB)
-            dropout = 1.0 / (1.0 + Math.Exp((snrDb - 5.0) / 3.0));
+            if (snrDb > fmThreshold + transitionWidth)
+            {
+                // Clean signal: no dropouts
+                dropout = 0.0;
+            }
+            else if (snrDb < fmThreshold - transitionWidth)
+            {
+                // Poor signal: heavy dropouts (but not 100%)
+                dropout = 0.5 + 0.3 * (1.0 - (snrDb + 20.0) / 15.0);
+                dropout = Math.Clamp(dropout, 0.5, 0.85);
+            }
+            else
+            {
+                // Transition region: sigmoid curve
+                double normalized = (snrDb - fmThreshold) / transitionWidth;
+                dropout = 0.4 * (1.0 - Math.Tanh(normalized * 2.0));
+            }
 
-            // Slightly soften the curve to keep comms intelligible down to ~3 dB
-            dropout = Math.Pow(dropout, 1.8);
-
-            // Add diffraction penalty if significant terrain obstruction exists
+            // Terrain obstruction penalty (scaled with severity)
             if (worstExcess > 50.0)
-                dropout = Math.Min(1.0, dropout + 0.25);
+            {
+                double terrainFactor = Math.Min(1.0, (worstExcess - 50.0) / 150.0); // 0 to 1 for 50-200m
+                dropout = Math.Min(0.9, dropout + 0.15 * terrainFactor);
+            }
 
-            // Clamp final result
-            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.0);
+            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 0.9);
 
-            double flutter = Math.Min(1.0, Math.Abs(diffLoss) / 25.0);
-            ap.FlutterDepth = (float)flutter;
+            double flutterMultipath = 0.0;
+            double flutterAtmo = 0.0;
+
+            // Multipath from terrain diffraction
+            if (diffLoss > 5.0)
+            {
+                flutterMultipath = Math.Min(0.25, Math.Abs(diffLoss) / 60.0);
+            }
+
+            // Two-ray multipath over water
+            if (oceanFrac > 0.3 && Math.Abs(twoRayDb) > 3.0)
+            {
+                flutterMultipath = Math.Max(flutterMultipath, 0.3);
+            }
+
+            // Distance-based atmospheric effects (tropospheric scattering, refraction)
+            double distKm = dist / 1000.0;
+            if (distKm > 100.0)
+            {
+                flutterAtmo = Math.Min(0.2, (distKm - 100.0) / 400.0); // Increases 100-500 km
+            }
+
+            // Baseline flutter (oscillator instability, vibration)
+            const double baseFlutter = 0.05;
+
+            // Combine all sources
+            double flutter = baseFlutter + flutterMultipath + flutterAtmo;
+            ap.FlutterDepth = (float)Math.Clamp(flutter, 0.0, 1.0);
 
             ap.TerrainProfile = profile;
             return ap;
         }
-        
+
         public static double CalculateKAvg(double senderAltitude, double receiverAltitude)
         {
             // calculates k_avg according to SAND2012-10690, section 3.2.3
@@ -391,12 +449,12 @@ namespace BMSAudioSim
 
             const double N_s = 324.8; // Average global surface refractivity according to Altshuler
             const double psi_g = 0; // neglible according to 3.2
-            
+
             // Calculate H_b according to (24)
             const double h_b = 12192; // breakpoint altitude in meters - 40k ft
             const double N_b = 66.65; // breakpoint refractivity
             double H_b = (h_b - receiverAltitude) / Math.Log(N_s / N_b);
-            
+
             double term1 = (1e-6 * N_s * Math.Cos(psi_g) * EarthRadius) / H_b;
             double term2 = (senderAltitude - receiverAltitude) / H_b;
             double term3 = Math.Pow(Math.E, (senderAltitude - receiverAltitude) / H_b) - 1;
@@ -404,6 +462,5 @@ namespace BMSAudioSim
 
             return kAvg;
         }
-
     }
 }
