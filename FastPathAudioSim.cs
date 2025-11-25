@@ -17,6 +17,7 @@ namespace BMSAudioSim
         public float NoiseLevel; // 0..1 (amount of added noise)
         public float DropoutProb; // 0..1 (chance of packet drop / glitch)
         public float FlutterDepth; // 0..1 amplitude flutter depth
+        public float RadioFrequencyMHz; // we need this for the heterodyne frequency
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
@@ -187,6 +188,7 @@ namespace BMSAudioSim
             double txPowerDbm, double receiverSensitivityDbm, double freqHz)
         {
             AudioParams ap = new AudioParams();
+            ap.RadioFrequencyMHz = (float) freqHz * 1_000_000;
 
             // -- Earth curvature --
             double refractivityK = CalculateKAvg(txH, rxH);

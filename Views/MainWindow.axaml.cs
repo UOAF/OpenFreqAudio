@@ -398,12 +398,13 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             
         if (!_audioPlaying)
         {
-            RadioPlayback.Start("countdown.wav", audioParams);
+            RadioPlayback.Start("countdown.wav", "audio2.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
+            //RadioPlayback.Start("silence.ogg", "silence.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
             _audioPlaying = true;
         }
         else
         {
-            RadioPlayback.UpdateParams(audioParams);
+            RadioPlayback.UpdateParams(audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
         }
     }
 
@@ -525,7 +526,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         UpdateMarkers();
     }
-
+    
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
@@ -536,8 +537,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         else // VHF
         {
             ViewModel.FrequencyMhz = 513.75;
-
         }
+
+        ViewModel.SteppedEnabled = Stepped.IsChecked is true;
         UpdateParameters();
     }
 }
