@@ -130,6 +130,19 @@
                         </Slider>
                         <TextBlock Text="Interfering Signal" VerticalAlignment="Center" />
                     </StackPanel>
+                    
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <TextBlock Text="Signal 1 Playback" VerticalAlignment="Center" Width="120"/>
+                        <RadioButton GroupName="Signal1Playback" Content="Continuous" IsChecked="{Binding Signal1Continuous}"/>
+                        <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
+                        <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="5" IsEnabled="{Binding SteppedEnabled}">
+                        <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
+                        <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
+                        <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
+                        <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                    </StackPanel>
                 </StackPanel>
             </StackPanel>
             <StackPanel Grid.Column="1" Margin="5">

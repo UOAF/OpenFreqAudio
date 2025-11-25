@@ -1,441 +1,668 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
-using BMSAudioSim.Models;
+using System.Threading;
+using System.Threading.Tasks;
 using ManagedBass;
 
 namespace BMSAudioSim;
 
-public static class RadioPlayback
+/// <summary>
+/// Manages multiple concurrent radio transmissions across multiple frequencies
+/// with automatic stepped-on interference per frequency and multi-frequency listening
+/// </summary>
+public class RadioPlayback
 {
-    private static RadioEffect? _radioEffect1;
-    private static RadioEffect? _radioEffect2;
-    private static RadioPreFilter? _radioPreFilter1;
-    private static RadioPreFilter? _radioPreFilter2;
-
-    private static float[]? _dspScratch = new float[8192];
-    private static float[]? _buffer1 = new float[8192];
-    private static float[]? _buffer2 = new float[8192];
-
-    private static DSPProcedure? _dspProc;
-    private static int _stream1;
-    private static int _stream2;
-
-    private static readonly object _lock = new object();
-    private static bool _steppedEnabled = false;
-    private static int _steppedDiffDbm = 0;
-
-    // Heterodyne and mixing state
-    private static double _heterodynePhase = 0;
-    private static double _switchPhase = 0;
-    private static double _warblePhase = 0;
-    private static float _currentHeterodyneFreq = 0;
-    private static float _heterodyneDriftTarget = 0;
-    private static float _heterodyneDrift = 0;
-    private static int _heterodyneDropoutSamplesRemaining = 0;
-    private static float _heterodyneDropoutFade = 1.0f;
-    private static float _lastRadioFrequencyMHz = 0;
-    private static Random _rng = new Random();
-
-    private static AudioParams _currentParams;
-
-    public static void Start(string filePath1, string filePath2, AudioParams initialParams, bool steppedEnabled,
-        int steppedDiffDbm)
+    // Stream tracking
+    private class RadioStream
     {
-        // Initialize BASS
-        if (!Bass.Init())
-            throw new Exception("Failed to initialize BASS.");
-
-        _steppedEnabled = steppedEnabled;
-        _steppedDiffDbm = steppedDiffDbm;
-        _currentParams = initialParams;
-
-        // Create primary stream
-        _stream1 = Bass.CreateStream(filePath1, 0, 0, BassFlags.Loop | BassFlags.Float);
-        if (_stream1 == 0)
-            throw new Exception($"BASS error creating stream1: {Bass.LastError}");
-
-        var info = Bass.ChannelGetInfo(_stream1);
-
-        // Initialize filters for primary stream
-        _radioPreFilter1 ??= new RadioPreFilter(info.Frequency);
-        _radioEffect1 ??= new RadioEffect(info.Frequency, info.Channels, initialParams);
-
-        // Create secondary stream
-        _stream2 = Bass.CreateStream(filePath2, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
-        if (_stream2 == 0)
-            throw new Exception($"BASS error creating stream2: {Bass.LastError}");
-
-        // Initialize filters for secondary stream
-        _radioPreFilter2 ??= new RadioPreFilter(info.Frequency);
-        _radioEffect2 ??= new RadioEffect(info.Frequency, info.Channels, initialParams);
-
-        // Define DSP callback
-        _dspProc = (handle, channel, bufferPtr, length, user) =>
-        {
-            int samples = length / sizeof(float);
-            EnsureBufferSize(samples);
-
-            // Capture snapshot of current params to avoid race conditions
-            AudioParams currentParams;
-            bool steppedEnabled;
-            int steppedDiffDbm;
-            lock (_lock)
-            {
-                currentParams = _currentParams;
-                steppedEnabled = _steppedEnabled;
-                steppedDiffDbm = _steppedDiffDbm;
-            }
-
-            // Copy primary stream to buffer1
-            Marshal.Copy(bufferPtr, _buffer1, 0, samples);
-
-            if (steppedEnabled && _stream2 != 0)
-            {
-                // Read from secondary stream
-                int bytesRead = Bass.ChannelGetData(_stream2, _buffer2, length);
-
-                if (bytesRead > 0)
-                {
-                    int samples2 = bytesRead / sizeof(float);
-
-                    // === CALCULATE ALL GAINS FIRST ===
-                    float gainRatio = (float)Math.Pow(10.0, steppedDiffDbm / 20.0);
-
-                    float primaryGain = currentParams.Gain;
-                    float secondaryGain = currentParams.Gain * gainRatio;
-
-                    // Scale both down if needed to stay within [0, 1]
-                    float maxGain = Math.Max(primaryGain, secondaryGain);
-                    if (maxGain > 1.0f)
-                    {
-                        float scale = 1.0f / maxGain;
-                        primaryGain *= scale;
-                        secondaryGain *= scale;
-                    }
-
-                    primaryGain = Math.Clamp(primaryGain, 0.0f, 1.0f);
-                    secondaryGain = Math.Clamp(secondaryGain, 0.0f, 1.0f);
-
-                    // === PROCESS BOTH BUFFERS ===
-
-                    // Process primary
-                    _radioPreFilter1.SetNoiseLevel(currentParams.NoiseLevel);
-                    _radioPreFilter1.Process(_buffer1, 0, samples, 1);
-
-                    var params1 = new AudioParams
-                    {
-                        Gain = primaryGain,
-                        LowpassHz = currentParams.LowpassHz,
-                        NoiseLevel = currentParams.NoiseLevel,
-                        DropoutProb = currentParams.DropoutProb,
-                        FlutterDepth = currentParams.FlutterDepth
-                    };
-                    _radioEffect1.Params = params1;
-                    _radioEffect1.Process(_buffer1, 0, samples);
-
-                    // Process secondary
-                    _radioPreFilter2.SetNoiseLevel(currentParams.NoiseLevel);
-                    _radioPreFilter2.Process(_buffer2, 0, samples2, 1);
-
-                    var params2 = new AudioParams
-                    {
-                        Gain = secondaryGain,
-                        LowpassHz = currentParams.LowpassHz,
-                        NoiseLevel = currentParams.NoiseLevel,
-                        DropoutProb = currentParams.DropoutProb,
-                        FlutterDepth = currentParams.FlutterDepth
-                    };
-                    _radioEffect2.Params = params2;
-                    _radioEffect2.Process(_buffer2, 0, samples2);
-
-                    // Mix with FM capture effect
-                    MixWithCaptureEffect(_buffer1, _buffer2, _dspScratch,
-                        Math.Min(samples, samples2),
-                        info.Frequency,
-                        -steppedDiffDbm,
-                        currentParams.RadioFrequencyMHz,
-                        primaryGain,
-                        secondaryGain,
-                        params1.DropoutProb);
-
-                    // Copy mixed result back
-                    Marshal.Copy(_dspScratch, 0, bufferPtr, Math.Min(samples, samples2));
-                    return;
-                }
-            }
-
-            // No stepped-on: process primary normally
-            _radioPreFilter1.SetNoiseLevel(currentParams.NoiseLevel);
-            _radioPreFilter1.Process(_buffer1, 0, samples, 1);
-
-            _radioEffect1.Params = currentParams;
-            _radioEffect1.Process(_buffer1, 0, samples);
-
-            Marshal.Copy(_buffer1, 0, bufferPtr, samples);
-        };
-
-        // Attach DSP and start playback
-        Bass.ChannelSetDSP(_stream1, _dspProc, IntPtr.Zero, 0);
-        Bass.ChannelPlay(_stream1);
-    }
-
-    private static void EnsureBufferSize(int samples)
-    {
-        if (_dspScratch == null || _dspScratch.Length < samples)
-            _dspScratch = new float[samples];
-        if (_buffer1 == null || _buffer1.Length < samples)
-            _buffer1 = new float[samples];
-        if (_buffer2 == null || _buffer2.Length < samples)
-            _buffer2 = new float[samples];
-    }
-
-    private static void MixWithCaptureEffect(float[] primary, float[] secondary, float[] output,
-        int samples, int sampleRate, double powerDiffDbm, float radioFrequencyMHz, float primaryGain,
-        float secondaryGain, float dropoutProb)
-    {
-        double dt = 1.0 / sampleRate;
-
-        // Calculate mixing parameters
-        AudioMixerParams mixer = CalculateMixerParams(powerDiffDbm);
-
-        // === MANAGE HETERODYNE FREQUENCY ===
-        if (mixer.HeterodyneFreq > 0)
-        {
-            // Check if frequency changed or first time
-            if (_currentHeterodyneFreq == 0 || Math.Abs(radioFrequencyMHz - _lastRadioFrequencyMHz) > 0.001f)
-            {
-                // Generate new heterodyne frequency based on radio frequency
-                // Base on frequency modulo for variation
-                float baseHz = 700f + ((radioFrequencyMHz * 10f) % 600f);
-
-                // Add deterministic variation based on frequency
-                int seed = (int)(radioFrequencyMHz * 1000);
-                Random freqRng = new Random(seed);
-                baseHz += (float)(freqRng.NextDouble() * 100 - 50); // ±50 Hz
-
-                _currentHeterodyneFreq = Math.Clamp(baseHz, 600f, 1400f);
-                _lastRadioFrequencyMHz = radioFrequencyMHz;
-
-                // Reset drift when frequency changes
-                _heterodyneDrift = 0;
-                _heterodyneDriftTarget = 0;
-            }
-        }
-        else
-        {
-            // No interference - reset everything
-            _currentHeterodyneFreq = 0;
-            _lastRadioFrequencyMHz = 0;
-            _heterodyneDrift = 0;
-            _heterodyneDriftTarget = 0;
+        public string StreamId { get; set; } = "";
+        public float FrequencyMHz { get; set; }
+        public int BassStreamHandle { get; set; }
+        public int Channels { get; set; }
+        public RadioEffect RadioEffect { get; set; }
+        public RadioPreFilter RadioPreFilter { get; set; }
+        public AudioParams CurrentParams { get; set; }
+        public float[] Buffer { get; set; } = new float[8192];
+    
+        // Use int for Interlocked operations (0 = false, 1 = true)
+        public int _transmissionActiveFlag = 0;
+        public bool TransmissionActive 
+        { 
+            get => Interlocked.CompareExchange(ref _transmissionActiveFlag, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _transmissionActiveFlag, value ? 1 : 0);
         }
 
-        // Main mixing loop
-        for (int i = 0; i < samples; i++)
+        public int _isStoppingFlag = 0;
+        public bool IsStopping 
+        { 
+            get => Interlocked.CompareExchange(ref _isStoppingFlag, 0, 0) == 1;
+            set => Interlocked.Exchange(ref _isStoppingFlag, value ? 1 : 0);
+        }
+
+        public int StoppingBurstSamplesLeft { get; set; }
+    }
+
+    // Per-frequency configuration
+    private class FrequencyConfig
+    {
+        public float Volume { get; set; } = 1.0f;
+        public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
+        public Radiomixer Mixer { get; set; } = new Radiomixer();
+    }
+
+    /// <summary>
+    /// Audio channel routing options
+    /// </summary>
+    public enum AudioChannel
+    {
+        Left,
+        Right,
+        Both
+    }
+
+    private readonly Dictionary<string, RadioStream> _streams = new();
+    private readonly Dictionary<float, FrequencyConfig> _frequencies = new(); // Per-frequency config
+    private readonly object _lock = new();
+
+    // Master output stream (receives DSP processing)
+    private int _masterStream;
+    private DSPProcedure? _dspProc;
+
+    // Processing resources
+    private float[] _dspScratch = new float[8192];
+    private float[] _mixBuffer1 = new float[8192];
+    private float[] _mixBuffer2 = new float[8192];
+    private float[] _frequencyMixBuffer = new float[8192];
+    private Random _rng = new Random();
+
+    // Sample rate (set from first stream)
+    private int _sampleRate = 48000;
+    private int _channels = 2;
+
+    private static bool _bassInitialized = false;
+    private static readonly object _bassInitLock = new();
+
+    public RadioPlayback()
+    {
+        // Initialize BASS (only once globally)
+        lock (_bassInitLock)
         {
-            float mixed;
-
-            // Strong capture - one signal dominates completely
-            if (mixer.CaptureRatio >= 0.98f)
+            if (!_bassInitialized)
             {
-                mixed = primary[i];
+                if (!Bass.Init())
+                    throw new Exception("Failed to initialize BASS.");
+                _bassInitialized = true;
             }
-            else if (mixer.CaptureRatio <= 0.02f)
+        }
+
+        // Load stepped-on sample (shared across all frequencies)
+        Radiomixer.LoadSteppedOnSample("stepped-on.ogg");
+
+        // Master stream will be created when first stream is added (after we know sample rate)
+    }
+
+    /// <summary>
+    /// Start a new transmission stream on a specific frequency
+    /// </summary>
+    /// <param name="streamId">Unique identifier for this stream</param>
+    /// <param name="filePath">Audio file path</param>
+    /// <param name="audioParams">RF parameters for this transmission</param>
+    public void StartStream(string streamId, string filePath, AudioParams audioParams)
+    {
+        Console.Out.WriteLine($"Starting stream with id {streamId}");
+        lock (_lock)
+        {
+            // If stream already exists, stop it first
+            if (_streams.ContainsKey(streamId))
             {
-                mixed = secondary[i];
-            }
-            else
-            {
-                // Interference region
-
-                // Calculate signal strength (limited by weaker signal)
-                float signalStrength = Math.Min(primaryGain, secondaryGain);
-
-                // Fast switching (10-40 Hz) - creates "buzz" quality
-                float fastSwitchRate = 10.0f + (0.5f - Math.Abs(0.5f - mixer.CaptureRatio)) * 60.0f;
-                _switchPhase += 2 * Math.PI * fastSwitchRate * dt;
-                if (_switchPhase > Math.PI * 2) _switchPhase -= Math.PI * 2;
-                float fastMod = (float)Math.Sin(_switchPhase) * (0.15f * signalStrength);
-
-                // Slow warble (1 Hz) - gradual drift in mixing ratio
-                _warblePhase += 2 * Math.PI * 1.0 * dt;
-                if (_warblePhase > Math.PI * 2) _warblePhase -= Math.PI * 2;
-                float slowMod = (float)Math.Sin(_warblePhase) * (0.1f * signalStrength);
-
-                // Combine modulations
-                float instantCapture = mixer.CaptureRatio + fastMod + slowMod;
-                instantCapture = Math.Clamp(instantCapture, 0.0f, 1.0f);
-
-                // Mix signals
-                mixed = primary[i] * instantCapture + secondary[i] * (1 - instantCapture);
-
-                // Add heterodyne whistle with slow frequency drift
-                if (_currentHeterodyneFreq > 0 && mixer.InterferenceLevel > 0)
-                {
-                    // Update drift target every 2 seconds
-                    if (i % (sampleRate * 2) == 0)
-                    {
-                        _heterodyneDriftTarget = (float)(_rng.NextDouble() * 2 - 1) * 10f;
-                    }
-
-                    float driftSpeed = 0.0001f;
-                    _heterodyneDrift += (_heterodyneDriftTarget - _heterodyneDrift) * driftSpeed;
-
-                    // Add phase noise when signals are weak
-                    float phaseNoise = 0;
-                    if (signalStrength < 0.5f)
-                    {
-                        float noiseAmount = (0.5f - signalStrength) * 2.0f;
-                        phaseNoise = (float)(_rng.NextDouble() * 2 - 1) * noiseAmount * 0.1f;
-                    }
-
-                    float actualFreq = _currentHeterodyneFreq + _heterodyneDrift + phaseNoise;
-
-                    _heterodynePhase += 2 * Math.PI * actualFreq * dt;
-                    if (_heterodynePhase > Math.PI * 2) _heterodynePhase -= Math.PI * 2;
-
-                    // Scale amplitude by signal strength
-                    float heterodyneAmplitude = mixer.InterferenceLevel * 0.2f * signalStrength;
-
-                    // Check for dropout at reasonable intervals (every 50ms)
-                    if (i % (sampleRate / 20) == 0)
-                    {
-                        if (dropoutProb > 0 && _rng.NextDouble() < dropoutProb)
-                        {
-                            int dropoutDurationMs = 50 + (int)(_rng.NextDouble() * 100);
-                            _heterodyneDropoutSamplesRemaining = (int)(sampleRate * dropoutDurationMs / 1000.0);
-                        }
-                    }
-
-                    // Smooth fade in/out
-                    if (_heterodyneDropoutSamplesRemaining > 0)
-                    {
-                        _heterodyneDropoutFade = Math.Max(0, _heterodyneDropoutFade - 0.01f);
-                        _heterodyneDropoutSamplesRemaining--;
-                    }
-                    else
-                    {
-                        _heterodyneDropoutFade = Math.Min(1.0f, _heterodyneDropoutFade + 0.01f);
-                    }
-
-                    heterodyneAmplitude *= _heterodyneDropoutFade;
-
-                    float heterodyne = (float)Math.Sin(_heterodynePhase) * heterodyneAmplitude;
-                    mixed += heterodyne;
-                }
-
-                // Add interference distortion (also scale by signal strength)
-                if (mixer.InterferenceLevel > 0.35f)
-                {
-                    // Intermodulation distortion - weaker with weak signals
-                    float im = mixed * mixed * Math.Sign(mixed) * mixer.InterferenceLevel * 0.2f * signalStrength;
-                    mixed += im;
-
-                    // Random noise bursts - scale probability with signal strength
-                    if (_rng.NextDouble() < mixer.InterferenceLevel * 0.01 * signalStrength)
-                    {
-                        mixed += (float)(_rng.NextDouble() * 2 - 1) * 0.3f;
-                    }
-                }
+                StopStreamInternal(streamId);
             }
 
-            output[i] = Math.Clamp(mixed, -1f, 1f);
+            // Ensure frequency config exists
+            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyMHz))
+            {
+                _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
+            }
+
+            // Create BASS stream
+            int bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
+            if (bassStream == 0)
+                throw new Exception($"BASS error creating stream '{streamId}': {Bass.LastError}");
+
+            var info = Bass.ChannelGetInfo(bassStream);
+
+            // Update sample rate from first stream and create master output
+            if (_streams.Count == 0)
+            {
+                _sampleRate = info.Frequency;
+                _channels = info.Channels;
+
+                // Now create master stream with correct sample rate
+                CreateMasterStream();
+            }
+
+            // Create stream object
+            var stream = new RadioStream
+            {
+                StreamId = streamId,
+                FrequencyMHz = audioParams.RadioFrequencyMHz,
+                BassStreamHandle = bassStream,
+                Channels = info.Channels, // Store actual channel count
+                RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams),
+                RadioPreFilter = new RadioPreFilter(info.Frequency),
+                CurrentParams = audioParams,
+                Buffer = new float[8192],
+                TransmissionActive = false
+            };
+
+            _streams.Add(streamId, stream);
+
+            // If this is the first stream, set up DSP and start playback
+            if (_streams.Count == 1)
+            {
+                SetupDSPAndPlay();
+            }
+
+            // Don't trigger burst here - DSP callback will detect transmission start
+            // Mark as inactive initially, DSP will detect when transmission becomes active
+            stream.TransmissionActive = false;
         }
     }
 
-    private static AudioMixerParams CalculateMixerParams(double powerDiffDbm)
-    {
-        var mixer = new AudioMixerParams();
-        double absDiff = Math.Abs(powerDiffDbm);
-
-        if (absDiff >= 10.0)
-        {
-            // Complete capture
-            mixer.CaptureRatio = powerDiffDbm > 0 ? 1.0f : 0.0f;
-            mixer.InterferenceLevel = 0.0f;
-            mixer.HeterodyneFreq = 0.0f;
-        }
-        else if (absDiff >= 6.0)
-        {
-            // Very strong capture: 90-100%
-            if (powerDiffDbm > 0)
-                mixer.CaptureRatio = (float)(0.9f + (absDiff - 6.0) / 4.0 * 0.1f);
-            else
-                mixer.CaptureRatio = (float)(0.1f - (absDiff - 6.0) / 4.0 * 0.1f);
-
-            mixer.InterferenceLevel = 0.15f;
-            mixer.HeterodyneFreq = 1.0f;
-        }
-        else if (absDiff >= 4.0)
-        {
-            // Strong capture: 80-90%
-            if (powerDiffDbm > 0)
-                mixer.CaptureRatio = (float)(0.8f + (absDiff - 4.0) / 2.0 * 0.1f);
-            else
-                mixer.CaptureRatio = (float)(0.2f - (absDiff - 4.0) / 2.0 * 0.1f);
-
-            mixer.InterferenceLevel = 0.25f;
-            mixer.HeterodyneFreq = 1.0f;
-        }
-        else if (absDiff >= 2.0)
-        {
-            // Moderate capture: 65-80%
-            if (powerDiffDbm > 0)
-                mixer.CaptureRatio = (float)(0.65f + (absDiff - 2.0) / 2.0 * 0.15f);
-            else
-                mixer.CaptureRatio = (float)(0.35f - (absDiff - 2.0) / 2.0 * 0.15f);
-
-            mixer.InterferenceLevel = 0.35f;
-            mixer.HeterodyneFreq = 1.0f;
-        }
-        else if (absDiff >= 1.0)
-        {
-            // Light capture: 55-65%
-            if (powerDiffDbm > 0)
-                mixer.CaptureRatio = (float)(0.55f + (absDiff - 1.0) / 1.0 * 0.1f);
-            else
-                mixer.CaptureRatio = (float)(0.45f - (absDiff - 1.0) / 1.0 * 0.1f);
-
-            mixer.InterferenceLevel = 0.5f;
-            mixer.HeterodyneFreq = 1.0f;
-        }
-        else
-        {
-            // Very close: 50-55%
-            mixer.CaptureRatio = 0.5f + (float)(powerDiffDbm / 1.0) * 0.05f;
-            mixer.InterferenceLevel = (float)(0.65f - absDiff * 0.15f);
-            mixer.HeterodyneFreq = 1.0f;
-        }
-
-        return mixer;
-    }
-
-    public static void UpdateParams(AudioParams p, bool steppedEnabled, int steppedDiffDbm)
+    /// <summary>
+    /// Stop a transmission stream
+    /// </summary>
+    public async Task StopStream(string streamId)
     {
         lock (_lock)
         {
-            _currentParams = p;
-            _steppedEnabled = steppedEnabled;
-            _steppedDiffDbm = steppedDiffDbm;
+            if (!_streams.TryGetValue(streamId, out var stream))
+                return; // Stream doesn't exist
+
+            // Mark stream as stopping - DSP callback will handle the burst and cleanup
+            if (stream.CurrentParams.Gain > 0.03f || stream.TransmissionActive)
+            {
+                stream.IsStopping = true;
+                stream.StoppingBurstSamplesLeft = 720; // 15ms at 48kHz (burst duration)
+                stream.RadioEffect.TriggerSquelchBurst();
+            }
+            else
+            {
+                // No burst needed, remove immediately
+                StopStreamInternal(streamId);
+            }
+        }
+
+        // No need to wait here - DSP callback will handle timing
+    }
+
+    private void StopStreamInternal(string streamId)
+    {
+        if (!_streams.TryGetValue(streamId, out var stream))
+            return;
+
+        if (stream.BassStreamHandle != 0)
+        {
+            Bass.StreamFree(stream.BassStreamHandle);
+        }
+
+        _streams.Remove(streamId);
+
+        // If no more streams, stop and free master playback
+        if (_streams.Count == 0 && _masterStream != 0)
+        {
+            Bass.ChannelStop(_masterStream);
+            Bass.StreamFree(_masterStream);
+            _masterStream = 0;
         }
     }
 
-    public static void Stop()
+    /// <summary>
+    /// Update RF parameters for a specific stream while it's playing
+    /// DSP callback will automatically detect gain changes and trigger squelch bursts
+    /// </summary>
+    /// <param name="streamId">Stream identifier</param>
+    /// <param name="newParams">New RF parameters (gain, distance, SNR, etc.)</param>
+    public void UpdateStreamParams(string streamId, AudioParams newParams)
     {
-        if (_stream1 != 0)
+        lock (_lock)
         {
-            Bass.ChannelStop(_stream1);
-            Bass.StreamFree(_stream1);
-            _stream1 = 0;
+            if (!_streams.TryGetValue(streamId, out var stream))
+                return;
+
+            // Update parameters - DSP callback will detect gain changes and trigger squelch bursts
+            stream.CurrentParams = newParams;
+            stream.RadioEffect.Params = newParams;
+        }
+    }
+
+    /// <summary>
+    /// Set volume for a specific frequency
+    /// </summary>
+    /// <param name="frequencyMHz">Frequency in MHz</param>
+    /// <param name="volume">Volume (0.0 to 1.0)</param>
+    public void SetFrequencyVolume(float frequencyMHz, float volume)
+    {
+        lock (_lock)
+        {
+            if (!_frequencies.ContainsKey(frequencyMHz))
+            {
+                _frequencies[frequencyMHz] = new FrequencyConfig();
+            }
+
+            _frequencies[frequencyMHz].Volume = Math.Clamp(volume, 0f, 1f);
+        }
+    }
+
+    /// <summary>
+    /// Set audio channel routing for a specific frequency
+    /// </summary>
+    /// <param name="frequencyMHz">Frequency in MHz</param>
+    /// <param name="audioChannel">Channel routing (Left/Right/Both)</param>
+    public void SetFrequencyAudioChannel(float frequencyMHz, AudioChannel audioChannel)
+    {
+        lock (_lock)
+        {
+            if (!_frequencies.ContainsKey(frequencyMHz))
+            {
+                _frequencies[frequencyMHz] = new FrequencyConfig();
+            }
+
+            _frequencies[frequencyMHz].AudioChannel = audioChannel;
+        }
+    }
+
+    /// <summary>
+    /// Get volume for a specific frequency
+    /// </summary>
+    public float GetFrequencyVolume(float frequencyMHz)
+    {
+        lock (_lock)
+        {
+            if (_frequencies.TryGetValue(frequencyMHz, out var freq))
+                return freq.Volume;
+            return 1.0f;
+        }
+    }
+
+    /// <summary>
+    /// Get audio channel routing for a specific frequency
+    /// </summary>
+    public AudioChannel GetFrequencyAudioChannel(float frequencyMHz)
+    {
+        lock (_lock)
+        {
+            if (_frequencies.TryGetValue(frequencyMHz, out var freq))
+                return freq.AudioChannel;
+            return AudioChannel.Both;
+        }
+    }
+
+    private void CreateMasterStream()
+    {
+        // Create master output stream with streaming callback
+        // The callback generates silence, DSP will fill it with audio
+        StreamProcedure streamProc = (handle, buffer, length, user) =>
+        {
+            // Generate silence - DSP will fill this with actual audio
+            if (buffer != IntPtr.Zero)
+            {
+                // Fill with zeros (silence)
+                unsafe
+                {
+                    float* ptr = (float*)buffer;
+                    int samples = length / sizeof(float);
+                    for (int i = 0; i < samples; i++)
+                        ptr[i] = 0f;
+                }
+            }
+
+            return length;
+        };
+
+        _masterStream = Bass.CreateStream(_sampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
+        if (_masterStream == 0)
+            throw new Exception($"BASS error creating master stream: {Bass.LastError}");
+    }
+
+    private void SetupDSPAndPlay()
+    {
+        Console.Out.WriteLine("SetupDSPAndPlay");
+        
+        int dspCallbackCount = 0; // Counter to track callbacks
+        
+        _dspProc = (handle, channel, bufferPtr, length, user) =>
+        {
+            int callbackId = Interlocked.Increment(ref dspCallbackCount);
+            int threadId = Thread.CurrentThread.ManagedThreadId;
+            Console.Out.WriteLine($"[DSP #{callbackId} Thread {threadId}] Callback START");
+            
+            int samples = length / sizeof(float);
+            EnsureBufferSize(samples);
+
+            // Get snapshot of all active streams
+            List<RadioStream> activeStreams;
+            Dictionary<float, FrequencyConfig> frequencySnapshot;
+
+            lock (_lock)
+            {
+                activeStreams = _streams.Values.ToList();
+                frequencySnapshot = new Dictionary<float, FrequencyConfig>(_frequencies);
+                Console.Out.WriteLine($"[DSP #{callbackId}] Got {activeStreams.Count} streams");
+            }
+
+            // Ensure all buffers are large enough for this callback
+            foreach (var stream in activeStreams)
+            {
+                if (stream.Buffer.Length < samples)
+                {
+                    stream.Buffer = new float[samples];
+                }
+            }
+
+// Clear output buffer
+            Array.Clear(_dspScratch, 0, samples);
+
+            if (activeStreams.Count == 0)
+            {
+                Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
+                return;
+            }
+
+// Read and process all streams
+            List<string> streamsToRemove = new List<string>();
+
+            foreach (var stream in activeStreams)
+            {
+                // Handle stopping streams
+                if (stream.IsStopping)
+                {
+                    stream.StoppingBurstSamplesLeft -= samples;
+                    if (stream.StoppingBurstSamplesLeft <= 0)
+                    {
+                        streamsToRemove.Add(stream.StreamId);
+                        continue;
+                    }
+                }
+    
+                bool isActive = stream.CurrentParams.Gain > 0.03f;
+    
+                // Atomic check-and-set: ONLY returns 0 once across all threads
+                if (isActive && !stream.IsStopping)
+                {
+                    if (Interlocked.CompareExchange(ref stream._transmissionActiveFlag, 1, 0) == 0)
+                    {
+                        Console.Out.WriteLine($"[DSP #{callbackId}] Triggering burst on {stream.StreamId}");
+                        stream.RadioEffect.TriggerSquelchBurst();
+                    }
+                }
+    
+                int bytesRead = Bass.ChannelGetData(stream.BassStreamHandle, stream.Buffer, length);
+                if (bytesRead <= 0)
+                    continue;
+
+                int streamSamples = bytesRead / sizeof(float);
+
+                if (isActive)
+                {
+                    stream.RadioPreFilter.SetNoiseLevel(stream.CurrentParams.NoiseLevel);
+                    stream.RadioPreFilter.Process(stream.Buffer, 0, streamSamples, stream.Channels);
+                }
+                else
+                {
+                    Array.Clear(stream.Buffer, 0, streamSamples);
+                }
+    
+                stream.RadioEffect.Process(stream.Buffer, 0, streamSamples);
+            }
+
+            // Group streams by frequency
+            var streamsByFrequency = activeStreams
+                .GroupBy(s => s.FrequencyMHz)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            // Process each frequency separately
+            foreach (var kvp in streamsByFrequency)
+            {
+                float frequency = kvp.Key;
+                var streamsOnFreq = kvp.Value;
+
+                // Get config for this frequency
+                if (!frequencySnapshot.TryGetValue(frequency, out var freqConfig))
+                {
+                    // No config yet, use defaults
+                    freqConfig = new FrequencyConfig();
+                }
+
+                // Skip if volume is zero (muted)
+                if (freqConfig.Volume <= 0f)
+                    continue;
+
+                Array.Clear(_frequencyMixBuffer, 0, samples);
+
+                if (streamsOnFreq.Count == 1)
+                {
+                    // Single stream on this frequency - direct copy
+                    var stream = streamsOnFreq[0];
+                    Array.Copy(stream.Buffer, _frequencyMixBuffer, Math.Min(samples, stream.Buffer.Length));
+                }
+                else
+                {
+                    // Multiple streams on same frequency - find two strongest and apply stepped-on
+                    var sortedByGain = streamsOnFreq
+                        .OrderByDescending(s => s.CurrentParams.Gain)
+                        .Take(2)
+                        .ToList();
+
+                    if (sortedByGain.Count == 1)
+                    {
+                        Array.Copy(sortedByGain[0].Buffer, _frequencyMixBuffer,
+                            Math.Min(samples, sortedByGain[0].Buffer.Length));
+                    }
+                    else
+                    {
+                        // Two strongest streams - apply stepped-on interference
+                        var primary = sortedByGain[0];
+                        var secondary = sortedByGain[1];
+
+                        float primaryGain = primary.CurrentParams.Gain;
+                        float secondaryGain = secondary.CurrentParams.Gain;
+
+                        // Calculate power difference
+                        double gainRatio = secondaryGain / Math.Max(primaryGain, 0.001f);
+                        int powerDiffDbm = (int)(20.0 * Math.Log10(gainRatio));
+
+                        // Copy to mixing buffers
+                        int mixSamples = Math.Min(samples, Math.Min(primary.Buffer.Length, secondary.Buffer.Length));
+                        Array.Copy(primary.Buffer, _mixBuffer1, mixSamples);
+                        Array.Copy(secondary.Buffer, _mixBuffer2, mixSamples);
+
+                        // Calculate stepped-on parameters
+                        var steppedParams = Radiomixer.CalculateSteppedOnParams(
+                            primary.CurrentParams, secondary.CurrentParams,
+                            primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
+                            primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB
+                        );
+
+                        // Apply physics-based interference
+                        freqConfig.Mixer.ProcessSteppedOn(
+                            _mixBuffer1,
+                            _mixBuffer2,
+                            _frequencyMixBuffer,
+                            steppedParams,
+                            _sampleRate,
+                            primaryGain,
+                            secondaryGain
+                        );
+                    }
+                }
+
+                // Mix this frequency into the main output with volume and channel routing
+                float volume = freqConfig.Volume;
+                AudioChannel audioChannel = freqConfig.AudioChannel;
+
+                // Assumes stereo output (2 channels)
+                int frames = samples / 2;
+
+                for (int frame = 0; frame < frames; frame++)
+                {
+                    int leftIdx = frame * 2;
+                    int rightIdx = frame * 2 + 1;
+
+                    float leftSample = _frequencyMixBuffer[leftIdx] * volume;
+                    float rightSample = _frequencyMixBuffer[rightIdx] * volume;
+
+                    // Apply channel routing
+                    switch (audioChannel)
+                    {
+                        case AudioChannel.Left:
+                            _dspScratch[leftIdx] += leftSample;
+                            // Right channel gets silence
+                            break;
+
+                        case AudioChannel.Right:
+                            // Left channel gets silence
+                            _dspScratch[rightIdx] += rightSample;
+                            break;
+
+                        case AudioChannel.Both:
+                            _dspScratch[leftIdx] += leftSample;
+                            _dspScratch[rightIdx] += rightSample;
+                            break;
+                    }
+                }
+            }
+
+            // Clamp final output to prevent clipping
+            for (int i = 0; i < samples; i++)
+            {
+                _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
+            }
+
+            // Copy result to output
+            Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
+
+            // Cleanup stopped streams (outside the main loop to avoid modifying during iteration)
+            if (streamsToRemove.Count > 0)
+            {
+                lock (_lock)
+                {
+                    foreach (var streamId in streamsToRemove)
+                    {
+                        StopStreamInternal(streamId);
+                    }
+                }
+            }
+            Console.Out.WriteLine($"[DSP #{callbackId}] Callback END");
+        };
+
+        // Attach DSP to master stream
+        Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero, 0);
+        Bass.ChannelPlay(_masterStream);
+    }
+
+    private void EnsureBufferSize(int samples)
+    {
+        if (_dspScratch.Length < samples)
+        {
+            _dspScratch = new float[samples];
+            _mixBuffer1 = new float[samples];
+            _mixBuffer2 = new float[samples];
+            _frequencyMixBuffer = new float[samples];
+        }
+    }
+
+    /// <summary>
+    /// Stop all streams and cleanup
+    /// </summary>
+    public async Task StopAll()
+    {
+        List<string> streamIds;
+        lock (_lock)
+        {
+            streamIds = _streams.Keys.ToList();
         }
 
-        if (_stream2 != 0)
+        // Stop all streams (with their closing bursts)
+        foreach (var streamId in streamIds)
         {
-            Bass.ChannelStop(_stream2);
-            Bass.StreamFree(_stream2);
-            _stream2 = 0;
+            await StopStream(streamId);
         }
 
-        Bass.Free();
+        // Cleanup master stream
+        if (_masterStream != 0)
+        {
+            Bass.ChannelStop(_masterStream);
+            Bass.StreamFree(_masterStream);
+            _masterStream = 0;
+        }
+    }
+
+    /// <summary>
+    /// Get list of currently active stream IDs
+    /// </summary>
+    public List<string> GetActiveStreams()
+    {
+        lock (_lock)
+        {
+            return _streams.Keys.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Get streams on a specific frequency
+    /// </summary>
+    public List<string> GetStreamsOnFrequency(float frequencyMHz)
+    {
+        lock (_lock)
+        {
+            return _streams.Values
+                .Where(s => Math.Abs(s.FrequencyMHz - frequencyMHz) < 0.001f)
+                .Select(s => s.StreamId)
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Get all active frequencies with transmissions
+    /// </summary>
+    public List<float> GetActiveFrequencies()
+    {
+        lock (_lock)
+        {
+            return _streams.Values
+                .Select(s => s.FrequencyMHz)
+                .Distinct()
+                .OrderBy(f => f)
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Get current parameters for a stream
+    /// </summary>
+    public AudioParams? GetStreamParams(string streamId)
+    {
+        lock (_lock)
+        {
+            if (_streams.TryGetValue(streamId, out var stream))
+                return stream.CurrentParams;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Get the frequency a stream is transmitting on
+    /// </summary>
+    public float? GetStreamFrequency(string streamId)
+    {
+        lock (_lock)
+        {
+            if (_streams.TryGetValue(streamId, out var stream))
+                return stream.FrequencyMHz;
+            return null;
+        }
     }
 }

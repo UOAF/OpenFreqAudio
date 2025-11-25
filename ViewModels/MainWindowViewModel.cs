@@ -1,4 +1,5 @@
 ﻿namespace BMSAudioSim.ViewModels;
+
 using ReactiveUI;
 
 public class MainWindowViewModel : ReactiveObject
@@ -9,10 +10,12 @@ public class MainWindowViewModel : ReactiveObject
     private int _txDbm = 40;
     private int _rxDbm = -105;
 
-    private double _frequencyMhz = 339.75; // default UHF
+    private double _frequencyMhz = 85.0; // default UHF
 
     private bool _steppedEnabled = false;
     private int _steppedDiffDbm = 0;
+    private bool _signal1Continuous = false;
+    private bool _signal2Continuous = false;
 
     public int TXAltitude
     {
@@ -37,21 +40,34 @@ public class MainWindowViewModel : ReactiveObject
         get => _steppedEnabled;
         set => this.RaiseAndSetIfChanged(ref _steppedEnabled, value);
     }
+
     public int SteppedDiffDbm
     {
         get => _steppedDiffDbm;
         set => this.RaiseAndSetIfChanged(ref _steppedDiffDbm, value);
     }
-    
+
     public int RxDbm
     {
         get => _rxDbm;
         set => this.RaiseAndSetIfChanged(ref _rxDbm, value);
     }
-    
+
     public double FrequencyMhz
     {
         get => _frequencyMhz;
         set => this.RaiseAndSetIfChanged(ref _frequencyMhz, value);
+    }
+
+    public bool Signal1Continuous
+    {
+        get => _signal1Continuous;
+        set => this.RaiseAndSetIfChanged(ref _signal1Continuous, value);
+    }
+    
+    public bool Signal2Continuous
+    {
+        get => _signal2Continuous;
+        set => this.RaiseAndSetIfChanged(ref _signal2Continuous, value);
     }
 }

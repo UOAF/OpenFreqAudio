@@ -33,8 +33,18 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private (int x, int y)? _senderPos;
     private (int x, int y)? _receiverPos;
     private FastPathAudioSim? _fastPathAudioSim;
-    static volatile bool _audioPlaying = false;
+    static volatile bool _stream1Playing = false;
+    static volatile bool _stream2Playing = false;
     private DEMReader? _demReader;
+    private AudioParams _signal1Params;
+    private AudioParams _signal2Params;
+    private RadioPlayback _radioPlayback = new();
+
+    private readonly string _stream1Id = "stream1";
+    private readonly string _stream1File = "countdown.ogg";
+    private readonly string _stream2Id = "stream2";
+    private readonly string _stream2File = "audio2.ogg";
+
     
     // Marker display
     private Ellipse? _senderMarker;
@@ -44,6 +54,32 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         this.WhenActivated(disposables => { /* Handle view activation etc. */ });
         InitializeComponent();
+        ButtonSignal1Ptt.AddHandler(Button.PointerPressedEvent, (sender, e) =>
+        {
+            Console.Out.WriteLine("PointerPressedEvent");
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
+        }, handledEventsToo: true);
+        
+        ButtonSignal1Ptt.AddHandler(Button.PointerReleasedEvent, (sender, e) =>
+        {
+            Console.Out.WriteLine("PointerReleasedEvent");
+            _radioPlayback.StopStream(_stream1Id).Wait(300);
+
+        }, handledEventsToo: true);
+        
+        ButtonSignal2Ptt.AddHandler(Button.PointerPressedEvent, (sender, e) =>
+        {
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
+        }, handledEventsToo: true);
+        
+        ButtonSignal2Ptt.AddHandler(Button.PointerReleasedEvent, (sender, e) =>
+        {
+            _radioPlayback.StopStream(_stream2Id).Wait(300);
+
+        }, handledEventsToo: true);
+        
+        _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Left);
+        _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Right);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -373,7 +409,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             return;
         }
-
+        
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
         
@@ -394,17 +430,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         LowPassHzText.Text = audioParams.LowpassHz.ToString();
         NoiseLvlText.Text = audioParams.NoiseLevel.ToString();
         DropoutProbText.Text = audioParams.DropoutProb.ToString();
-        FlutterDepthText.Text = audioParams.FlutterDepth.ToString();
-            
-        if (!_audioPlaying)
-        {
-            RadioPlayback.Start("countdown.ogg", "audio2.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
-            _audioPlaying = true;
-        }
-        else
-        {
-            RadioPlayback.UpdateParams(audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
-        }
+
+        _signal1Params = audioParams;
+        _signal2Params = audioParams;
+        _signal2Params.Distance_km += 1;
+        
+       
+        
+        _radioPlayback.UpdateStreamParams(_stream1Id, _signal1Params);
+        _radioPlayback.UpdateStreamParams(_stream2Id, _signal2Params);
     }
 
     private void UpdatePositionDisplay()
@@ -529,9 +563,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
+
+        _radioPlayback.StopAll().Wait(500);
         if (RadioButtonUhf.IsChecked == true)
         {
-            ViewModel.FrequencyMhz = 339.75;
+            ViewModel.FrequencyMhz = 85.0;
         }
         else // VHF
         {
@@ -540,5 +576,39 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         ViewModel.SteppedEnabled = Stepped.IsChecked is true;
         UpdateParameters();
+        if (ViewModel.Signal1Continuous)
+        {
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
+        }
+
+        if (ViewModel.Signal2Continuous)
+        {
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
+        }
+    }
+    private void OnSignal1PTTChanged(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton radioButton) return;
+        if (((RadioButton)sender).IsChecked.GetValueOrDefault())
+        {
+            _radioPlayback.StopStream(_stream1Id).Wait(100);
+        }
+        else
+        {
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
+        }
+    }
+    
+    private void OnSignal2PTTChanged(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton radioButton) return;
+        if (((RadioButton)sender).IsChecked.GetValueOrDefault())
+        {
+            _radioPlayback.StopStream(_stream2Id).Wait(100);
+        }
+        else
+        {
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
+        }
     }
 }

@@ -3,6 +3,19 @@ using System.Threading;
 
 namespace BMSAudioSim;
 
+/// <summary>
+/// Modern military radio receiver effects (AN/ARC-210/222 style)
+/// 
+/// Signal chain: Analog FM transmission → Analog FM demodulator → Digital audio processing
+/// 
+/// Receiver-side effects (AFTER demodulation):
+/// - Fast digital squelch (DSP-based)
+/// - Sharp brick-wall filtering (digital IIR filters)
+/// - RF fading effects (pre-demod phenomena that affect audio)
+/// 
+/// NOTE: Transmissions are ANALOG FM - no digital vocoder, packets, or bit errors!
+/// Digital processing happens ONLY in the receiver's audio backend after demodulation.
+/// </summary>
 public class RadioEffect
 {
     private readonly int _channels;
@@ -11,25 +24,26 @@ public class RadioEffect
     private readonly object _lock = new();
     private AudioParams _params;
     
-    // Flutter state (variable)
-    private double _flutterPhase;
-    private float _flutterFreq = 10f;
-    private float _flutterFreqTarget = 10f;
-    private float _flutterDepthMod = 1f;
+    // Digital filter state (2-stage biquad needs 4 states per channel)
+    private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
     
-    // Squelch gate state
+    // Squelch gate state (digital = much faster)
     private enum SquelchState { Closed, Opening, Open, Closing }
     private SquelchState _squelchState = SquelchState.Closed;
     private int _squelchTransitionSamples = 0;
     private int _squelchTransitionLength = 0;
-    private const int SquelchAttackSamples = 48;  // ~1ms at 48kHz
-    private const int SquelchReleaseSamples = 2400; // ~50ms at 48kHz
-    private bool _squelchNoiseAdded = false;
+    private const int SquelchAttackSamples = 12;   // ~0.25ms at 48kHz (very fast digital)
+    private const int SquelchReleaseSamples = 240;  // ~5ms at 48kHz (fast digital)
     
-    // Dropout state
+    // Squelch burst state (the characteristic "pop" when gate opens/closes)
+    private int _squelchBurstSamplesLeft = 0;
+    private const int SquelchBurstDuration = 720; // ~15ms at 48kHz (longer, softer)
+    private const float SquelchBurstAmplitude = 0.08f; // Softer pop volume
+    
+    // Dropout state (digital = full muting or corruption)
     private int _dropoutSamplesLeft = 0;
     private int _dropoutFadeSamples = 0;
-    private float _dropoutAttenuation = 1f;
+    private bool _dropoutIsMute = true; // true = mute, false = digital corruption
     private readonly Random _rng = new(Environment.TickCount);
 
     private static readonly ThreadLocal<Random> ThreadRng =
@@ -46,23 +60,30 @@ public class RadioEffect
             lock (_lock)
             {
                 // Detect signal strength changes for squelch
-                bool wasWeak = _params.Gain < 0.05f;
-                bool isWeak = value.Gain < 0.05f;
+                bool wasWeak = _params.Gain < 0.03f; // Digital threshold tighter
+                bool isWeak = value.Gain < 0.03f;
                 
                 if (wasWeak && !isWeak && _squelchState == SquelchState.Closed)
                 {
-                    // Signal came up - open squelch
+                    Console.Out.WriteLine("Squelch Opening");
+                    // Signal came up - open squelch (fast digital)
                     _squelchState = SquelchState.Opening;
                     _squelchTransitionSamples = 0;
                     _squelchTransitionLength = SquelchAttackSamples;
-                    _squelchNoiseAdded = false;
+                    
+                    // Trigger squelch burst (opening pop)
+                    _squelchBurstSamplesLeft = SquelchBurstDuration;
                 }
                 else if (!wasWeak && isWeak && _squelchState == SquelchState.Open)
                 {
-                    // Signal dropped - close squelch
+                    Console.Out.WriteLine("Squelch Closing");
+                    // Signal dropped - close squelch (fast digital)
                     _squelchState = SquelchState.Closing;
                     _squelchTransitionSamples = 0;
                     _squelchTransitionLength = SquelchReleaseSamples;
+                    
+                    // Trigger squelch burst (closing pop)
+                    _squelchBurstSamplesLeft = SquelchBurstDuration;
                 }
                 
                 _params = value;
@@ -76,9 +97,24 @@ public class RadioEffect
         _channels = channels;
         _params = initial;
         _prevOut = new float[channels];
+        _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
         
         // Initialize squelch state based on initial signal strength
-        _squelchState = initial.Gain >= 0.05f ? SquelchState.Open : SquelchState.Closed;
+        _squelchState = initial.Gain >= 0.03f ? SquelchState.Open : SquelchState.Closed;
+    }
+
+    /// <summary>
+    /// Manually trigger a squelch burst (for transmission start/stop)
+    /// </summary>
+    public void TriggerSquelchBurst()
+    {
+        lock (_lock)
+        {
+            if (_squelchBurstSamplesLeft != 0) return;
+            
+            _squelchBurstSamplesLeft = SquelchBurstDuration;
+            Console.Out.WriteLine($"Triggering Squelch Burst {_squelchBurstSamplesLeft}");
+        }
     }
 
     public void Process(float[] buffer, int offset, int samples)
@@ -89,44 +125,56 @@ public class RadioEffect
         double dt = 1.0 / _sampleRate;
         int frames = samples / _channels;
 
-        float cutoff = MathF.Max(100, MathF.Min(p.LowpassHz, 0.45f * _sampleRate));
-        float rc = 1f / (2f * MathF.PI * cutoff);
-        float alpha = (float)(dt / (rc + dt));
+        // Digital brick-wall filter coefficients
+        // Using cascaded biquad for sharper rolloff
+        float cutoff = MathF.Max(300, MathF.Min(p.LowpassHz, 0.45f * _sampleRate));
+        float omega = 2f * MathF.PI * cutoff / _sampleRate;
+        float cosOmega = MathF.Cos(omega);
+        float Q = 0.707f; // Butterworth
+        float alpha = MathF.Sin(omega) / (2f * Q);
+        
+        float b0 = (1f - cosOmega) / 2f;
+        float b1 = 1f - cosOmega;
+        float b2 = b0;
+        float a0 = 1f + alpha;
+        float a1 = -2f * cosOmega;
+        float a2 = 1f - alpha;
+        
+        // Normalize
+        b0 /= a0; b1 /= a0; b2 /= a0;
+        a1 /= a0; a2 /= a0;
 
-        // Dropout parameters
-        double eventsPerSec = Math.Clamp(p.DropoutProb, 0.0, 5.0);
+        // Dropout parameters (RF fading/multipath, not digital packet loss)
+        // In analog FM, dropouts come from:
+        // - Multipath fading (Rayleigh/Rician fading)
+        // - Terrain shadowing
+        // - Atmospheric effects
+        double eventsPerSec = Math.Clamp(p.DropoutProb, 0.0, 2.0); // Max 2/sec
         double blockDurationSec = (double)frames / _sampleRate;
         double startProbThisBlock = eventsPerSec * blockDurationSec;
-        const double meanDropMs = 120.0;
-        const double minDropMs = 30.0;
-        const double fadeMs = 20.0;
-        const float minAttenuation = 0.05f; // More severe dropout minimum
+        const double meanDropMs = 75.0; // Average fade duration
+        const double maxDropMs = 300.0; // Max fade duration
+        const double minDropMs = 20.0;  // Min fade duration
+        const double fadeMs = 0.5; // Fast fade in/out (squelch response)
 
         var rng = ThreadRng.Value ?? _rng;
 
-        // Maybe start a dropout
+        // Maybe start a dropout (RF fading event)
         if (_dropoutSamplesLeft <= 0 && rng.NextDouble() < startProbThisBlock)
         {
             double u = rng.NextDouble();
             double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
             _dropoutSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
             _dropoutFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
-            _dropoutAttenuation = minAttenuation + (float)(rng.NextDouble() * 0.08);
+            
+            // Analog FM fading: Just signal loss, no corruption
+            // (corruption would require digital codec, which we don't have)
+            _dropoutIsMute = true; // Always mute for analog fading
         }
-        
-        // Variable flutter frequency (random walk)
-        if (rng.NextDouble() < 0.001) // Occasionally change target
-        {
-            _flutterFreqTarget = 8f + (float)(rng.NextDouble() * 4.0); // 8-12 Hz
-        }
-        _flutterFreq += (_flutterFreqTarget - _flutterFreq) * 0.001f; // Smooth transition
-        
-        // Flutter depth modulation (varies with signal quality)
-        _flutterDepthMod = 0.6f + 0.4f * (float)Math.Sin(_flutterPhase * 0.03);
 
         for (int frame = 0; frame < frames; frame++)
         {
-            // === Squelch gate processing ===
+            // === Digital squelch gate (fast, no burst) ===
             float squelchGain = 1f;
             
             switch (_squelchState)
@@ -136,15 +184,9 @@ public class RadioEffect
                     break;
                     
                 case SquelchState.Opening:
+                    // Linear ramp (digital is clean and fast)
                     float openProgress = (float)_squelchTransitionSamples / _squelchTransitionLength;
-                    squelchGain = openProgress * openProgress; // Exponential curve
-                    
-                    // Add characteristic squelch opening burst
-                    if (!_squelchNoiseAdded && openProgress > 0.1f)
-                    {
-                        _squelchNoiseAdded = true;
-                        // Burst added per-channel below
-                    }
+                    squelchGain = openProgress;
                     
                     _squelchTransitionSamples++;
                     if (_squelchTransitionSamples >= _squelchTransitionLength)
@@ -156,6 +198,7 @@ public class RadioEffect
                     break;
                     
                 case SquelchState.Closing:
+                    // Linear ramp down (fast)
                     float closeProgress = (float)_squelchTransitionSamples / _squelchTransitionLength;
                     squelchGain = 1f - closeProgress;
                     
@@ -165,26 +208,68 @@ public class RadioEffect
                     break;
             }
 
-            // === Dropout envelope ===
+            // === Squelch burst generation (the "pop" sound) ===
+            float squelchBurstSample = 0f;
+            if (_squelchBurstSamplesLeft > 0)
+            {
+                // Generate analog-style bandlimited noise (not harsh white noise)
+                int age = SquelchBurstDuration - _squelchBurstSamplesLeft;
+                
+                // Gentler envelope: slower attack, slower exponential decay
+                float envelope;
+                if (age < 96) // ~2ms attack at 48kHz (4x longer, much softer)
+                {
+                    // Ease-in curve for gentle attack
+                    float attackProgress = (float)age / 96f;
+                    envelope = attackProgress * attackProgress; // Quadratic ease-in
+                }
+                else
+                {
+                    // Slower exponential decay over remaining duration
+                    float decayProgress = (float)(age - 96) / (SquelchBurstDuration - 96);
+                    envelope = MathF.Exp(-3.5f * decayProgress); // Gentler exponential decay
+                }
+                
+                // Analog-style noise: bandlimited with low-frequency bias
+                // Real squelch noise is filtered by radio's IF stages, not sharp white noise
+                float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                float noise2 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                
+                // Simple 2-pole averaging for softer, more analog character
+                // This removes harsh high frequencies that make it sound digital
+                float analogNoise = (noise1 + noise2) * 0.5f;
+                
+                // Apply envelope and reduced amplitude for subtler effect
+                squelchBurstSample = analogNoise * envelope * SquelchBurstAmplitude;
+                
+                _squelchBurstSamplesLeft--;
+            }
+
+            // === Dropout envelope (RF fading) ===
             bool inDrop = _dropoutSamplesLeft > 0;
             float dropoutEnvelope = 1f;
 
             if (inDrop)
             {
-                int total = _dropoutFadeSamples * 2;
-                int age = Math.Max(0, total - _dropoutSamplesLeft);
-                if (age < _dropoutFadeSamples)
+                int fadeIn = _dropoutFadeSamples;
+                int fadeOut = _dropoutFadeSamples;
+                int totalDrop = _dropoutSamplesLeft + fadeIn + fadeOut;
+                int age = totalDrop - _dropoutSamplesLeft;
+                
+                if (age < fadeIn)
                 {
-                    dropoutEnvelope = 1f - (1f - _dropoutAttenuation) * (age / (float)_dropoutFadeSamples);
+                    // Fast fade to mute (squelch closing)
+                    dropoutEnvelope = 1f - (float)age / fadeIn;
                 }
-                else if (_dropoutSamplesLeft < _dropoutFadeSamples)
+                else if (_dropoutSamplesLeft < fadeOut)
                 {
-                    float t = (_dropoutFadeSamples - _dropoutSamplesLeft) / (float)_dropoutFadeSamples;
-                    dropoutEnvelope = _dropoutAttenuation + (1f - _dropoutAttenuation) * t;
+                    // Fast fade back (squelch opening)
+                    dropoutEnvelope = (float)(_dropoutFadeSamples - _dropoutSamplesLeft) / fadeOut;
                 }
                 else
                 {
-                    dropoutEnvelope = _dropoutAttenuation;
+                    // Full dropout (signal loss)
+                    dropoutEnvelope = 0f;
                 }
             }
 
@@ -192,51 +277,67 @@ public class RadioEffect
             {
                 int idx = offset + frame * _channels + c;
                 float x = buffer[idx];
-                
-                // Add squelch opening burst
-                if (_squelchState == SquelchState.Opening && !_squelchNoiseAdded)
-                {
-                    x += (float)(rng.NextDouble() * 2.0 - 1.0) * 0.15f;
-                }
 
-                // Apply squelch gate
+                // Apply squelch gate (clean digital, no burst)
                 x *= squelchGain;
 
-                // Dropout processing
+                // === RF Fading (analog signal loss) ===
                 if (inDrop)
                 {
-                    // Mix with harsh static during dropout
-                    float dropNoise = (float)(rng.NextDouble() * 2.0 - 1.0);
-                    x = dropoutEnvelope * x + (1f - dropoutEnvelope) * dropNoise * 0.12f;
+                    // Analog FM fading: Just signal attenuation
+                    // No digital corruption artifacts (no codec to corrupt!)
+                    x *= dropoutEnvelope;
                 }
 
-                // Lowpass filter (after dropout for smoothness)
-                float y = _prevOut[c] + alpha * (x - _prevOut[c]);
+                // === Digital brick-wall filter (biquad) ===
+                // State indices for this channel: [x[n-1], x[n-2], y[n-1], y[n-2]]
+                int stateBase = c * 4;
+                
+                // Direct Form II biquad implementation
+                float xn1 = _filterState[stateBase];     // x[n-1]
+                float xn2 = _filterState[stateBase + 1]; // x[n-2]
+                float yn1 = _filterState[stateBase + 2]; // y[n-1]
+                float yn2 = _filterState[stateBase + 3]; // y[n-2]
+                
+                // Compute output
+                float y = b0 * x + b1 * xn1 + b2 * xn2 - a1 * yn1 - a2 * yn2;
+                
+                // Update state
+                _filterState[stateBase + 1] = xn1; // x[n-2] = x[n-1]
+                _filterState[stateBase] = x;       // x[n-1] = x[n]
+                _filterState[stateBase + 3] = yn1; // y[n-2] = y[n-1]
+                _filterState[stateBase + 2] = y;   // y[n-1] = y[n]
+                
                 _prevOut[c] = y;
+                
+                // Apply gain
+                float val = y * p.Gain;
 
-                // === Variable flutter modulation ===
-                float flutterAmount = 0.05f * p.FlutterDepth * _flutterDepthMod;
-                float flutter = 1f + flutterAmount * (float)Math.Sin(_flutterPhase);
-                
-                // Add occasional "warble" (fast AM modulation)
-                if (rng.NextDouble() < 0.0005) // Rare warble events
+                // === Analog receiver noise (optional) ===
+                // In weak signal conditions, analog FM receivers exhibit:
+                // - Thermal noise (becomes dominant below FM threshold)
+                // - Background hiss
+                // This is different from digital quantization noise!
+                if (p.NoiseLevel > 0.1f && squelchGain > 0f)
                 {
-                    float warble = (float)Math.Sin(_flutterPhase * 40.0) * 0.02f;
-                    flutter += warble;
+                    // Thermal/background noise (analog characteristic)
+                    // Only when signal is weak and squelch is open
+                    float thermalNoise = (float)(rng.NextDouble() * 2.0 - 1.0) * p.NoiseLevel * 0.02f;
+                    val += thermalNoise;
                 }
-                
-                float val = y * p.Gain * flutter;
 
                 // Clamp to safe range
+                val = Math.Clamp(val, -1f, 1f);
+                
+                // === Mix in squelch burst INDEPENDENTLY ===
+                // This happens outside the signal chain so it's always audible
+                // regardless of gain or squelch state
+                val += squelchBurstSample;
+                
                 buffer[idx] = Math.Clamp(val, -1f, 1f);
             }
 
             if (inDrop) _dropoutSamplesLeft--;
-
-            // Update flutter phase with variable frequency
-            _flutterPhase += 2 * Math.PI * _flutterFreq * dt;
-            if (_flutterPhase > Math.PI * 2.0)
-                _flutterPhase -= Math.PI * 2.0;
         }
     }
 }

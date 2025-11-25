@@ -13,12 +13,16 @@ namespace BMSAudioSim
     public class AudioParams
     {
         public float Gain; // linear gain
-        public float LowpassHz; // cutoff for low-pass filter
-        public float NoiseLevel; // 0..1 (amount of added noise)
-        public float DropoutProb; // 0..1 (chance of packet drop / glitch)
-        public float FlutterDepth; // 0..1 amplitude flutter depth
-        public float RadioFrequencyMHz; // we need this for the heterodyne frequency
-
+        public float LowpassHz; // cutoff for low-pass filter (codec bandwidth)
+        public float NoiseLevel; // 0..1 (digital quantization noise, not hiss)
+        public float DropoutProb; // 0..1 (digital packet loss / codec errors)
+        public float RadioFrequencyMHz;
+        
+        // RF propagation parameters (for physics-based stepped-on interference)
+        public float Distance_km;    // Distance from transmitter to receiver
+        public float SNR_dB;         // Signal-to-noise ratio
+        public float PathLoss_dB;    // Total path loss
+        
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
     }
@@ -73,6 +77,7 @@ namespace BMSAudioSim
         private readonly double originX, originY, cellSizeMeters;
         private readonly int maxSamplesPerPath = 4096;
         private readonly double weatherDbPerKm = 0.02;
+        private Random _rng = new Random();
 
         public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters)
         {
@@ -188,7 +193,7 @@ namespace BMSAudioSim
             double txPowerDbm, double receiverSensitivityDbm, double freqHz)
         {
             AudioParams ap = new AudioParams();
-            ap.RadioFrequencyMHz = (float) freqHz * 1_000_000;
+            ap.RadioFrequencyMHz = (float)freqHz / 1_000_000;
 
             // -- Earth curvature --
             double refractivityK = CalculateKAvg(txH, rxH);
@@ -345,94 +350,153 @@ namespace BMSAudioSim
             double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm typical
 
             // --- Received power and SNR ---
+            bool isVHF = ap.RadioFrequencyMHz < 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
+
+            // === STRICT LOS ENFORCEMENT (frequency-dependent) ===
+            bool hasSignificantTerrainBlock, hasModerateTerrainBlock;
+
+            if (isVHF) // VHF: 30-174 MHz
+            {
+                // VHF: Longer wavelength (1.7-10m) - more forgiving with terrain
+                hasSignificantTerrainBlock = worstExcess > 200.0 || diffLoss > 25.0;
+                hasModerateTerrainBlock = worstExcess > 80.0 || diffLoss > 15.0;
+            }
+            else // UHF: 225-512 MHz
+            {
+                // UHF: Shorter wavelength (0.6-1.3m) - strict line-of-sight
+                hasSignificantTerrainBlock = worstExcess > 100.0 || diffLoss > 15.0;
+                hasModerateTerrainBlock = worstExcess > 30.0 || diffLoss > 8.0;
+            }
+
+            if (hasSignificantTerrainBlock)
+            {
+                ap.Gain = 0.0f;
+                ap.LowpassHz = 1800.0f; // Doesn't matter, no signal
+                ap.NoiseLevel = 0.95f; // Full noise floor
+                ap.DropoutProb = 0.95f; // Essentially continuous dropout
+                ap.TerrainProfile = profile;
+                return ap;
+            }
+
+            double gainDb;
+
+
             double prDbm = txPowerDbm - pathLossDb;
             double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
-            
-            // === Audio mappings ===
-            double gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
+
+            if (hasModerateTerrainBlock)
+            {
+                double terrainPenaltyDb;
+                float maxGain;
+                float dropoutProb;
+                float noiseLevel;
+
+
+                if (isVHF) // VHF
+                {
+                    // VHF: More forgiving in moderate block
+                    // Longer wavelength (2.4m) diffracts better around obstacles
+                    terrainPenaltyDb = 15.0; // 5 dB less penalty than UHF
+                    maxGain = 0.25f; // 67% higher cap than UHF
+                    noiseLevel = 0.65f; // 19% less noise than UHF
+                    ap.DropoutProb = 0.5f;
+
+                }
+                else // UHF
+                {
+                    // UHF: Harsh penalties in moderate block
+                    // Shorter wavelength (1.0m) blocked more easily
+                    terrainPenaltyDb = 20.0; // Heavy penalty
+                    maxGain = 0.15f; // Severely limited
+                    noiseLevel = 0.80f; // High noise
+                    ap.DropoutProb = 0.8f;
+                }
+
+                // Apply frequency-dependent penalties
+                gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
+                gainDb -= terrainPenaltyDb;
+                ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
+                ap.Gain = Math.Clamp(ap.Gain, 0.0f, maxGain);
+
+                // Force to lowest codec rate
+                ap.LowpassHz = 1800.0f; // Fallback mode
+
+                // Apply frequency-dependent degradation
+                ap.NoiseLevel = noiseLevel;
+                ap.TerrainProfile = profile;
+                return ap;
+            }
+
+
+// === CLEAN LOS PATH - Normal operation ===
+            gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
             ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
 
+// Digital codec bandwidth - STEPPED not gradual
             double cutoff;
+            if (snrDb < 0.0)
+            {
+                cutoff = 1800.0; // Low-rate codec (2.4 kbps CVSD)
+            }
+            else if (snrDb < 8.0)
+            {
+                cutoff = 2800.0; // Standard MELP (2.4 kbps)
+            }
+            else if (snrDb < 18.0)
+            {
+                cutoff = 3200.0; // Enhanced MELP (4.8 kbps)
+            }
+            else
+            {
+                cutoff = 3400.0; // Full quality (6.0 kbps)
+            }
+
+// Add some jitter at boundaries
+            if (snrDb > -1.0 && snrDb < 1.0)
+            {
+                cutoff += (_rng.NextDouble() * 2.0 - 1.0) * 200.0;
+            }
+
+            ap.LowpassHz = (float)Math.Clamp(cutoff, 1800.0, 3500.0);
+
+// Digital quantization noise
+            double noise;
             if (snrDb < 5.0)
             {
-                // Very poor signal: narrow bandwidth (500-2000 Hz)
-                cutoff = 500.0 + (snrDb + 20.0) * 60.0; // -20 dB → 500 Hz, 5 dB → 2000 Hz
+                noise = Math.Clamp((10.0 - snrDb) / 30.0, 0.15, 0.9);
             }
             else if (snrDb < 15.0)
             {
-                // Marginal signal: ramp up to nominal (2000-3000 Hz)
-                cutoff = 2000.0 + (snrDb - 5.0) * 100.0;
+                noise = Math.Clamp((20.0 - snrDb) / 40.0, 0.05, 0.3);
             }
             else
             {
-                // Good signal: fixed nominal bandwidth
-                cutoff = 3000.0;
+                noise = 0.02;
             }
 
-            ap.LowpassHz = (float)Math.Clamp(cutoff, 500.0, 3500.0);
-
-            double noise = Math.Clamp((30.0 - snrDb) / 50.0, 0.02, 1.0);
             ap.NoiseLevel = (float)noise;
 
+// Digital dropout probability
             double dropout;
-            const double fmThreshold = 10.0; // typical FM capture threshold
-            const double transitionWidth = 5.0; // dB
+            const double digitalThreshold = 8.0;
+            const double transitionWidth = 4.0;
 
-            if (snrDb > fmThreshold + transitionWidth)
+            if (snrDb > digitalThreshold + transitionWidth)
             {
-                // Clean signal: no dropouts
                 dropout = 0.0;
             }
-            else if (snrDb < fmThreshold - transitionWidth)
+            else if (snrDb < digitalThreshold - transitionWidth)
             {
-                // Poor signal: heavy dropouts (but not 100%)
-                dropout = 0.5 + 0.3 * (1.0 - (snrDb + 20.0) / 15.0);
-                dropout = Math.Clamp(dropout, 0.5, 0.85);
+                dropout = 0.6 + 0.2 * (1.0 - (snrDb + 20.0) / 16.0);
+                dropout = Math.Clamp(dropout, 0.6, 0.85);
             }
             else
             {
-                // Transition region: sigmoid curve
-                double normalized = (snrDb - fmThreshold) / transitionWidth;
-                dropout = 0.4 * (1.0 - Math.Tanh(normalized * 2.0));
-            }
-
-            // Terrain obstruction penalty (scaled with severity)
-            if (worstExcess > 50.0)
-            {
-                double terrainFactor = Math.Min(1.0, (worstExcess - 50.0) / 150.0); // 0 to 1 for 50-200m
-                dropout = Math.Min(0.9, dropout + 0.15 * terrainFactor);
+                double normalized = (snrDb - digitalThreshold) / transitionWidth;
+                dropout = 0.35 * (1.0 - Math.Tanh(normalized * 3.0));
             }
 
             ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 0.9);
-
-            double flutterMultipath = 0.0;
-            double flutterAtmo = 0.0;
-
-            // Multipath from terrain diffraction
-            if (diffLoss > 5.0)
-            {
-                flutterMultipath = Math.Min(0.25, Math.Abs(diffLoss) / 60.0);
-            }
-
-            // Two-ray multipath over water
-            if (oceanFrac > 0.3 && Math.Abs(twoRayDb) > 3.0)
-            {
-                flutterMultipath = Math.Max(flutterMultipath, 0.3);
-            }
-
-            // Distance-based atmospheric effects (tropospheric scattering, refraction)
-            double distKm = dist / 1000.0;
-            if (distKm > 100.0)
-            {
-                flutterAtmo = Math.Min(0.2, (distKm - 100.0) / 400.0); // Increases 100-500 km
-            }
-
-            // Baseline flutter (oscillator instability, vibration)
-            const double baseFlutter = 0.05;
-
-            // Combine all sources
-            double flutter = baseFlutter + flutterMultipath + flutterAtmo;
-            ap.FlutterDepth = (float)Math.Clamp(flutter, 0.0, 1.0);
 
             ap.TerrainProfile = profile;
             return ap;

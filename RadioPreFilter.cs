@@ -41,7 +41,10 @@ public class RadioPreFilter
         const float threshold = 0.2f;       // -14dB threshold
         const float ratio = 6.0f;           // 6:1 compression (moderate)
         
-        for (int i = 0; i < samples; i += channels)
+        // Calculate number of frames
+        int frames = samples / channels;
+        
+        for (int frame = 0; frame < frames; frame++)
         {
             // Generate noise
             float noise = 0f;
@@ -53,7 +56,7 @@ public class RadioPreFilter
 
             for (int c = 0; c < channels; c++)
             {
-                int idx = offset + i + c;
+                int idx = offset + frame * channels + c;
                 float x = buffer[idx];
 
                 // Add noise

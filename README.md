@@ -15,6 +15,11 @@ Simulation of BMS new terrain effects on radio transmissions.
 * Radio pre-filter for realism
 * Frequency-based receiver sensitivity and noise floor
 
+### Interference Simulations
+* Modern digital radio interference
+* Calculations based on respective signal strengths
+* FM capture behaviour simulation
+
 ## Installation
 * Unpack everything
 * Run BMSAudio.exe
