@@ -31,6 +31,8 @@ public static class RadioPlayback
     private static float _currentHeterodyneFreq = 0;
     private static float _heterodyneDriftTarget = 0;
     private static float _heterodyneDrift = 0;
+    private static int _heterodyneDropoutSamplesRemaining = 0;
+    private static float _heterodyneDropoutFade = 1.0f;
     private static float _lastRadioFrequencyMHz = 0;
     private static Random _rng = new Random();
 
@@ -188,7 +190,8 @@ public static class RadioPlayback
     }
 
     private static void MixWithCaptureEffect(float[] primary, float[] secondary, float[] output,
-        int samples, int sampleRate, double powerDiffDbm, float radioFrequencyMHz, float primaryGain, float secondaryGain, float dropoutProb)
+        int samples, int sampleRate, double powerDiffDbm, float radioFrequencyMHz, float primaryGain,
+        float secondaryGain, float dropoutProb)
     {
         double dt = 1.0 / sampleRate;
 
@@ -245,16 +248,19 @@ public static class RadioPlayback
             {
                 // Interference region
 
+                // Calculate signal strength (limited by weaker signal)
+                float signalStrength = Math.Min(primaryGain, secondaryGain);
+
                 // Fast switching (10-40 Hz) - creates "buzz" quality
                 float fastSwitchRate = 10.0f + (0.5f - Math.Abs(0.5f - mixer.CaptureRatio)) * 60.0f;
                 _switchPhase += 2 * Math.PI * fastSwitchRate * dt;
                 if (_switchPhase > Math.PI * 2) _switchPhase -= Math.PI * 2;
-                float fastMod = (float)Math.Sin(_switchPhase) * 0.15f;
+                float fastMod = (float)Math.Sin(_switchPhase) * (0.15f * signalStrength);
 
                 // Slow warble (1 Hz) - gradual drift in mixing ratio
                 _warblePhase += 2 * Math.PI * 1.0 * dt;
                 if (_warblePhase > Math.PI * 2) _warblePhase -= Math.PI * 2;
-                float slowMod = (float)Math.Sin(_warblePhase) * 0.1f;
+                float slowMod = (float)Math.Sin(_warblePhase) * (0.1f * signalStrength);
 
                 // Combine modulations
                 float instantCapture = mixer.CaptureRatio + fastMod + slowMod;
@@ -274,47 +280,59 @@ public static class RadioPlayback
 
                     float driftSpeed = 0.0001f;
                     _heterodyneDrift += (_heterodyneDriftTarget - _heterodyneDrift) * driftSpeed;
-    
-                    // Heterodyne amplitude limited by weaker signal
-                    float signalStrength = Math.Min(primaryGain, secondaryGain);
-                   
+
                     // Add phase noise when signals are weak
                     float phaseNoise = 0;
                     if (signalStrength < 0.5f)
                     {
-                        // More phase noise when weak (unstable carriers)
-                        float noiseAmount = (0.5f - signalStrength) * 2.0f; // 0 to 1
+                        float noiseAmount = (0.5f - signalStrength) * 2.0f;
                         phaseNoise = (float)(_rng.NextDouble() * 2 - 1) * noiseAmount * 0.1f;
                     }
-    
+
                     float actualFreq = _currentHeterodyneFreq + _heterodyneDrift + phaseNoise;
-    
+
                     _heterodynePhase += 2 * Math.PI * actualFreq * dt;
                     if (_heterodynePhase > Math.PI * 2) _heterodynePhase -= Math.PI * 2;
 
-                    // Scale amplitude by weaker signal and interference level
+                    // Scale amplitude by signal strength
                     float heterodyneAmplitude = mixer.InterferenceLevel * 0.2f * signalStrength;
-                    
-                    if (dropoutProb > 0 && _rng.NextDouble() < dropoutProb * 0.5)
+
+                    // Check for dropout at reasonable intervals (every 50ms)
+                    if (i % (sampleRate / 20) == 0)
                     {
-                        // Heterodyne cuts out (carriers lost in noise burst)
-                        heterodyneAmplitude = 0;
+                        if (dropoutProb > 0 && _rng.NextDouble() < dropoutProb)
+                        {
+                            int dropoutDurationMs = 50 + (int)(_rng.NextDouble() * 100);
+                            _heterodyneDropoutSamplesRemaining = (int)(sampleRate * dropoutDurationMs / 1000.0);
+                        }
                     }
-                    
+
+                    // Smooth fade in/out
+                    if (_heterodyneDropoutSamplesRemaining > 0)
+                    {
+                        _heterodyneDropoutFade = Math.Max(0, _heterodyneDropoutFade - 0.01f);
+                        _heterodyneDropoutSamplesRemaining--;
+                    }
+                    else
+                    {
+                        _heterodyneDropoutFade = Math.Min(1.0f, _heterodyneDropoutFade + 0.01f);
+                    }
+
+                    heterodyneAmplitude *= _heterodyneDropoutFade;
+
                     float heterodyne = (float)Math.Sin(_heterodynePhase) * heterodyneAmplitude;
-    
                     mixed += heterodyne;
                 }
 
-                // Add interference distortion
+                // Add interference distortion (also scale by signal strength)
                 if (mixer.InterferenceLevel > 0.35f)
                 {
-                    // Intermodulation distortion
-                    float im = mixed * mixed * Math.Sign(mixed) * mixer.InterferenceLevel * 0.2f;
+                    // Intermodulation distortion - weaker with weak signals
+                    float im = mixed * mixed * Math.Sign(mixed) * mixer.InterferenceLevel * 0.2f * signalStrength;
                     mixed += im;
 
-                    // Random noise bursts
-                    if (_rng.NextDouble() < mixer.InterferenceLevel * 0.01)
+                    // Random noise bursts - scale probability with signal strength
+                    if (_rng.NextDouble() < mixer.InterferenceLevel * 0.01 * signalStrength)
                     {
                         mixed += (float)(_rng.NextDouble() * 2 - 1) * 0.3f;
                     }

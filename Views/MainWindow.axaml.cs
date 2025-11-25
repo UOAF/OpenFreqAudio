@@ -398,8 +398,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             
         if (!_audioPlaying)
         {
-            RadioPlayback.Start("countdown.wav", "audio2.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
-            //RadioPlayback.Start("silence.ogg", "silence.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
+            RadioPlayback.Start("countdown.ogg", "audio2.ogg", audioParams, ViewModel.SteppedEnabled, ViewModel.SteppedDiffDbm);
             _audioPlaying = true;
         }
         else
