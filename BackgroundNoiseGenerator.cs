@@ -54,11 +54,11 @@ public class BackgroundNoiseGenerator
         {
             float xf = (float)(x % (2.0 * Math.PI));
             if (xf < 0) xf += 2f * MathF.PI;
-            
+    
             float indexF = xf * IndexScale;
-            int index = (int)indexF;
+            int index = (int)indexF & IndexMask;
             float frac = indexF - index;
-            
+    
             int nextIndex = (index + 1) & IndexMask;
             return _table[index] * (1f - frac) + _table[nextIndex] * frac;
         }

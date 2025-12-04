@@ -81,6 +81,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e);
         _radioPlayback.Initialize();
+        _radioPlayback.SetSquelchThreshold((float) SquelchSliderToDb(ViewModel.Squelch));
         _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Right);
         _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Left);
     }
@@ -627,9 +628,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        double dB = -40 + (e.NewValue * 4.0);     // map 0–10 to -40 dB → 0 dB
-        double value = Math.Pow(10, dB / 20.0);   // convert dB to linear
-        Console.Out.WriteLine($"SetSquelchThreshold {value}");
-        _radioPlayback.SetSquelchThreshold((float)value);
+        var squelchValue = SquelchSliderToDb(e.NewValue);
+        Console.Out.WriteLine($"SetSquelchThreshold {squelchValue}");
+        _radioPlayback.SetSquelchThreshold((float)squelchValue);
+    }
+
+    private double SquelchSliderToDb(double sliderValue)
+    {
+        double dB = -40 + (sliderValue * 4.0);     // map 0–10 to -40 dB → 0 dB
+        return Math.Pow(10, dB / 20.0);   // convert dB to linear
     }
 }
