@@ -82,12 +82,20 @@ namespace BMSAudioSim
     // ================================================================
     public class FastPathAudioSim
     {
-        private const double EarthRadius = 6378000.0;
+        // Physical constants
+        private const double EarthRadius = 6378000.0; // meters
+        private const double SpeedOfLight = 299792458.0; // m/s
+        private const double FourPi = 12.566370614359172; // 4 * π (precomputed)
+        
+        // RF modulation constants
+        private const double VhfUhfBoundaryMHz = 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
+        private const float VhfBandwidthHz = 3000.0f; // AM voice bandwidth
+        private const float UhfBandwidthHz = 3400.0f; // FM voice bandwidth
+        
         private readonly DEMReader dem;
         private readonly double originX, originY, cellSizeMeters;
         private readonly int maxSamplesPerPath = 4096;
         private readonly double weatherDbPerKm = 0.02;
-        private Random _rng = new Random();
 
         public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters)
         {
@@ -132,9 +140,8 @@ namespace BMSAudioSim
         private static double FSPL_dB(double distanceMeters, double freqHz)
         {
             if (distanceMeters < 1.0) distanceMeters = 1.0;
-            double c = 299792458.0;
-            double lambda = c / freqHz;
-            return 20.0 * Math.Log10(4.0 * Math.PI * distanceMeters / lambda);
+            double lambda = SpeedOfLight / freqHz;
+            return 20.0 * Math.Log10(FourPi * distanceMeters / lambda);
         }
 
         // Knife-edge diffraction loss (dB)
@@ -143,6 +150,17 @@ namespace BMSAudioSim
             if (v < -0.78) return 0.0;
             double term = Math.Sqrt((v - 0.1) * (v - 0.1) + 1.0) + (v - 0.1);
             return 6.9 + 20.0 * Math.Log10(term);
+        }
+
+        // Helper to finalize AudioParams with common fields and optional terrain profile
+        private void FinalizeAudioParams(AudioParams ap, double dist, double snrDb, double pathLossDb, 
+            List<(double dist, double elev)> profile, bool includeTerrainProfile)
+        {
+            ap.Distance_km = (float)(dist / 1000.0);
+            ap.SNR_dB = (float)snrDb;
+            ap.PathLoss_dB = (float)pathLossDb;
+            if (includeTerrainProfile)
+                ap.TerrainProfile = profile;
         }
 
         // Adaptive sampling of terrain along the line
@@ -200,47 +218,59 @@ namespace BMSAudioSim
         public AudioParams ComputeAudioForPath(
             double txX, double txY, double txH,
             double rxX, double rxY, double rxH,
-            double txPowerDbm, double receiverSensitivityDbm, double freqHz)
+            double txPowerDbm, double receiverSensitivityDbm, double freqHz,
+            bool includeTerrainProfile = false) // Opt-in debug data
         {
             AudioParams ap = new AudioParams();
             ap.RadioFrequencyMHz = (float)freqHz / 1_000_000;
 
-            // -- Earth curvature --
+            // --- Basic geometry ---
+            double dx = rxX - txX, dy = rxY - txY;
+            double distSquared = dx * dx + dy * dy;
+            double dist = Math.Sqrt(distSquared);
+            if (dist < 1.0) dist = 1.0;
+
+            // === Early exit for extreme distances ===
+            // >500km is unrealistic for VHF/UHF tactical radio
+            if (dist > 500000.0) 
+            {
+                ap.Gain = 0.0f;
+                ap.LowpassHz = VhfBandwidthHz;
+                ap.NoiseLevel = 0.95f;
+                ap.DropoutProb = 0.0f;
+                ap.Distance_km = (float)(dist / 1000.0);
+                return ap;
+            }
+
+            // === Earth curvature and atmospheric refraction ===
             double refractivityK = CalculateKAvg(txH, rxH);
             double R_eff = EarthRadius * refractivityK;
 
-            // --- Basic geometry ---
-            double dx = rxX - txX, dy = rxY - txY;
-            double dist = Math.Sqrt(dx * dx + dy * dy);
-            if (dist < 1.0) dist = 1.0;
-
-            // --- Free-space path loss baseline ---
+            // === RF propagation parameters ===
+            double lambda = SpeedOfLight / freqHz;
             double fspl = FSPL_dB(dist, freqHz);
-            double c = 299792458.0;
-            double lambda = c / freqHz;
 
-            // --- Adaptive sampling ---
+            // === Terrain profile sampling (adaptive based on Fresnel zone) ===
             double r1 = 0.5 * Math.Sqrt(lambda * dist);
             double samplesAcross = (freqHz > 300e6) ? 8.0 : 5.0;
             double targetSpacing = Math.Max(Math.Min(r1 / samplesAcross, 100.0), 5.0);
             int desiredSamples = (int)Math.Min(maxSamplesPerPath, Math.Max(64, Math.Ceiling(dist / targetSpacing)));
-
-            // --- Sample terrain profile ---
             var profile = SampleProfileAdaptive(txX, txY, rxX, rxY, desiredSamples);
 
-            // --- LOS and diffraction analysis ---
+            // === Line-of-sight and diffraction analysis ===
             double txTop = SampleElevation(txX, txY) + txH;
             double rxTop = SampleElevation(rxX, rxY) + rxH;
             double worstExcess = double.NegativeInfinity;
             double worstDistFromTx = 0.0;
             double oceanFrac = 0.0;
+            double inverseTwoReff = 1.0 / (2.0 * R_eff); // Precompute for loop efficiency
 
             foreach (var pt in profile)
             {
                 // pt.dist = distance from TX to sample (meters)
                 // Compute curvature bulge (meters) at this sample relative to straight chord
                 // bulge = x * (D - x) / (2 * R_eff)
-                double bulge = (pt.dist * (dist - pt.dist)) / (2.0 * R_eff);
+                double bulge = pt.dist * (dist - pt.dist) * inverseTwoReff;
 
                 // effective ground elevation includes curvature bulge
                 double effectiveGround = pt.elev + bulge;
@@ -259,7 +289,7 @@ namespace BMSAudioSim
 
             oceanFrac /= profile.Count;
 
-            // --- Diffraction ---
+            // === Diffraction loss calculation (knife-edge approximation) ===
             double diffLoss = 0.0;
             if (worstExcess > 0.0)
             {
@@ -269,10 +299,8 @@ namespace BMSAudioSim
                 diffLoss = KnifeEdgeLoss_dB(v);
             }
 
-            // --- Weather attenuation ---
+            // === Total path loss ===
             double weatherLoss = weatherDbPerKm * (dist / 1000.0);
-
-            // --- Total path loss ---
             double pathLossDb = fspl + diffLoss + weatherLoss;
 
             // --- Tunables (adjust to taste) ---
@@ -364,7 +392,7 @@ namespace BMSAudioSim
             double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
             double gainDb;
             
-            bool isVHF = ap.RadioFrequencyMHz < 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
+            bool isVHF = ap.RadioFrequencyMHz < VhfUhfBoundaryMHz; // VHF: 30-174 MHz, UHF: 225-512 MHz
 
             // === STRICT LOS ENFORCEMENT (frequency-dependent) ===
             // Calculate first Fresnel zone radius at worst obstruction point
@@ -384,13 +412,10 @@ namespace BMSAudioSim
                 if (worstExcess > F1_radius * 0.3 || diffLoss > 6.0)
                 {
                     ap.Gain = 0.0f;
-                    ap.LowpassHz = 3400.0f; // Doesn't matter, no signal
+                    ap.LowpassHz = UhfBandwidthHz;
                     ap.NoiseLevel = 0.95f; // Full noise floor
                     ap.DropoutProb = 0.0f; // No signal to drop out
-                    ap.Distance_km = (float)(dist / 1000.0);
-                    ap.SNR_dB = (float)snrDb;
-                    ap.PathLoss_dB = (float)pathLossDb;
-                    ap.TerrainProfile = profile;
+                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
                     return ap;
                 }
                 
@@ -405,13 +430,10 @@ namespace BMSAudioSim
                     
                     ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
                     ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.08f); // Severely limited
-                    ap.LowpassHz = 3400.0f;
+                    ap.LowpassHz = UhfBandwidthHz;
                     ap.NoiseLevel = 0.85f; // Very noisy
                     ap.DropoutProb = 1.2f; // Heavy fading
-                    ap.Distance_km = (float)(dist / 1000.0);
-                    ap.SNR_dB = (float)snrDb;
-                    ap.PathLoss_dB = (float)pathLossDb;
-                    ap.TerrainProfile = profile;
+                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
                     return ap;
                 }
             }
@@ -422,13 +444,10 @@ namespace BMSAudioSim
                 if (worstExcess > F1_radius * 0.6 || diffLoss > 20.0)
                 {
                     ap.Gain = 0.0f;
-                    ap.LowpassHz = 3000.0f; // Doesn't matter, no signal
+                    ap.LowpassHz = VhfBandwidthHz;
                     ap.NoiseLevel = 0.95f;
                     ap.DropoutProb = 0.0f;
-                    ap.Distance_km = (float)(dist / 1000.0);
-                    ap.SNR_dB = (float)snrDb;
-                    ap.PathLoss_dB = (float)pathLossDb;
-                    ap.TerrainProfile = profile;
+                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
                     return ap;
                 }
                 
@@ -447,13 +466,10 @@ namespace BMSAudioSim
                     ap.Gain = (float)(ap.Gain * degradationFactor);
                     ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.35f);
                     
-                    ap.LowpassHz = 3000.0f;
+                    ap.LowpassHz = VhfBandwidthHz;
                     ap.NoiseLevel = (float)(0.55 + (1.0 - degradationFactor) * 0.30);
                     ap.DropoutProb = (float)(0.4 + (1.0 - degradationFactor) * 0.5);
-                    ap.Distance_km = (float)(dist / 1000.0);
-                    ap.SNR_dB = (float)snrDb;
-                    ap.PathLoss_dB = (float)pathLossDb;
-                    ap.TerrainProfile = profile;
+                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
                     return ap;
                 }
             }
@@ -467,7 +483,7 @@ namespace BMSAudioSim
             if (isVHF)
             {
                 // === VHF AM (30-174 MHz): Amplitude Modulation ===
-                ap.LowpassHz = 3000.0f; // Fixed AM voice bandwidth (~300-3000 Hz)
+                ap.LowpassHz = VhfBandwidthHz; // AM voice bandwidth (~300-3000 Hz)
                 
                 // Analog static increases smoothly with decreasing SNR
                 if (snrDb > 20.0)
@@ -476,24 +492,24 @@ namespace BMSAudioSim
                 }
                 else if (snrDb > 10.0)
                 {
-                    // Light static
-                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02→0.20
+                    // Light static: 0.02 → 0.20
+                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18);
                 }
                 else if (snrDb > 0.0)
                 {
-                    // Heavy static
-                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20→0.55
+                    // Heavy static: 0.20 → 0.55
+                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35);
                 }
                 else
                 {
-                    // Barely intelligible
-                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55→0.85
+                    // Barely intelligible: 0.55 → 0.85
+                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30));
                 }
             }
             else
             {
                 // === UHF FM (225-512 MHz): Frequency Modulation ===
-                ap.LowpassHz = 3400.0f; // Fixed FM voice bandwidth (~300-3400 Hz)
+                ap.LowpassHz = UhfBandwidthHz; // FM voice bandwidth (~300-3400 Hz)
                 
                 // FM "quieting" - noise suppression improves with stronger signal
                 // FM threshold effect: below ~10 dB SNR, noise increases rapidly
@@ -503,23 +519,23 @@ namespace BMSAudioSim
                 }
                 else if (snrDb > 10.0)
                 {
-                    // Good quieting
-                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01→0.10
+                    // Good quieting: 0.01 → 0.10
+                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09);
                 }
                 else if (snrDb > 5.0)
                 {
-                    // FM threshold region - noise rises
-                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10→0.40
+                    // FM threshold region: 0.10 → 0.40
+                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30);
                 }
                 else if (snrDb > 0.0)
                 {
-                    // Below FM threshold - heavy noise
-                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40→0.75
+                    // Below FM threshold: 0.40 → 0.75
+                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35);
                 }
                 else
                 {
-                    // Very weak signal
-                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75→0.95
+                    // Very weak signal: 0.75 → 0.95
+                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20));
                 }
             }
 
@@ -551,37 +567,37 @@ namespace BMSAudioSim
 
             ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.5);
 
-            // Store propagation parameters for physics-based interference
-            ap.Distance_km = (float)(dist / 1000.0);
-            ap.SNR_dB = (float)snrDb;
-            ap.PathLoss_dB = (float)pathLossDb;
-            ap.TerrainProfile = profile;
+            // Finalize and return
+            FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
             return ap;
         }
 
         public static double CalculateKAvg(double senderAltitude, double receiverAltitude)
         {
-            // calculates k_avg according to SAND2012-10690, section 3.2.3
-            // Constants
-            // senderAltitude = h_a, receiverAltitude = h_s
-            // earthRadius = R_e
+            // Calculates average atmospheric refractivity factor k_avg
+            // Based on SAND2012-10690, section 3.2.3
+            // Used to compute effective Earth radius: R_eff = k_avg * R_earth
 
             if (senderAltitude < 0) senderAltitude = 0;
             if (receiverAltitude < 0) receiverAltitude = 0;
-            if (senderAltitude - receiverAltitude == 0) return 1;
+            
+            double altitudeDiff = senderAltitude - receiverAltitude;
+            if (altitudeDiff == 0) return 1.0;
 
-            const double N_s = 324.8; // Average global surface refractivity according to Altshuler
-            const double psi_g = 0; // neglible according to 3.2
+            // Atmospheric refractivity constants
+            const double N_s = 324.8; // Average global surface refractivity (Altshuler)
+            const double h_b = 12192; // Breakpoint altitude in meters (~40k ft)
+            const double N_b = 66.65; // Breakpoint refractivity
+            const double LogNsOverNb = 1.5829767628777844; // Precomputed Math.Log(N_s / N_b)
+            
+            double H_b = (h_b - receiverAltitude) / LogNsOverNb;
+            double altDiffOverHb = altitudeDiff / H_b;
 
-            // Calculate H_b according to (24)
-            const double h_b = 12192; // breakpoint altitude in meters - 40k ft
-            const double N_b = 66.65; // breakpoint refractivity
-            double H_b = (h_b - receiverAltitude) / Math.Log(N_s / N_b);
-
-            double term1 = (1e-6 * N_s * Math.Cos(psi_g) * EarthRadius) / H_b;
-            double term2 = (senderAltitude - receiverAltitude) / H_b;
-            double term3 = Math.Pow(Math.E, (senderAltitude - receiverAltitude) / H_b) - 1;
-            double kAvg = 1 / (1 - term1 * (term2 / term3));
+            // psi_g = 0 (grazing angle negligible per section 3.2)
+            // Therefore Math.Cos(psi_g) = 1.0
+            double term1 = (1e-6 * N_s * EarthRadius) / H_b;
+            double term3 = Math.Exp(altDiffOverHb) - 1.0;
+            double kAvg = 1.0 / (1.0 - term1 * (altDiffOverHb / term3));
 
             return kAvg;
         }
