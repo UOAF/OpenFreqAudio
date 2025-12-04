@@ -4,7 +4,8 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:avalonia="clr-namespace:ScottPlot.Avalonia;assembly=ScottPlot.Avalonia"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        MinHeight="1000"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="1000"
         x:Class="BMSAudioSim.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
@@ -103,7 +104,7 @@
         </Grid>
 
         <!-- Bottom Info Panel -->
-        <Grid Grid.Row="2" Margin="10" ColumnDefinitions="*,*,*">
+        <Grid Grid.Row="2" Margin="10" ColumnDefinitions="*,*,*" Name="ConfigPanel" IsEnabled="False">
             <StackPanel Grid.Column="0" Margin="5">
                 <TextBlock Text="Sender:" FontWeight="Bold" />
                 <TextBlock Name="SenderPosText" Text="Not set" />
@@ -116,19 +117,13 @@
                         <RadioButton Content="VHF" Margin="5, 0" />
                         <TextBlock VerticalAlignment="Center" Text="Frequency " Margin="15, 0, 0, 0" />
                         <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}" />
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal">
-                        <CheckBox Name="Stepped" IsChecked="{Binding SteppedEnabled}" IsCheckedChanged="ToggleButton_OnIsCheckedChanged">
-                            Interfering Signal - Strength
-                        </CheckBox>
                         
-                        <TextBlock Margin="10, 0, 0, 0" Text="Original Signal" VerticalAlignment="Center" />
-                        <Slider IsEnabled="{Binding SteppedEnabled}" Minimum="-15" Maximum="15"
+                        <TextBlock Margin="5, 0" Text="Squelch" VerticalAlignment="Center"/>
+                        <TextBlock Margin="5, 0" Text="{Binding Squelch}" VerticalAlignment="Center"/>
+                        <Slider Minimum="0" Maximum="10"
                                 TickPlacement="Outside"
-                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SteppedDiffDbm}"
-                                ValueChanged="OnAltSliderChanged" MinWidth="200">
-                        </Slider>
-                        <TextBlock Text="Interfering Signal" VerticalAlignment="Center" />
+                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Squelch}"
+                                ValueChanged="OnSquelchSliderChanged" MinWidth="80" VerticalAlignment="Center"/>
                     </StackPanel>
                     
                     <StackPanel Orientation="Horizontal" Spacing="5">
@@ -137,11 +132,22 @@
                         <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
                         <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
                     </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="5" IsEnabled="{Binding SteppedEnabled}">
+                    <StackPanel Orientation="Horizontal" Spacing="5">
                         <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
                         <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
                         <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
                         <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                    </StackPanel>
+                    
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Signal Boost" VerticalAlignment="Center"/>
+                        <TextBlock Margin="10, 0, 0, 0" Text="Signal 1" VerticalAlignment="Center" />
+                        <Slider Minimum="-15" Maximum="15"
+                                TickPlacement="Outside"
+                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SteppedDiffDbm}"
+                                ValueChanged="OnAltSliderChanged" MinWidth="200">
+                        </Slider>
+                        <TextBlock Text="Signal 2" VerticalAlignment="Center" />
                     </StackPanel>
                 </StackPanel>
             </StackPanel>

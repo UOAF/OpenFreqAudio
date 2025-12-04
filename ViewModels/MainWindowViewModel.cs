@@ -10,13 +10,18 @@ public class MainWindowViewModel : ReactiveObject
     private int _txDbm = 40;
     private int _rxDbm = -105;
 
-    private double _frequencyMhz = 85.0; // default UHF
+    private double _frequencyMhz = 513.75; // default UHF
 
-    private bool _steppedEnabled = false;
     private int _steppedDiffDbm = 0;
     private bool _signal1Continuous = false;
     private bool _signal2Continuous = false;
-
+    private int _squelch = 0;
+    
+    public int Squelch
+    {
+        get => _squelch;
+        set => this.RaiseAndSetIfChanged(ref _squelch, value);
+    }
     public int TXAltitude
     {
         get => _txAltitude;
@@ -34,13 +39,7 @@ public class MainWindowViewModel : ReactiveObject
         get => _txDbm;
         set => this.RaiseAndSetIfChanged(ref _txDbm, value);
     }
-
-    public bool SteppedEnabled
-    {
-        get => _steppedEnabled;
-        set => this.RaiseAndSetIfChanged(ref _steppedEnabled, value);
-    }
-
+    
     public int SteppedDiffDbm
     {
         get => _steppedDiffDbm;

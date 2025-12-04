@@ -24,6 +24,9 @@ public class RadioEffect
     private readonly object _lock = new();
     private AudioParams _params;
     
+    // User-configurable squelch threshold
+    private float _squelchThreshold = 0.03f;
+    
     // Digital filter state (2-stage biquad needs 4 states per channel)
     private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
     
@@ -35,10 +38,28 @@ public class RadioEffect
     private const int SquelchAttackSamples = 12;   // ~0.25ms at 48kHz (very fast digital)
     private const int SquelchReleaseSamples = 240;  // ~5ms at 48kHz (fast digital)
     
+    /// <summary>
+    /// Check if squelch is currently open (allowing audio through)
+    /// </summary>
+    public bool IsSquelchOpen
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
+            }
+        }
+    }
+    
     // Squelch burst state (the characteristic "pop" when gate opens/closes)
     private int _squelchBurstSamplesLeft = 0;
     private const int SquelchBurstDuration = 720; // ~15ms at 48kHz (longer, softer)
-    private const float SquelchBurstAmplitude = 0.08f; // Softer pop volume
+    private const float SquelchBurstAmplitude = 0.12f; // Audible but not harsh (increased for filtered version)
+    
+    // Squelch burst low-pass filter state (removes harsh high frequencies)
+    private readonly float[] _squelchBurstFilterHistory = new float[4]; // 4-tap moving average (balanced)
+    private int _squelchBurstFilterIndex = 0;
     
     // Dropout state (digital = full muting or corruption)
     private int _dropoutSamplesLeft = 0;
@@ -60,12 +81,12 @@ public class RadioEffect
             lock (_lock)
             {
                 // Detect signal strength changes for squelch
-                bool wasWeak = _params.Gain < 0.03f; // Digital threshold tighter
-                bool isWeak = value.Gain < 0.03f;
+                bool wasWeak = _params.Gain < _squelchThreshold;
+                bool isWeak = value.Gain < _squelchThreshold;
                 
-                if (wasWeak && !isWeak && _squelchState == SquelchState.Closed)
+                // Signal crossed threshold - transition immediately regardless of current state
+                if (wasWeak && !isWeak)
                 {
-                    Console.Out.WriteLine("Squelch Opening");
                     // Signal came up - open squelch (fast digital)
                     _squelchState = SquelchState.Opening;
                     _squelchTransitionSamples = 0;
@@ -73,10 +94,11 @@ public class RadioEffect
                     
                     // Trigger squelch burst (opening pop)
                     _squelchBurstSamplesLeft = SquelchBurstDuration;
+                    Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                    _squelchBurstFilterIndex = 0;
                 }
-                else if (!wasWeak && isWeak && _squelchState == SquelchState.Open)
+                else if (!wasWeak && isWeak)
                 {
-                    Console.Out.WriteLine("Squelch Closing");
                     // Signal dropped - close squelch (fast digital)
                     _squelchState = SquelchState.Closing;
                     _squelchTransitionSamples = 0;
@@ -84,6 +106,8 @@ public class RadioEffect
                     
                     // Trigger squelch burst (closing pop)
                     _squelchBurstSamplesLeft = SquelchBurstDuration;
+                    Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                    _squelchBurstFilterIndex = 0;
                 }
                 
                 _params = value;
@@ -100,7 +124,49 @@ public class RadioEffect
         _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
         
         // Initialize squelch state based on initial signal strength
-        _squelchState = initial.Gain >= 0.03f ? SquelchState.Open : SquelchState.Closed;
+        _squelchState = initial.Gain >= _squelchThreshold ? SquelchState.Open : SquelchState.Closed;
+    }
+
+    /// <summary>
+    /// Set the squelch threshold for this RadioEffect
+    /// </summary>
+    public void SetSquelchThreshold(float threshold)
+    {
+        lock (_lock)
+        {
+            float oldThreshold = _squelchThreshold;
+            _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
+            
+            // Re-evaluate squelch state with new threshold
+            bool wasWeak = _params.Gain < oldThreshold;
+            bool isWeak = _params.Gain < _squelchThreshold;
+            
+            // Handle all states - signal crossed threshold
+            if (wasWeak && !isWeak)
+            {
+                // Signal is now strong enough - open squelch regardless of current state
+                _squelchState = SquelchState.Opening;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchAttackSamples;
+                
+                // Trigger squelch burst
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
+            }
+            else if (!wasWeak && isWeak)
+            {
+                // Signal is now too weak - close squelch regardless of current state
+                _squelchState = SquelchState.Closing;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchReleaseSamples;
+                
+                // Trigger squelch burst
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -113,6 +179,11 @@ public class RadioEffect
             if (_squelchBurstSamplesLeft != 0) return;
             
             _squelchBurstSamplesLeft = SquelchBurstDuration;
+            
+            // Reset filter history to avoid artifacts from previous bursts
+            Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+            _squelchBurstFilterIndex = 0;
+            
             Console.Out.WriteLine($"Triggering Squelch Burst {_squelchBurstSamplesLeft}");
         }
     }
@@ -217,30 +288,42 @@ public class RadioEffect
                 
                 // Gentler envelope: slower attack, slower exponential decay
                 float envelope;
-                if (age < 96) // ~2ms attack at 48kHz (4x longer, much softer)
+                if (age < 120) // ~2.5ms attack at 48kHz (even slower for less click)
                 {
-                    // Ease-in curve for gentle attack
-                    float attackProgress = (float)age / 96f;
-                    envelope = attackProgress * attackProgress; // Quadratic ease-in
+                    // Cubic ease-in curve for very gentle attack
+                    float attackProgress = (float)age / 120f;
+                    envelope = attackProgress * attackProgress * attackProgress; // Cubic ease-in
                 }
                 else
                 {
                     // Slower exponential decay over remaining duration
-                    float decayProgress = (float)(age - 96) / (SquelchBurstDuration - 96);
-                    envelope = MathF.Exp(-3.5f * decayProgress); // Gentler exponential decay
+                    float decayProgress = (float)(age - 120) / (SquelchBurstDuration - 120);
+                    envelope = MathF.Exp(-4.0f * decayProgress); // Slightly faster decay
                 }
                 
-                // Analog-style noise: bandlimited with low-frequency bias
-                // Real squelch noise is filtered by radio's IF stages, not sharp white noise
+                // Generate raw noise
                 float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
                 float noise2 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                float noise3 = (float)(rng.NextDouble() * 2.0 - 1.0);
                 
-                // Simple 2-pole averaging for softer, more analog character
-                // This removes harsh high frequencies that make it sound digital
-                float analogNoise = (noise1 + noise2) * 0.5f;
+                // Pre-average to reduce initial harshness
+                float rawNoise = (noise1 + noise2 + noise3) / 3.0f;
                 
-                // Apply envelope and reduced amplitude for subtler effect
-                squelchBurstSample = analogNoise * envelope * SquelchBurstAmplitude;
+                // Apply 4-tap moving average low-pass filter to remove high frequencies
+                // Balanced between smoothness and audibility
+                _squelchBurstFilterHistory[_squelchBurstFilterIndex] = rawNoise;
+                _squelchBurstFilterIndex = (_squelchBurstFilterIndex + 1) % 4;
+                
+                // Calculate filtered output (average of last 4 samples)
+                float filteredNoise = 0f;
+                for (int i = 0; i < 4; i++)
+                {
+                    filteredNoise += _squelchBurstFilterHistory[i];
+                }
+                filteredNoise /= 4.0f;
+                
+                // Apply envelope and reduced amplitude for subtler, less clicky effect
+                squelchBurstSample = filteredNoise * envelope * SquelchBurstAmplitude;
                 
                 _squelchBurstSamplesLeft--;
             }

@@ -45,41 +45,45 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private readonly string _stream2Id = "stream2";
     private readonly string _stream2File = "audio2.ogg";
 
-    
+
     // Marker display
     private Ellipse? _senderMarker;
     private Ellipse? _receiverMarker;
-    
+
     public MainWindow()
     {
-        this.WhenActivated(disposables => { /* Handle view activation etc. */ });
+        this.WhenActivated(disposables =>
+        {
+            /* Handle view activation etc. */
+        });
         InitializeComponent();
         ButtonSignal1Ptt.AddHandler(Button.PointerPressedEvent, (sender, e) =>
         {
             Console.Out.WriteLine("PointerPressedEvent");
             _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
         }, handledEventsToo: true);
-        
+
         ButtonSignal1Ptt.AddHandler(Button.PointerReleasedEvent, (sender, e) =>
         {
             Console.Out.WriteLine("PointerReleasedEvent");
             _radioPlayback.StopStream(_stream1Id).Wait(300);
+        }, handledEventsToo: true);
 
-        }, handledEventsToo: true);
-        
-        ButtonSignal2Ptt.AddHandler(Button.PointerPressedEvent, (sender, e) =>
-        {
-            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
-        }, handledEventsToo: true);
-        
-        ButtonSignal2Ptt.AddHandler(Button.PointerReleasedEvent, (sender, e) =>
-        {
-            _radioPlayback.StopStream(_stream2Id).Wait(300);
+        ButtonSignal2Ptt.AddHandler(Button.PointerPressedEvent,
+            (sender, e) => { _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params); },
+            handledEventsToo: true);
 
-        }, handledEventsToo: true);
-        
+        ButtonSignal2Ptt.AddHandler(Button.PointerReleasedEvent,
+            (sender, e) => { _radioPlayback.StopStream(_stream2Id).Wait(300); }, handledEventsToo: true);
+    }
+
+    protected override void OnLoaded(RoutedEventArgs e)
+    {
+        base.OnLoaded(e);
+        _radioPlayback.Initialize();
         _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Left);
         _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Right);
+        _radioPlayback.TuneFrequency((float) ViewModel.FrequencyMhz);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -89,11 +93,12 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             Title = "Open Heightmap File",
             AllowMultiple = false,
-            FileTypeFilter = new []{ 
+            FileTypeFilter = new[]
+            {
                 new FilePickerFileType("BMS NT HeightMap") { Patterns = new[] { "HeightMap.raw" } }
             }
         };
-        
+
         var file = await storage.OpenFilePickerAsync(filepickerOptions);
 
         if (file.Count > 0)
@@ -130,11 +135,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             await LoadPreviewImage(_previewImagePath);
 
             StatusText.Text = $"Heightmap loaded: {HEIGHTMAP_SIZE}x{HEIGHTMAP_SIZE}";
-            
+
             clickCount = 0;
             _senderPos = null;
             _receiverPos = null;
-            
+
             UpdatePositionDisplay();
             UpdateMarkers();
         }
@@ -165,12 +170,12 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
                 if (h > maxHeight) maxHeight = h;
             }
         }
-        
+
         float range = maxHeight - minHeight;
         if (range == 0) range = 1;
 
         using var bitmap = new SKBitmap(PREVIEW_SIZE, PREVIEW_SIZE, SKColorType.Rgba8888, SKAlphaType.Opaque);
-    
+
         IntPtr pixelsAddr = bitmap.GetPixels();
         unsafe
         {
@@ -315,14 +320,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         clickCount++;
         UpdatePositionDisplay();
         UpdateMarkers();
+        ConfigPanel.IsEnabled = _senderPos.HasValue && _receiverPos.HasValue;
     }
 
     // ===== MARKER DISPLAY =====
-    
+
     private void UpdateMarkers()
     {
         if (MarkerCanvas == null) return;
-        
+
         MarkerCanvas.Children.Clear();
         _senderMarker = null;
         _receiverMarker = null;
@@ -364,8 +370,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         var imageBounds = HeightmapImage.Bounds;
         var bitmap = HeightmapImage.Source as Bitmap;
-    
-        if (bitmap == null) 
+
+        if (bitmap == null)
             return new Point(0, 0);
 
         // Calculate actual image area considering Uniform stretch
@@ -409,21 +415,21 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             return;
         }
-        
+
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-        
+
         var audioParams = _fastPathAudioSim.ComputeAudioForPath(
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.y),
             txH: ViewModel.TXAltitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
-            _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y), 
+            _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
             ViewModel.RXAltitude, ViewModel.TxDbm, ViewModel.RxDbm, ViewModel.FrequencyMhz * 10e5);
 
-        if (audioParams == null) throw new Exception("audioParams is null"); 
+        if (audioParams == null) throw new Exception("audioParams is null");
         if (audioParams.TerrainProfile == null) throw new Exception("terrainProfile is null");
-            
+
         UpdateProfileGraph(audioParams.TerrainProfile);
 
         GainText.Text = audioParams.Gain.ToString();
@@ -431,12 +437,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         NoiseLvlText.Text = audioParams.NoiseLevel.ToString();
         DropoutProbText.Text = audioParams.DropoutProb.ToString();
 
-        _signal1Params = audioParams;
-        _signal2Params = audioParams;
-        _signal2Params.Distance_km += 1;
+        _signal1Params = audioParams.Copy();
+        _signal2Params = audioParams.Copy();
         
-       
-        
+        // Convert dB to linear multiplier: 10^(dB/20)
+        float linearMultiplier = MathF.Pow(10, ViewModel.SteppedDiffDbm / 20.0f);
+
+        _signal1Params.Gain = audioParams.Gain / linearMultiplier;        
+        _signal2Params.Gain = audioParams.Gain * linearMultiplier;        
+
         _radioPlayback.UpdateStreamParams(_stream1Id, _signal1Params);
         _radioPlayback.UpdateStreamParams(_stream2Id, _signal2Params);
     }
@@ -489,7 +498,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         scatter.LineWidth = 0;
         scatter.FillY = true;
         scatter.FillYValue = yValues.Min();
-        
+
         PixelPadding padding = new(80, 30, 30, 50);
         HeightProfilePlot.Plot.Layout.Fixed(padding);
 
@@ -499,10 +508,10 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         line.Smooth = true;
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-        
+
         var txAbsoluteHeight = ViewModel.TXAltitude + profile.First().elev;
         var rxAbsoluteHeight = ViewModel.RXAltitude + profile.Last().elev;
-        
+
         var senderMarker = HeightProfilePlot.Plot.Add.Marker(xValues[0], txAbsoluteHeight);
         senderMarker.Color = Color.FromHex("#06D6A0");
         senderMarker.Size = 12;
@@ -512,18 +521,18 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         receiverMarker.Color = Color.FromHex("#EF476F");
         receiverMarker.Size = 12;
         receiverMarker.Shape = MarkerShape.FilledCircle;
-        
+
         var lineTXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(txAbsoluteHeight);
         lineTXAlt.Text = $"{txAbsoluteHeight:0} m";
         lineTXAlt.LabelAlignment = Alignment.LowerLeft;
         lineTXAlt.Color = Color.FromHex("#06D6A0");
-        
+
         var lineRXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(rxAbsoluteHeight);
         lineRXAlt.Text = $"{rxAbsoluteHeight:0} m";
         lineRXAlt.LabelAlignment = Alignment.LowerRight;
         lineRXAlt.LabelOppositeAxis = true;
         lineRXAlt.Color = Color.FromHex("#EF476F");
-        
+
         HeightProfilePlot.Plot.Title("Height Profile: Sender to Receiver");
         HeightProfilePlot.Plot.XLabel("Distance (m)");
         HeightProfilePlot.Plot.YLabel("Elevation (m)");
@@ -559,22 +568,24 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         UpdateMarkers();
     }
-    
+
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
 
         _radioPlayback.StopAll().Wait(500);
+        
+        _radioPlayback.UntuneFrequency((float) ViewModel.FrequencyMhz);
         if (RadioButtonUhf.IsChecked == true)
-        {
-            ViewModel.FrequencyMhz = 85.0;
-        }
-        else // VHF
         {
             ViewModel.FrequencyMhz = 513.75;
         }
+        else // VHF
+        {
+            ViewModel.FrequencyMhz = 85.0;
+        }
 
-        ViewModel.SteppedEnabled = Stepped.IsChecked is true;
+        _radioPlayback.TuneFrequency((float) ViewModel.FrequencyMhz);
         UpdateParameters();
         if (ViewModel.Signal1Continuous)
         {
@@ -586,6 +597,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
         }
     }
+
     private void OnSignal1PTTChanged(object? sender, RoutedEventArgs e)
     {
         if (sender is not RadioButton radioButton) return;
@@ -598,7 +610,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
         }
     }
-    
+
     private void OnSignal2PTTChanged(object? sender, RoutedEventArgs e)
     {
         if (sender is not RadioButton radioButton) return;
@@ -610,5 +622,21 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
         }
+    }
+
+    private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
+    {
+        double minVal = 0.01, maxVal = 1.0;
+
+        // Convert dBm to linear scale
+        double linearValue = Math.Pow(10, e.NewValue / 10);
+
+        // Assuming a dBm range between -120 and 0 for normalization
+        double linearMin = Math.Pow(10, -120 / 10);
+        double linearMax = Math.Pow(10, 0 / 10);
+
+        // Normalize the linear value to the range [minVal, maxVal]
+        double normalizedValue = (e.NewValue / 10.0) * (maxVal - minVal) + minVal;
+        _radioPlayback.SetSquelchThreshold((float)normalizedValue);
     }
 }

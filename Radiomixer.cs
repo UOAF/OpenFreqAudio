@@ -13,7 +13,7 @@ public class Radiomixer
 {
     // Pre-loaded stepped-on interference sample
     private static float[]? _steppedOnSample = null;
-    private static int _sampleRate = 48000;
+    private static int _sampleRate = 44100;
     
     // Playback state (use float for smooth playback)
     private float _playbackPosition = 0;
@@ -381,16 +381,6 @@ public class Radiomixer
         
         // Store position for next call
         _playbackPosition = playbackPos;
-    }
-    
-    /// <summary>
-    /// Set the stepped-on sample directly (for testing or runtime loading).
-    /// </summary>
-    public static void SetSteppedOnSample(float[] sample, int sampleRate)
-    {
-        _steppedOnSample = sample;
-        _sampleRate = sampleRate;
-        Console.WriteLine($"[RadioMixer] Loaded stepped-on sample: {sample.Length} samples @ {sampleRate} Hz");
     }
     
     /// <summary>

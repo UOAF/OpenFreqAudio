@@ -13,9 +13,9 @@ namespace BMSAudioSim
     public class AudioParams
     {
         public float Gain; // linear gain
-        public float LowpassHz; // cutoff for low-pass filter (codec bandwidth)
-        public float NoiseLevel; // 0..1 (digital quantization noise, not hiss)
-        public float DropoutProb; // 0..1 (digital packet loss / codec errors)
+        public float LowpassHz; // cutoff for low-pass filter (analog voice bandwidth)
+        public float NoiseLevel; // 0..1 (analog static/hiss level)
+        public float DropoutProb; // 0..1 (multipath fading events per second)
         public float RadioFrequencyMHz;
         
         // RF propagation parameters (for physics-based stepped-on interference)
@@ -25,6 +25,16 @@ namespace BMSAudioSim
         
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
+
+        public AudioParams Copy()
+        {
+            return new AudioParams()
+            {
+                Distance_km = Distance_km, DropoutProb = DropoutProb, LowpassHz = LowpassHz, NoiseLevel = NoiseLevel,
+                Gain = Gain, PathLoss_dB = PathLoss_dB, RadioFrequencyMHz = RadioFrequencyMHz, SNR_dB = SNR_dB,
+                TerrainProfile = TerrainProfile
+            };
+        }
     }
 
     // ================================================================
@@ -349,155 +359,202 @@ namespace BMSAudioSim
             double receiverNoiseFigure = 7.0; // dB
             double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm typical
 
-            // --- Received power and SNR ---
+            // --- Received power and SNR (needed for LOS checks) ---
+            double prDbm = txPowerDbm - pathLossDb;
+            double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
+            double gainDb;
+            
             bool isVHF = ap.RadioFrequencyMHz < 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
 
             // === STRICT LOS ENFORCEMENT (frequency-dependent) ===
-            bool hasSignificantTerrainBlock, hasModerateTerrainBlock;
+            // Calculate first Fresnel zone radius at worst obstruction point
+            double F1_radius = Math.Sqrt(lambda * dist / 4.0); // approximate for midpoint
 
-            if (isVHF) // VHF: 30-174 MHz
+            // Fresnel clearance percentage (0 = fully blocked, 1 = fully clear)
+            double fresnelClearance = 1.0;
+            if (worstExcess > 0)
             {
-                // VHF: Longer wavelength (1.7-10m) - more forgiving with terrain
-                hasSignificantTerrainBlock = worstExcess > 200.0 || diffLoss > 25.0;
-                hasModerateTerrainBlock = worstExcess > 80.0 || diffLoss > 15.0;
-            }
-            else // UHF: 225-512 MHz
-            {
-                // UHF: Shorter wavelength (0.6-1.3m) - strict line-of-sight
-                hasSignificantTerrainBlock = worstExcess > 100.0 || diffLoss > 15.0;
-                hasModerateTerrainBlock = worstExcess > 30.0 || diffLoss > 8.0;
+                fresnelClearance = Math.Max(0.0, 1.0 - worstExcess / (F1_radius * 1.4));
             }
 
-            if (hasSignificantTerrainBlock)
+            // === UHF: STRICT LOS ===
+            if (!isVHF)
             {
-                ap.Gain = 0.0f;
-                ap.LowpassHz = 1800.0f; // Doesn't matter, no signal
-                ap.NoiseLevel = 0.95f; // Full noise floor
-                ap.DropoutProb = 0.95f; // Essentially continuous dropout
-                ap.TerrainProfile = profile;
-                return ap;
-            }
-
-            double gainDb;
-
-
-            double prDbm = txPowerDbm - pathLossDb;
-            double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
-
-            if (hasModerateTerrainBlock)
-            {
-                double terrainPenaltyDb;
-                float maxGain;
-                float dropoutProb;
-                float noiseLevel;
-
-
-                if (isVHF) // VHF
+                // HARD cutoff
+                if (worstExcess > F1_radius * 0.3 || diffLoss > 6.0)
                 {
-                    // VHF: More forgiving in moderate block
-                    // Longer wavelength (2.4m) diffracts better around obstacles
-                    terrainPenaltyDb = 15.0; // 5 dB less penalty than UHF
-                    maxGain = 0.25f; // 67% higher cap than UHF
-                    noiseLevel = 0.65f; // 19% less noise than UHF
-                    ap.DropoutProb = 0.5f;
-
+                    ap.Gain = 0.0f;
+                    ap.LowpassHz = 3400.0f; // Doesn't matter, no signal
+                    ap.NoiseLevel = 0.95f; // Full noise floor
+                    ap.DropoutProb = 0.0f; // No signal to drop out
+                    ap.Distance_km = (float)(dist / 1000.0);
+                    ap.SNR_dB = (float)snrDb;
+                    ap.PathLoss_dB = (float)pathLossDb;
+                    ap.TerrainProfile = profile;
+                    return ap;
                 }
-                else // UHF
+                
+                // Very tight tolerance for partial obstruction
+                // Even 20% Fresnel zone blockage severely degrades UHF
+                if (worstExcess > F1_radius * 0.1 || diffLoss > 3.0)
                 {
-                    // UHF: Harsh penalties in moderate block
-                    // Shorter wavelength (1.0m) blocked more easily
-                    terrainPenaltyDb = 20.0; // Heavy penalty
-                    maxGain = 0.15f; // Severely limited
-                    noiseLevel = 0.80f; // High noise
-                    ap.DropoutProb = 0.8f;
+                    // Heavy penalty but not complete loss
+                    double terrainPenaltyDb = 25.0 + diffLoss * 2.0;
+                    gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
+                    gainDb -= terrainPenaltyDb;
+                    
+                    ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
+                    ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.08f); // Severely limited
+                    ap.LowpassHz = 3400.0f;
+                    ap.NoiseLevel = 0.85f; // Very noisy
+                    ap.DropoutProb = 1.2f; // Heavy fading
+                    ap.Distance_km = (float)(dist / 1000.0);
+                    ap.SNR_dB = (float)snrDb;
+                    ap.PathLoss_dB = (float)pathLossDb;
+                    ap.TerrainProfile = profile;
+                    return ap;
                 }
-
-                // Apply frequency-dependent penalties
-                gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
-                gainDb -= terrainPenaltyDb;
-                ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
-                ap.Gain = Math.Clamp(ap.Gain, 0.0f, maxGain);
-
-                // Force to lowest codec rate
-                ap.LowpassHz = 1800.0f; // Fallback mode
-
-                // Apply frequency-dependent degradation
-                ap.NoiseLevel = noiseLevel;
-                ap.TerrainProfile = profile;
-                return ap;
+            }
+            // === VHF: MORE FORGIVING ===
+            else
+            {
+                // Complete blockage threshold (60%+ Fresnel zone blocked)
+                if (worstExcess > F1_radius * 0.6 || diffLoss > 20.0)
+                {
+                    ap.Gain = 0.0f;
+                    ap.LowpassHz = 3000.0f; // Doesn't matter, no signal
+                    ap.NoiseLevel = 0.95f;
+                    ap.DropoutProb = 0.0f;
+                    ap.Distance_km = (float)(dist / 1000.0);
+                    ap.SNR_dB = (float)snrDb;
+                    ap.PathLoss_dB = (float)pathLossDb;
+                    ap.TerrainProfile = profile;
+                    return ap;
+                }
+                
+                // Partial obstruction - smooth degradation
+                if (worstExcess > F1_radius * 0.2 || diffLoss > 8.0)
+                {
+                    // Apply smooth degradation based on Fresnel clearance
+                    double degradationFactor = Math.Pow(fresnelClearance, 2.0);
+                    
+                    // Moderate penalty
+                    double terrainPenaltyDb = 12.0 + diffLoss * 1.0;
+                    gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
+                    gainDb -= terrainPenaltyDb;
+                    
+                    ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
+                    ap.Gain = (float)(ap.Gain * degradationFactor);
+                    ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.35f);
+                    
+                    ap.LowpassHz = 3000.0f;
+                    ap.NoiseLevel = (float)(0.55 + (1.0 - degradationFactor) * 0.30);
+                    ap.DropoutProb = (float)(0.4 + (1.0 - degradationFactor) * 0.5);
+                    ap.Distance_km = (float)(dist / 1000.0);
+                    ap.SNR_dB = (float)snrDb;
+                    ap.PathLoss_dB = (float)pathLossDb;
+                    ap.TerrainProfile = profile;
+                    return ap;
+                }
             }
 
-
-// === CLEAN LOS PATH - Normal operation ===
+            // === CLEAN LOS PATH - Normal operation ===
             gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
             ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
 
-// Digital codec bandwidth - STEPPED not gradual
-            double cutoff;
-            if (snrDb < 0.0)
+            // === ANALOG MODULATION CHARACTERISTICS ===
+            
+            if (isVHF)
             {
-                cutoff = 1800.0; // Low-rate codec (2.4 kbps CVSD)
-            }
-            else if (snrDb < 8.0)
-            {
-                cutoff = 2800.0; // Standard MELP (2.4 kbps)
-            }
-            else if (snrDb < 18.0)
-            {
-                cutoff = 3200.0; // Enhanced MELP (4.8 kbps)
-            }
-            else
-            {
-                cutoff = 3400.0; // Full quality (6.0 kbps)
-            }
-
-// Add some jitter at boundaries
-            if (snrDb > -1.0 && snrDb < 1.0)
-            {
-                cutoff += (_rng.NextDouble() * 2.0 - 1.0) * 200.0;
-            }
-
-            ap.LowpassHz = (float)Math.Clamp(cutoff, 1800.0, 3500.0);
-
-// Digital quantization noise
-            double noise;
-            if (snrDb < 5.0)
-            {
-                noise = Math.Clamp((10.0 - snrDb) / 30.0, 0.15, 0.9);
-            }
-            else if (snrDb < 15.0)
-            {
-                noise = Math.Clamp((20.0 - snrDb) / 40.0, 0.05, 0.3);
+                // === VHF AM (30-174 MHz): Amplitude Modulation ===
+                ap.LowpassHz = 3000.0f; // Fixed AM voice bandwidth (~300-3000 Hz)
+                
+                // Analog static increases smoothly with decreasing SNR
+                if (snrDb > 20.0)
+                {
+                    ap.NoiseLevel = 0.02f; // Clean signal
+                }
+                else if (snrDb > 10.0)
+                {
+                    // Light static
+                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02→0.20
+                }
+                else if (snrDb > 0.0)
+                {
+                    // Heavy static
+                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20→0.55
+                }
+                else
+                {
+                    // Barely intelligible
+                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55→0.85
+                }
             }
             else
             {
-                noise = 0.02;
+                // === UHF FM (225-512 MHz): Frequency Modulation ===
+                ap.LowpassHz = 3400.0f; // Fixed FM voice bandwidth (~300-3400 Hz)
+                
+                // FM "quieting" - noise suppression improves with stronger signal
+                // FM threshold effect: below ~10 dB SNR, noise increases rapidly
+                if (snrDb > 15.0)
+                {
+                    ap.NoiseLevel = 0.01f; // Excellent FM quieting
+                }
+                else if (snrDb > 10.0)
+                {
+                    // Good quieting
+                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01→0.10
+                }
+                else if (snrDb > 5.0)
+                {
+                    // FM threshold region - noise rises
+                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10→0.40
+                }
+                else if (snrDb > 0.0)
+                {
+                    // Below FM threshold - heavy noise
+                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40→0.75
+                }
+                else
+                {
+                    // Very weak signal
+                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75→0.95
+                }
             }
 
-            ap.NoiseLevel = (float)noise;
-
-// Digital dropout probability
+            // === MULTIPATH FADING AND DROPOUTS ===
             double dropout;
-            const double digitalThreshold = 8.0;
-            const double transitionWidth = 4.0;
-
-            if (snrDb > digitalThreshold + transitionWidth)
+            if (snrDb > 15.0)
             {
-                dropout = 0.0;
+                dropout = 0.0; // Clean signal, no fading
             }
-            else if (snrDb < digitalThreshold - transitionWidth)
+            else if (snrDb > 5.0)
             {
-                dropout = 0.6 + 0.2 * (1.0 - (snrDb + 20.0) / 16.0);
-                dropout = Math.Clamp(dropout, 0.6, 0.85);
+                // Light fading at marginal SNR
+                dropout = (15.0 - snrDb) / 10.0 * 0.3; // 0→0.3 events/sec
+            }
+            else if (snrDb > 0.0)
+            {
+                // Moderate fading
+                dropout = 0.3 + (5.0 - snrDb) / 5.0 * 0.4; // 0.3→0.7 events/sec
             }
             else
             {
-                double normalized = (snrDb - digitalThreshold) / transitionWidth;
-                dropout = 0.35 * (1.0 - Math.Tanh(normalized * 3.0));
+                // Heavy fading
+                dropout = 0.7 + Math.Min(-snrDb / 10.0, 0.5); // 0.7→1.2 events/sec
             }
 
-            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 0.9);
+            // VHF is less affected by multipath (longer wavelength)
+            if (isVHF)
+                dropout *= 0.7;
 
+            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.5);
+
+            // Store propagation parameters for physics-based interference
+            ap.Distance_km = (float)(dist / 1000.0);
+            ap.SNR_dB = (float)snrDb;
+            ap.PathLoss_dB = (float)pathLossDb;
             ap.TerrainProfile = profile;
             return ap;
         }

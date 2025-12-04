@@ -58,13 +58,6 @@ public class SteppedOnParams
     public float InterferenceLevel;
     
     /// <summary>
-    /// Digital artifact rate in events per second.
-    /// Codec clicks, quantization errors, brief mutes.
-    /// Typical range: 0-25 events/sec.
-    /// </summary>
-    public float DigitalArtifactRate;
-    
-    /// <summary>
     /// Whether this is VHF (30-174 MHz) or UHF (225-512 MHz).
     /// VHF is more resilient to interference than UHF.
     /// </summary>
@@ -75,4 +68,9 @@ public class SteppedOnParams
     /// Based on combined SNR of both signals.
     /// </summary>
     public float SignalQuality;
+
+    public override string ToString()
+    {
+        return $"PowerDiff_dBm = {PowerDiff_dBm} CaptureRatio = {CaptureRatio} BeatFrequency_Hz={BeatFrequency_Hz}";
+    }
 }
