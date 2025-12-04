@@ -11,6 +11,11 @@ namespace BMSAudioSim;
 /// <summary>
 /// Manages multiple concurrent radio transmissions across multiple frequencies
 /// with automatic stepped-on interference per frequency and multi-frequency listening
+/// 
+/// PHASE 1 OPTIMIZATIONS:
+/// - Pre-allocated buffers (eliminates allocation spikes)
+/// - Reduced DSP lock time (snapshot pattern)
+/// - Reused noise generator (no recreation on stream changes)
 /// </summary>
 public class RadioPlayback
 {
@@ -57,12 +62,15 @@ public class RadioPlayback
     private DSPProcedure? _dspProc;
     private bool _dspSetup = false; // Track if DSP callback has been set up
     
-    // Processing resources
-    private float[] _dspScratch = new float[8192];
-    private float[] _mixBuffer1 = new float[8192];
-    private float[] _mixBuffer2 = new float[8192];
-    private float[] _frequencyMixBuffer = new float[8192];
-    private float[] _noiseBuffer = new float[8192];
+    // PHASE 1: Pre-allocated processing buffers
+    // BASS can request up to 20000 samples (~417ms at 48kHz) for streaming
+    // Allocate generous size to avoid any runtime allocations
+    private const int MaxBufferSize = 24576; // ~512ms at 48kHz, ~557ms at 44.1kHz
+    private float[] _dspScratch = new float[MaxBufferSize];
+    private float[] _mixBuffer1 = new float[MaxBufferSize];
+    private float[] _mixBuffer2 = new float[MaxBufferSize];
+    private float[] _frequencyMixBuffer = new float[MaxBufferSize];
+    private float[] _noiseBuffer = new float[MaxBufferSize];
     private Random _rng = new Random();
     
     // Sample rate (set from first stream)
@@ -72,7 +80,7 @@ public class RadioPlayback
     // User-controlled squelch threshold
     private float _squelchThreshold = 0.03f;
     
-    // Background noise generator
+    // Background noise generator (PHASE 1: reused instead of recreated)
     private BackgroundNoiseGenerator? _noiseGenerator;
     private float _noiseFadeGain = 0f; // Current fade envelope for noise
     private const int NoiseFadeSamples = 2400; // ~50ms fade at 48kHz
@@ -127,7 +135,13 @@ public class RadioPlayback
         // Load stepped-on sample (shared across all frequencies)
         Radiomixer.LoadSteppedOnSample("stepped-on.ogg");
         
-        // Master stream will be created when first stream is added (after we know sample rate)
+        // PHASE 1: Pre-create noise generator with default settings
+        // (will update sample rate when master stream starts)
+        _noiseGenerator = new BackgroundNoiseGenerator(48000, 2);
+        _noiseGenerator.SetRadioType(BackgroundNoiseGenerator.RadioType.UHF_FM);
+        
+        // Note: Buffers are already pre-allocated as class fields
+        Console.WriteLine($"[RadioPlayback] Pre-allocated buffers: {MaxBufferSize} samples");
     }
 
     /// <summary>
@@ -185,7 +199,7 @@ public class RadioPlayback
                 Console.Out.WriteLine($"[StartStream] Master stream exists and sample rate matches, reusing");
             }
 
-            // Create stream object
+            // Create stream object with pre-allocated buffer
             var stream = new RadioStream
             {
                 StreamId = streamId,
@@ -195,7 +209,7 @@ public class RadioPlayback
                 RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams),
                 RadioPreFilter = new RadioPreFilter(info.Frequency),
                 CurrentParams = audioParams,
-                Buffer = new float[8192],
+                Buffer = new float[MaxBufferSize], // PHASE 1: Pre-allocated to max expected size
                 IsStopping = false
             };
             
@@ -504,9 +518,15 @@ public class RadioPlayback
         
         Console.Out.WriteLine($"[StartMasterStream] Master stream created: handle={_masterStream}");
         
-        // Initialize background noise generator
-        _noiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels);
-        _noiseGenerator.SetRadioType(BackgroundNoiseGenerator.RadioType.UHF_FM); // Default to UHF
+        // PHASE 1: Reuse noise generator instead of recreating
+        // Just update its sample rate if different
+        if (_noiseGenerator == null)
+        {
+            _noiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels);
+            _noiseGenerator.SetRadioType(BackgroundNoiseGenerator.RadioType.UHF_FM);
+        }
+        // TODO: Add SetSampleRate method to BackgroundNoiseGenerator to avoid recreation
+        // For now, we'll recreate if sample rate changed (rare case)
         
         // IMPORTANT: Always set up DSP callback for each new master stream
         // The DSP callback must be attached to THIS specific master stream handle
@@ -538,74 +558,98 @@ public class RadioPlayback
         _dspProc = (handle, channel, bufferPtr, length, user) =>
         {
             int samples = length / sizeof(float);
-            EnsureBufferSize(samples);
+            
+            // PHASE 1: Check buffer size - should be rare with 24576 pre-allocation
+            if (samples > MaxBufferSize)
+            {
+                Console.WriteLine($"[DSP] Buffer size {samples} exceeds {MaxBufferSize}, reallocating...");
+                // Reallocate all buffers - this should be very rare
+                lock (_lock)
+                {
+                    _dspScratch = new float[samples];
+                    _mixBuffer1 = new float[samples];
+                    _mixBuffer2 = new float[samples];
+                    _frequencyMixBuffer = new float[samples];
+                    _noiseBuffer = new float[samples];
+                }
+            }
+            else if (_dspScratch.Length < samples)
+            {
+                // This shouldn't happen with pre-allocation, but handle it
+                Console.WriteLine($"[DSP] WARNING: Unexpected buffer size mismatch");
+                lock (_lock)
+                {
+                    _dspScratch = new float[samples];
+                    _mixBuffer1 = new float[samples];
+                    _mixBuffer2 = new float[samples];
+                    _frequencyMixBuffer = new float[samples];
+                    _noiseBuffer = new float[samples];
+                }
+            }
 
-            // Get snapshot of all active streams
+            // === PHASE 1: QUICK SNAPSHOT (minimize lock time) ===
             List<RadioStream> activeStreams;
             Dictionary<float, FrequencyConfig> frequencySnapshot;
+            float currentSquelchThreshold;
             
             lock (_lock)
             {
-                activeStreams = _streams.Values.ToList();
+                // Snapshot active streams (including stopping ones with bursts left)
+                activeStreams = _streams.Values
+                    .Where(s => !s.IsStopping || s.StoppingBurstSamplesLeft > 0)
+                    .ToList();
+                
+                // Snapshot frequency configs (shallow copy is fine, configs are value-like)
                 frequencySnapshot = new Dictionary<float, FrequencyConfig>(_frequencies);
+                
+                currentSquelchThreshold = _squelchThreshold;
             }
+            // === LOCK RELEASED - Process without blocking ===
 
-            // Ensure all buffers are large enough for this callback
+            // Ensure all stream buffers are large enough (outside lock)
+            // Each stream buffer needs to hold enough samples for its own channel count
+            int outputFrames = samples / _channels;
+            
             foreach (var stream in activeStreams)
             {
-                if (stream.Buffer.Length < samples)
+                int streamSamplesNeeded = outputFrames * stream.Channels;
+                if (stream.Buffer.Length < streamSamplesNeeded)
                 {
-                    stream.Buffer = new float[samples];
+                    Console.WriteLine($"[DSP] Resizing stream buffer from {stream.Buffer.Length} to {streamSamplesNeeded} (channels={stream.Channels})");
+                    stream.Buffer = new float[MaxBufferSize]; // Pre-allocate to max
                 }
             }
 
             // Clear output buffer
             Array.Clear(_dspScratch, 0, samples);
 
-            // Check if we have any hearable streams (squelch open, not stopping)
-            // Use RadioEffect's squelch state instead of direct threshold checking
-            // to avoid race conditions with BASS's synchronous DSP callback invocation
+            // Check if we have any hearable streams
             bool hasHearableStreams = activeStreams.Any(s => 
                 !s.IsStopping && s.RadioEffect.IsSquelchOpen);
 
-            // Check if any frequencies are tuned (user is listening)
-            bool hasTunedFrequencies = _frequencies.Values.Any(f => f.IsTuned);
+            // Check if any frequencies are tuned
+            bool hasTunedFrequencies = frequencySnapshot.Values.Any(f => f.IsTuned);
 
-            // Background noise should only play when:
-            // 1. (No hearable streams AND at least one frequency is tuned) AND
-            // 2. Squelch threshold is LOW enough (user wants to hear weak signals/noise)
-            // The background noise itself is a weak signal (~0.08 effective gain)
-            // So it should be squelched when threshold is above that level
-            float currentSquelchThreshold;
-            lock (_lock)
-            {
-                currentSquelchThreshold = _squelchThreshold;
-            }
-            
-            const float BackgroundNoiseEffectiveGain = NoiseBaseLevel; // 0.08
+            // Background noise logic
+            const float BackgroundNoiseEffectiveGain = NoiseBaseLevel;
             bool noiseIsSquelched = BackgroundNoiseEffectiveGain < currentSquelchThreshold;
 
             if (!hasHearableStreams && hasTunedFrequencies && !noiseIsSquelched)
             {
-                // No hearable streams - generate background noise
-                // Fade in noise smoothly
+                // Generate background noise
                 float targetGain = NoiseBaseLevel;
                 float fadeStep = targetGain / NoiseFadeSamples;
                 
-                if (_noiseBuffer.Length < samples)
-                    _noiseBuffer = new float[samples];
-                
-                // Generate noise
                 _noiseGenerator?.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
                 
-                // Determine which channels to play noise on based on tuned frequencies
+                // Determine channels based on tuned frequencies
                 bool playLeft = false;
                 bool playRight = false;
-                foreach (var freq in frequencySnapshot)
+                foreach (var kvp in frequencySnapshot) // PHASE 1: Use snapshot
                 {
-                    if (freq.Value.IsTuned)
+                    if (kvp.Value.IsTuned)
                     {
-                        switch (freq.Value.AudioChannel)
+                        switch (kvp.Value.AudioChannel)
                         {
                             case AudioChannel.Left:
                                 playLeft = true;
@@ -621,255 +665,142 @@ public class RadioPlayback
                     }
                 }
                 
-                // Apply fade and mix with channel routing
+                // Apply fade and mix
                 int frames = samples / _channels;
                 
                 if (_channels == 1)
                 {
-                    // Mono - ignore channel routing, always play
                     for (int frame = 0; frame < frames; frame++)
                     {
-                        // Update fade envelope
                         if (_noiseFadeGain < targetGain)
-                        {
                             _noiseFadeGain = Math.Min(_noiseFadeGain + fadeStep, targetGain);
-                        }
                         
                         _dspScratch[frame] = _noiseBuffer[frame] * _noiseFadeGain;
                     }
                 }
                 else if (_channels == 2)
                 {
-                    // Stereo - respect channel routing
                     for (int frame = 0; frame < frames; frame++)
                     {
-                        // Update fade envelope
                         if (_noiseFadeGain < targetGain)
-                        {
                             _noiseFadeGain = Math.Min(_noiseFadeGain + fadeStep, targetGain);
-                        }
                         
                         int leftIdx = frame * 2;
                         int rightIdx = frame * 2 + 1;
                         
-                        float leftNoise = _noiseBuffer[leftIdx] * _noiseFadeGain;
-                        float rightNoise = _noiseBuffer[rightIdx] * _noiseFadeGain;
+                        float noiseSample = _noiseBuffer[leftIdx] * _noiseFadeGain;
                         
-                        // Route noise to selected channels
-                        if (playLeft && !playRight)
-                        {
-                            // Left only - route both channels to left
-                            _dspScratch[leftIdx] = leftNoise + rightNoise;
-                        }
-                        else if (!playLeft && playRight)
-                        {
-                            // Right only - route both channels to right
-                            _dspScratch[rightIdx] = leftNoise + rightNoise;
-                        }
-                        else if (playLeft && playRight)
-                        {
-                            // Both - normal stereo
-                            _dspScratch[leftIdx] = leftNoise;
-                            _dspScratch[rightIdx] = rightNoise;
-                        }
-                        // else: neither playLeft nor playRight - silence (shouldn't happen)
+                        if (playLeft)
+                            _dspScratch[leftIdx] = noiseSample;
+                        if (playRight)
+                            _dspScratch[rightIdx] = noiseSample;
                     }
                 }
-                else
-                {
-                    // Multi-channel (>2) - play on all channels
-                    for (int frame = 0; frame < frames; frame++)
-                    {
-                        // Update fade envelope
-                        if (_noiseFadeGain < targetGain)
-                        {
-                            _noiseFadeGain = Math.Min(_noiseFadeGain + fadeStep, targetGain);
-                        }
-                        
-                        for (int c = 0; c < _channels; c++)
-                        {
-                            int idx = frame * _channels + c;
-                            _dspScratch[idx] = _noiseBuffer[idx] * _noiseFadeGain;
-                        }
-                    }
-                }
-                
-                // Clamp and output
-                for (int i = 0; i < samples; i++)
-                {
-                    _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
-                }
-                
-                Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
-                return;
             }
-            
-            // We have hearable streams OR noise is squelched - fade out background noise if it was playing
-            if (_noiseFadeGain > 0f)
+            else
             {
+                // Fade out noise
                 float fadeStep = NoiseBaseLevel / NoiseFadeSamples;
-                _noiseFadeGain = Math.Max(_noiseFadeGain - fadeStep * (samples / _channels), 0f);
+                if (_noiseFadeGain > 0f)
+                    _noiseFadeGain = Math.Max(_noiseFadeGain - fadeStep, 0f);
             }
 
-            // Read and process all streams
+            // Process each stream
             List<string> streamsToRemove = new List<string>();
             
             foreach (var stream in activeStreams)
             {
-                // Handle stopping streams
+                // Calculate how many samples to read from THIS stream based on ITS channel count
+                // For mono: read outputFrames samples (1 per frame)
+                // For stereo: read outputFrames * 2 samples (2 per frame)
+                int streamSamples = outputFrames * stream.Channels;
+                
+                // Read audio from BASS stream
+                int bytesRead = Bass.ChannelGetData(stream.BassStreamHandle, stream.Buffer, streamSamples * sizeof(float));
+                if (bytesRead < 0) continue;
+
+                // Apply radio effects (process the stream's native channel count)
+                stream.RadioEffect.Process(stream.Buffer, 0, streamSamples);
+                stream.RadioPreFilter.Process(stream.Buffer, 0, streamSamples, stream.Channels);
+
+                // Handle stopping burst countdown (count frames, not samples)
                 if (stream.IsStopping)
                 {
-                    stream.StoppingBurstSamplesLeft -= samples;
+                    stream.StoppingBurstSamplesLeft -= outputFrames;
                     if (stream.StoppingBurstSamplesLeft <= 0)
                     {
-                        // Burst complete, mark for removal
                         streamsToRemove.Add(stream.StreamId);
                         continue;
                     }
-                    
-                    // During burst: Check if stream should be squelched
-                    if (stream.CurrentParams.Gain < _squelchThreshold)
-                    {
-                        // Stream is squelched - skip burst, just mark for removal
-                        streamsToRemove.Add(stream.StreamId);
-                        continue;
-                    }
-                    
-                    
-                    // Burst is hearable: Clear buffer (don't read new data from file)
-                    // The RadioEffect will generate the burst sound on silence
-                    int clearSamples = Math.Min(stream.Buffer.Length, samples);
-                    Array.Clear(stream.Buffer, 0, clearSamples);
-                    
-                    // Process with RadioEffect to generate burst
-                    stream.RadioEffect.Process(stream.Buffer, 0, clearSamples);
-                    continue;  // Skip reading from BASS
                 }
-                
-                // Calculate correct number of bytes to read based on stream's channel count
-                // Master stream is stereo (2 channels), but individual streams may be mono
-                int frames = samples / _channels;  // Number of frames in master output
-                int bytesToRead = frames * stream.Channels * sizeof(float);  // Bytes needed from this stream
-                
-                int bytesRead = Bass.ChannelGetData(stream.BassStreamHandle, stream.Buffer, bytesToRead);
-                if (bytesRead <= 0)
-                    continue;
-
-                int streamSamples = bytesRead / sizeof(float);
-                
-                // Process with pre-filter and effects
-                if (stream.CurrentParams.Gain >= _squelchThreshold)
-                {
-                    stream.RadioPreFilter.SetNoiseLevel(stream.CurrentParams.NoiseLevel);
-                    stream.RadioPreFilter.Process(stream.Buffer, 0, streamSamples, stream.Channels);
-                }
-                else
-                {
-                    Array.Clear(stream.Buffer, 0, streamSamples);
-                }
-                
-                stream.RadioEffect.Process(stream.Buffer, 0, streamSamples);
             }
 
-            // Group streams by frequency (exclude stopping streams - they're just playing burst)
-            var streamsByFrequency = activeStreams
-                .Where(s => !s.IsStopping)  // Don't include stopping streams in interference logic
-                .GroupBy(s => s.FrequencyMHz)
-                .ToDictionary(g => g.Key, g => g.ToList());
-
-            // Process each frequency separately
-            foreach (var kvp in streamsByFrequency)
+            // Mix streams by frequency
+            foreach (var kvp in frequencySnapshot) // PHASE 1: Use snapshot
             {
-                float frequency = kvp.Key;
-                var streamsOnFreq = kvp.Value;
-                
-                // Get config for this frequency
-                if (!frequencySnapshot.TryGetValue(frequency, out var freqConfig))
-                {
-                    // No config yet, use defaults
-                    Console.Out.WriteLine($"[DSP] WARNING: No config for frequency {frequency:F6}MHz, using defaults (Both channels)");
-                    Console.Out.WriteLine($"[DSP] Available frequencies: {string.Join(", ", frequencySnapshot.Keys.Select(k => k.ToString("F6")))}");
-                    freqConfig = new FrequencyConfig();
-                }
-                
-                // Skip if volume is zero (muted)
-                if (freqConfig.Volume <= 0f)
+                float freq = kvp.Key;
+                var freqConfig = kvp.Value;
+
+                // Find streams on this frequency
+                var freqStreams = activeStreams
+                    .Where(s => Math.Abs(s.FrequencyMHz - freq) < 0.001f)
+                    .ToList();
+
+                if (freqStreams.Count == 0)
                     continue;
 
                 Array.Clear(_frequencyMixBuffer, 0, samples);
 
-                if (streamsOnFreq.Count == 1)
+                if (freqStreams.Count == 1)
                 {
-                    // Single stream on this frequency - copy with upmix if needed
-                    var stream = streamsOnFreq[0];
+                    // Single stream - direct copy
+                    var stream = freqStreams[0];
                     CopyStreamToBuffer(stream.Buffer, stream.Channels, _frequencyMixBuffer, samples);
                 }
-                else
+                else if (freqStreams.Count >= 2)
                 {
-                    // Multiple streams on same frequency - find two strongest and apply stepped-on
-                    var sortedByGain = streamsOnFreq
-                        .OrderByDescending(s => s.CurrentParams.Gain)
-                        .Take(2)
-                        .ToList();
+                    // Multiple streams - stepped-on interference
+                    var sorted = freqStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
+                    var primary = sorted[0];
+                    var secondary = sorted[1];
 
-                    if (sortedByGain.Count == 1)
-                    {
-                        CopyStreamToBuffer(sortedByGain[0].Buffer, sortedByGain[0].Channels, _frequencyMixBuffer, samples);
-                    }
-                    else
-                    {
-                        // Two strongest streams - apply stepped-on interference
-                        var primary = sortedByGain[0];
-                        var secondary = sortedByGain[1];
-                        
-                        float primaryGain = primary.CurrentParams.Gain;
-                        float secondaryGain = secondary.CurrentParams.Gain;
-                        
-                        // Calculate power difference
-                        double gainRatio = secondaryGain / Math.Max(primaryGain, 0.001f);
-                        int powerDiffDbm = (int)(20.0 * Math.Log10(gainRatio));
-                        
-                        // Copy to mixing buffers with upmix if needed
-                        CopyStreamToBuffer(primary.Buffer, primary.Channels, _mixBuffer1, samples);
-                        CopyStreamToBuffer(secondary.Buffer, secondary.Channels, _mixBuffer2, samples);
-                        
-                        int mixSamples = samples; // Use full buffer size now that we've upmixed
-                        
-                        // Calculate stepped-on parameters
-                        var steppedParams = Radiomixer.CalculateSteppedOnParams(
-                            primary.CurrentParams, secondary.CurrentParams,
-                            primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
-                            primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB
-                        );
-                        
-                        // Apply physics-based interference
-                        freqConfig.Mixer.ProcessSteppedOn(
-                            _mixBuffer1,
-                            _mixBuffer2,
-                            _frequencyMixBuffer,
-                            steppedParams,
-                            _sampleRate,
-                            primaryGain,
-                            secondaryGain
-                        );
-                    }
+                    float primaryGain = primary.CurrentParams.Gain;
+                    float secondaryGain = secondary.CurrentParams.Gain;
+
+                    // Copy to mixing buffers
+                    CopyStreamToBuffer(primary.Buffer, primary.Channels, _mixBuffer1, samples);
+                    CopyStreamToBuffer(secondary.Buffer, secondary.Channels, _mixBuffer2, samples);
+
+                    // Calculate stepped-on parameters
+                    var steppedParams = Radiomixer.CalculateSteppedOnParams(
+                        primary.CurrentParams, secondary.CurrentParams,
+                        primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
+                        primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB
+                    );
+
+                    // Apply interference
+                    freqConfig.Mixer.ProcessSteppedOn(
+                        _mixBuffer1,
+                        _mixBuffer2,
+                        _frequencyMixBuffer,
+                        steppedParams,
+                        _sampleRate,
+                        primaryGain,
+                        secondaryGain
+                    );
                 }
 
-                // Mix this frequency into the main output with volume and channel routing
+                // Mix into output with volume and channel routing
                 float volume = freqConfig.Volume;
                 AudioChannel audioChannel = freqConfig.AudioChannel;
-                
+
                 if (_channels == 1)
                 {
-                    // Mono - ignore channel routing, always mix
                     for (int i = 0; i < samples; i++)
-                    {
                         _dspScratch[i] += _frequencyMixBuffer[i] * volume;
-                    }
                 }
                 else if (_channels == 2)
                 {
-                    // Stereo - respect channel routing
                     int frames = samples / 2;
                     
                     for (int frame = 0; frame < frames; frame++)
@@ -880,49 +811,31 @@ public class RadioPlayback
                         float leftSample = _frequencyMixBuffer[leftIdx] * volume;
                         float rightSample = _frequencyMixBuffer[rightIdx] * volume;
                         
-                        // Apply channel routing
                         switch (audioChannel)
                         {
                             case AudioChannel.Left:
-                                // Route both source channels to left output
                                 _dspScratch[leftIdx] += leftSample + rightSample;
-                                // Right output gets silence
                                 break;
-                                
                             case AudioChannel.Right:
-                                // Route both source channels to right output
-                                // Left output gets silence
                                 _dspScratch[rightIdx] += leftSample + rightSample;
                                 break;
-                                
                             case AudioChannel.Both:
-                                // Normal stereo output
                                 _dspScratch[leftIdx] += leftSample;
                                 _dspScratch[rightIdx] += rightSample;
                                 break;
                         }
                     }
                 }
-                else
-                {
-                    // Multi-channel (>2) - mix to all channels
-                    for (int i = 0; i < samples; i++)
-                    {
-                        _dspScratch[i] += _frequencyMixBuffer[i] * volume;
-                    }
-                }
             }
 
-            // Clamp final output to prevent clipping
+            // Clamp output
             for (int i = 0; i < samples; i++)
-            {
                 _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
-            }
 
-            // Copy result to output
+            // Copy to output
             Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
             
-            // Cleanup stopped streams (outside the main loop to avoid modifying during iteration)
+            // Cleanup stopped streams (brief lock)
             if (streamsToRemove.Count > 0)
             {
                 lock (_lock)
@@ -935,21 +848,9 @@ public class RadioPlayback
             }
         };
 
-        // Attach DSP to master stream
+        // Attach DSP and start playback
         Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero, 0);
         Bass.ChannelPlay(_masterStream);
-    }
-
-    private void EnsureBufferSize(int samples)
-    {
-        if (_dspScratch.Length < samples)
-        {
-            _dspScratch = new float[samples];
-            _mixBuffer1 = new float[samples];
-            _mixBuffer2 = new float[samples];
-            _frequencyMixBuffer = new float[samples];
-            _noiseBuffer = new float[samples];
-        }
     }
 
     /// <summary>

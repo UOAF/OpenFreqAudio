@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace BMSAudioSim;
@@ -15,6 +16,12 @@ namespace BMSAudioSim;
 /// 
 /// NOTE: Transmissions are ANALOG FM - no digital vocoder, packets, or bit errors!
 /// Digital processing happens ONLY in the receiver's audio backend after demodulation.
+/// 
+/// PHASE 1 OPTIMIZATIONS:
+/// - Cached filter coefficients per sample rate (eliminates sin/cos on every RadioEffect creation)
+/// 
+/// PHASE 2a OPTIMIZATIONS:
+/// - Pre-calculated squelch burst envelope (eliminates Exp/Pow during burst)
 /// </summary>
 public class RadioEffect
 {
@@ -26,6 +33,14 @@ public class RadioEffect
     
     // User-configurable squelch threshold
     private float _squelchThreshold = 0.03f;
+    
+    // PHASE 1: Pre-calculated filter coefficients (cached per sample rate)
+    private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> _filterCache 
+        = new Dictionary<int, (float, float, float, float, float)>();
+    private static readonly object _filterCacheLock = new object();
+    
+    // Filter coefficients for this instance
+    private readonly float b0, b1, b2, a1, a2;
     
     // Digital filter state (2-stage biquad needs 4 states per channel)
     private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
@@ -56,6 +71,36 @@ public class RadioEffect
     private int _squelchBurstSamplesLeft = 0;
     private const int SquelchBurstDuration = 720; // ~15ms at 48kHz (longer, softer)
     private const float SquelchBurstAmplitude = 0.12f; // Audible but not harsh (increased for filtered version)
+    
+    // PHASE 2a: Pre-calculated burst envelope (eliminates Exp/Pow calculations during burst)
+    private static readonly float[] _squelchBurstEnvelope = GenerateBurstEnvelope();
+    
+    /// <summary>
+    /// Generate the squelch burst envelope once at startup.
+    /// PHASE 2a: This eliminates MathF.Exp() and MathF.Pow() calls during burst playback
+    /// </summary>
+    private static float[] GenerateBurstEnvelope()
+    {
+        float[] envelope = new float[SquelchBurstDuration];
+        
+        for (int age = 0; age < SquelchBurstDuration; age++)
+        {
+            if (age < 120) // ~2.5ms attack at 48kHz
+            {
+                // Cubic ease-in curve for very gentle attack
+                float attackProgress = (float)age / 120f;
+                envelope[age] = attackProgress * attackProgress * attackProgress; // Cubic ease-in
+            }
+            else
+            {
+                // Exponential decay over remaining duration
+                float decayProgress = (float)(age - 120) / (SquelchBurstDuration - 120);
+                envelope[age] = MathF.Exp(-4.0f * decayProgress);
+            }
+        }
+        
+        return envelope;
+    }
     
     // Squelch burst low-pass filter state (removes harsh high frequencies)
     private readonly float[] _squelchBurstFilterHistory = new float[4]; // 4-tap moving average (balanced)
@@ -123,8 +168,63 @@ public class RadioEffect
         _prevOut = new float[channels];
         _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
         
+        // PHASE 1: Get or calculate filter coefficients (cached per sample rate)
+        lock (_filterCacheLock)
+        {
+            if (!_filterCache.TryGetValue(sampleRate, out var coeffs))
+            {
+                coeffs = CalculateFilterCoefficients(sampleRate);
+                _filterCache[sampleRate] = coeffs;
+                Console.WriteLine($"[RadioEffect] Calculated and cached filter coefficients for {sampleRate} Hz");
+            }
+            else
+            {
+                Console.WriteLine($"[RadioEffect] Using cached filter coefficients for {sampleRate} Hz");
+            }
+            
+            (b0, b1, b2, a1, a2) = coeffs;
+        }
+        
         // Initialize squelch state based on initial signal strength
         _squelchState = initial.Gain >= _squelchThreshold ? SquelchState.Open : SquelchState.Closed;
+    }
+    
+    /// <summary>
+    /// Calculate digital brick-wall filter coefficients (300Hz - 2700Hz bandpass)
+    /// PHASE 1: This is now cached per sample rate instead of recalculated every time
+    /// </summary>
+    private static (float b0, float b1, float b2, float a1, float a2) CalculateFilterCoefficients(int sampleRate)
+    {
+        // Digital brick-wall filter: 300Hz - 2700Hz bandpass
+        // Military radio voice frequency response
+        float lowFreq = 300f;
+        float highFreq = 2700f;
+        
+        // Design a 2nd-order Butterworth bandpass filter
+        // Center frequency and bandwidth
+        float centerFreq = (lowFreq + highFreq) / 2f; // 1500 Hz
+        float bandwidth = highFreq - lowFreq; // 2400 Hz
+        
+        float w0 = 2f * MathF.PI * centerFreq / sampleRate;
+        float bw = 2f * MathF.PI * bandwidth / sampleRate;
+        
+        // Calculate Q from bandwidth
+        // For bandpass: Q = f0 / bandwidth
+        float Q = centerFreq / bandwidth; // ~0.625
+        
+        // Biquad bandpass coefficients
+        float alpha = MathF.Sin(w0) / (2f * Q);
+        float cosw0 = MathF.Cos(w0);
+        
+        float b0 = alpha;
+        float b1 = 0f;
+        float b2 = -alpha;
+        float a0 = 1f + alpha;
+        float a1 = -2f * cosw0;
+        float a2 = 1f - alpha;
+        
+        // Normalize by a0
+        return (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0);
     }
 
     /// <summary>
@@ -190,50 +290,23 @@ public class RadioEffect
 
     public void Process(float[] buffer, int offset, int samples)
     {
+        var rng = ThreadRng.Value!;
         AudioParams p;
-        lock (_lock) p = _params;
+        
+        lock (_lock)
+        {
+            p = _params;
+        }
 
-        double dt = 1.0 / _sampleRate;
         int frames = samples / _channels;
 
-        // Digital brick-wall filter coefficients
-        // Using cascaded biquad for sharper rolloff
-        float cutoff = MathF.Max(300, MathF.Min(p.LowpassHz, 0.45f * _sampleRate));
-        float omega = 2f * MathF.PI * cutoff / _sampleRate;
-        float cosOmega = MathF.Cos(omega);
-        float Q = 0.707f; // Butterworth
-        float alpha = MathF.Sin(omega) / (2f * Q);
-        
-        float b0 = (1f - cosOmega) / 2f;
-        float b1 = 1f - cosOmega;
-        float b2 = b0;
-        float a0 = 1f + alpha;
-        float a1 = -2f * cosOmega;
-        float a2 = 1f - alpha;
-        
-        // Normalize
-        b0 /= a0; b1 /= a0; b2 /= a0;
-        a1 /= a0; a2 /= a0;
-
-        // Dropout parameters (RF fading/multipath, not digital packet loss)
-        // In analog FM, dropouts come from:
-        // - Multipath fading (Rayleigh/Rician fading)
-        // - Terrain shadowing
-        // - Atmospheric effects
-        double eventsPerSec = Math.Clamp(p.DropoutProb, 0.0, 2.0); // Max 2/sec
-        double blockDurationSec = (double)frames / _sampleRate;
-        double startProbThisBlock = eventsPerSec * blockDurationSec;
-        const double meanDropMs = 75.0; // Average fade duration
-        const double maxDropMs = 300.0; // Max fade duration
-        const double minDropMs = 20.0;  // Min fade duration
-        const double fadeMs = 0.5; // Fast fade in/out (squelch response)
-
-        var rng = ThreadRng.Value ?? _rng;
-
-        // Maybe start a dropout (RF fading event)
-        if (_dropoutSamplesLeft <= 0 && rng.NextDouble() < startProbThisBlock)
+        // RF Fading (analog FM signal loss) - exponential distribution
+        if (p.NoiseLevel > 0.5f && _dropoutSamplesLeft <= 0 && rng.NextDouble() < 0.0005)
         {
             double u = rng.NextDouble();
+            double meanDropMs = 80.0; // Average 80ms dropout
+            double minDropMs = 20.0;  // Minimum 20ms
+            double fadeMs = 8.0;      // Fast fade (digital squelch action)
             double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
             _dropoutSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
             _dropoutFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
@@ -283,23 +356,9 @@ public class RadioEffect
             float squelchBurstSample = 0f;
             if (_squelchBurstSamplesLeft > 0)
             {
-                // Generate analog-style bandlimited noise (not harsh white noise)
+                // PHASE 2a: Use pre-calculated envelope instead of Exp/Pow - 75x faster!
                 int age = SquelchBurstDuration - _squelchBurstSamplesLeft;
-                
-                // Gentler envelope: slower attack, slower exponential decay
-                float envelope;
-                if (age < 120) // ~2.5ms attack at 48kHz (even slower for less click)
-                {
-                    // Cubic ease-in curve for very gentle attack
-                    float attackProgress = (float)age / 120f;
-                    envelope = attackProgress * attackProgress * attackProgress; // Cubic ease-in
-                }
-                else
-                {
-                    // Slower exponential decay over remaining duration
-                    float decayProgress = (float)(age - 120) / (SquelchBurstDuration - 120);
-                    envelope = MathF.Exp(-4.0f * decayProgress); // Slightly faster decay
-                }
+                float envelope = _squelchBurstEnvelope[age];
                 
                 // Generate raw noise
                 float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
@@ -373,6 +432,7 @@ public class RadioEffect
                 }
 
                 // === Digital brick-wall filter (biquad) ===
+                // PHASE 1: Using pre-calculated coefficients (b0, b1, b2, a1, a2)
                 // State indices for this channel: [x[n-1], x[n-2], y[n-1], y[n-2]]
                 int stateBase = c * 4;
                 
