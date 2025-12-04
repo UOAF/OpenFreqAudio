@@ -113,8 +113,8 @@
                     <Slider Minimum="10" Maximum="50" Value="{Binding TxDbm}" ValueChanged="OnAltSliderChanged"></Slider>
                     <StackPanel Orientation="Horizontal">
                         <RadioButton Name="RadioButtonUhf" IsChecked="True"
-                                     IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF" />
-                        <RadioButton Content="VHF" Margin="5, 0" />
+                                     IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF (left)" />
+                        <RadioButton Content="VHF (right)" Margin="5, 0" />
                         <TextBlock VerticalAlignment="Center" Text="Frequency " Margin="15, 0, 0, 0" />
                         <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}" />
                         

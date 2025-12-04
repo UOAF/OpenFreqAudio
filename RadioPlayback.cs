@@ -41,6 +41,11 @@ public class RadioPlayback
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
         public Radiomixer Mixer { get; set; } = new Radiomixer();
         public bool IsTuned { get; set; } = false; // Is user listening to this frequency?
+        
+        // PHASE 2b FIX: Each frequency needs its own noise generator
+        // Different frequencies can have different radio types (VHF/UHF) and independent squelch
+        public BackgroundNoiseGenerator? NoiseGenerator { get; set; } = null;
+        public float NoiseFadeGain { get; set; } = 0f; // Per-frequency fade envelope
     }
     
     /// <summary>
@@ -80,9 +85,7 @@ public class RadioPlayback
     // User-controlled squelch threshold
     private float _squelchThreshold = 0.03f;
     
-    // Background noise generator (PHASE 1: reused instead of recreated)
-    private BackgroundNoiseGenerator? _noiseGenerator;
-    private float _noiseFadeGain = 0f; // Current fade envelope for noise
+    // Background noise fade timing (shared constant)
     private const int NoiseFadeSamples = 2400; // ~50ms fade at 48kHz
     private const float NoiseBaseLevel = 0.08f; // Base noise level (subtle but audible)
     
@@ -135,12 +138,8 @@ public class RadioPlayback
         // Load stepped-on sample (shared across all frequencies)
         Radiomixer.LoadSteppedOnSample("stepped-on.ogg");
         
-        // PHASE 1: Pre-create noise generator with default settings
-        // (will update sample rate when master stream starts)
-        _noiseGenerator = new BackgroundNoiseGenerator(48000, 2);
-        _noiseGenerator.SetRadioType(BackgroundNoiseGenerator.RadioType.UHF_FM);
-        
         // Note: Buffers are already pre-allocated as class fields
+        // Note: BackgroundNoiseGenerator is now per-frequency (created in TuneFrequency)
         Console.WriteLine($"[RadioPlayback] Pre-allocated buffers: {MaxBufferSize} samples");
     }
 
@@ -326,7 +325,22 @@ public class RadioPlayback
                 _frequencies[frequencyMHz] = new FrequencyConfig();
             }
 
-            _frequencies[frequencyMHz].IsTuned = true;
+            var freqConfig = _frequencies[frequencyMHz];
+            freqConfig.IsTuned = true;
+            
+            // PHASE 2b FIX: Create noise generator for this frequency if not already created
+            if (freqConfig.NoiseGenerator == null)
+            {
+                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyMHz);
+                
+                // Set radio type based on frequency
+                var radioType = frequencyMHz < 100 
+                    ? BackgroundNoiseGenerator.RadioType.VHF_AM 
+                    : BackgroundNoiseGenerator.RadioType.UHF_FM;
+                freqConfig.NoiseGenerator.SetRadioType(radioType);
+                
+                Console.Out.WriteLine($"[TuneFrequency] Created {radioType} noise generator for {frequencyMHz:F2} MHz");
+            }
 
             // Start master stream if not already started
             if (_masterStream == 0)
@@ -464,18 +478,26 @@ public class RadioPlayback
     }
 
     /// <summary>
-    /// Set the radio type for background noise generation
+    /// Set the radio type for background noise generation for a specific frequency
     /// VHF (AM): Crackling static with pops
     /// UHF (FM): Smooth white noise/hiss
     /// </summary>
+    /// <param name="frequencyMHz">Frequency in MHz</param>
     /// <param name="radioType">Radio type (VHF_AM or UHF_FM)</param>
-    public void SetRadioType(BackgroundNoiseGenerator.RadioType radioType)
+    public void SetRadioType(float frequencyMHz, BackgroundNoiseGenerator.RadioType radioType)
     {
-        _noiseGenerator?.SetRadioType(radioType);
+        lock (_lock)
+        {
+            if (_frequencies.TryGetValue(frequencyMHz, out var freqConfig))
+            {
+                freqConfig.NoiseGenerator?.SetRadioType(radioType);
+            }
+        }
     }
 
     /// <summary>
-    /// Set radio type based on frequency
+    /// Set radio type based on frequency (auto-detect VHF vs UHF)
+    /// This is called automatically when tuning, but can be overridden with SetRadioType()
     /// </summary>
     /// <param name="frequencyMHz">Frequency in MHz</param>
     public void SetRadioTypeFromFrequency(float frequencyMHz)
@@ -486,7 +508,7 @@ public class RadioPlayback
             ? BackgroundNoiseGenerator.RadioType.VHF_AM 
             : BackgroundNoiseGenerator.RadioType.UHF_FM;
         
-        _noiseGenerator?.SetRadioType(radioType);
+        SetRadioType(frequencyMHz, radioType);
     }
 
     private void StartMasterStream()
@@ -517,16 +539,6 @@ public class RadioPlayback
             throw new Exception($"BASS error creating master stream: {Bass.LastError}");
         
         Console.Out.WriteLine($"[StartMasterStream] Master stream created: handle={_masterStream}");
-        
-        // PHASE 1: Reuse noise generator instead of recreating
-        // Just update its sample rate if different
-        if (_noiseGenerator == null)
-        {
-            _noiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels);
-            _noiseGenerator.SetRadioType(BackgroundNoiseGenerator.RadioType.UHF_FM);
-        }
-        // TODO: Add SetSampleRate method to BackgroundNoiseGenerator to avoid recreation
-        // For now, we'll recreate if sample rate changed (rare case)
         
         // IMPORTANT: Always set up DSP callback for each new master stream
         // The DSP callback must be attached to THIS specific master stream handle
@@ -623,86 +635,92 @@ public class RadioPlayback
             // Clear output buffer
             Array.Clear(_dspScratch, 0, samples);
 
-            // Check if we have any hearable streams
-            bool hasHearableStreams = activeStreams.Any(s => 
-                !s.IsStopping && s.RadioEffect.IsSquelchOpen);
-
-            // Check if any frequencies are tuned
-            bool hasTunedFrequencies = frequencySnapshot.Values.Any(f => f.IsTuned);
-
-            // Background noise logic
+            // PHASE 2b FIX: Process background noise PER FREQUENCY
+            // Each frequency can have its own:
+            // - Radio type (VHF/UHF)
+            // - Channel routing (left/right/both)
+            // - Squelch threshold (affects when noise plays)
+            // - Fade envelope (independent fade in/out)
+            
             const float BackgroundNoiseEffectiveGain = NoiseBaseLevel;
             bool noiseIsSquelched = BackgroundNoiseEffectiveGain < currentSquelchThreshold;
-
-            if (!hasHearableStreams && hasTunedFrequencies && !noiseIsSquelched)
+            
+            foreach (var kvp in frequencySnapshot)
             {
-                // Generate background noise
-                float targetGain = NoiseBaseLevel;
-                float fadeStep = targetGain / NoiseFadeSamples;
+                float freq = kvp.Key;
+                var freqConfig = kvp.Value;
                 
-                _noiseGenerator?.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
+                // Skip if not tuned or no noise generator
+                if (!freqConfig.IsTuned || freqConfig.NoiseGenerator == null)
+                    continue;
                 
-                // Determine channels based on tuned frequencies
-                bool playLeft = false;
-                bool playRight = false;
-                foreach (var kvp in frequencySnapshot) // PHASE 1: Use snapshot
+                // Check if THIS frequency has any hearable streams
+                bool freqHasHearableStreams = activeStreams.Any(s => 
+                    Math.Abs(s.FrequencyMHz - freq) < 0.001f && 
+                    !s.IsStopping && 
+                    s.RadioEffect.IsSquelchOpen);
+                
+                // Generate noise for this frequency if no hearable streams and squelch allows
+                if (!freqHasHearableStreams && !noiseIsSquelched)
                 {
-                    if (kvp.Value.IsTuned)
+                    // Generate noise for this frequency
+                    float targetGain = NoiseBaseLevel * freqConfig.Volume;
+                    float fadeStep = targetGain / NoiseFadeSamples;
+                    
+                    freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
+                    
+                    // Apply fade and route to appropriate channels
+                    if (_channels == 1)
                     {
-                        switch (kvp.Value.AudioChannel)
+                        // Mono output
+                        for (int frame = 0; frame < outputFrames; frame++)
                         {
-                            case AudioChannel.Left:
-                                playLeft = true;
-                                break;
-                            case AudioChannel.Right:
-                                playRight = true;
-                                break;
-                            case AudioChannel.Both:
-                                playLeft = true;
-                                playRight = true;
-                                break;
+                            // Update fade envelope for this frequency
+                            if (freqConfig.NoiseFadeGain < targetGain)
+                                freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
+                            
+                            _dspScratch[frame] += _noiseBuffer[frame] * freqConfig.NoiseFadeGain;
+                        }
+                    }
+                    else if (_channels == 2)
+                    {
+                        // Stereo output - respect channel routing
+                        for (int frame = 0; frame < outputFrames; frame++)
+                        {
+                            // Update fade envelope for this frequency
+                            if (freqConfig.NoiseFadeGain < targetGain)
+                                freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
+                            
+                            int leftIdx = frame * 2;
+                            int rightIdx = frame * 2 + 1;
+                            
+                            // Noise sample with fade
+                            float noiseSample = _noiseBuffer[leftIdx] * freqConfig.NoiseFadeGain;
+                            
+                            // Route to appropriate channels
+                            switch (freqConfig.AudioChannel)
+                            {
+                                case AudioChannel.Left:
+                                    _dspScratch[leftIdx] += noiseSample;
+                                    break;
+                                case AudioChannel.Right:
+                                    _dspScratch[rightIdx] += noiseSample;
+                                    break;
+                                case AudioChannel.Both:
+                                    _dspScratch[leftIdx] += noiseSample;
+                                    _dspScratch[rightIdx] += noiseSample;
+                                    break;
+                            }
                         }
                     }
                 }
-                
-                // Apply fade and mix
-                int frames = samples / _channels;
-                
-                if (_channels == 1)
+                else
                 {
-                    for (int frame = 0; frame < frames; frame++)
-                    {
-                        if (_noiseFadeGain < targetGain)
-                            _noiseFadeGain = Math.Min(_noiseFadeGain + fadeStep, targetGain);
-                        
-                        _dspScratch[frame] = _noiseBuffer[frame] * _noiseFadeGain;
-                    }
+                    // Fade out noise for this frequency
+                    float fadeStep = NoiseBaseLevel / NoiseFadeSamples;
+                    if (freqConfig.NoiseFadeGain > 0f)
+                        freqConfig.NoiseFadeGain = Math.Max(freqConfig.NoiseFadeGain - fadeStep, 0f);
                 }
-                else if (_channels == 2)
-                {
-                    for (int frame = 0; frame < frames; frame++)
-                    {
-                        if (_noiseFadeGain < targetGain)
-                            _noiseFadeGain = Math.Min(_noiseFadeGain + fadeStep, targetGain);
-                        
-                        int leftIdx = frame * 2;
-                        int rightIdx = frame * 2 + 1;
-                        
-                        float noiseSample = _noiseBuffer[leftIdx] * _noiseFadeGain;
-                        
-                        if (playLeft)
-                            _dspScratch[leftIdx] = noiseSample;
-                        if (playRight)
-                            _dspScratch[rightIdx] = noiseSample;
-                    }
-                }
-            }
-            else
-            {
-                // Fade out noise
-                float fadeStep = NoiseBaseLevel / NoiseFadeSamples;
-                if (_noiseFadeGain > 0f)
-                    _noiseFadeGain = Math.Max(_noiseFadeGain - fadeStep, 0f);
             }
 
             // Process each stream

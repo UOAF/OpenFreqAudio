@@ -81,9 +81,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e);
         _radioPlayback.Initialize();
-        _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Left);
-        _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Right);
-        _radioPlayback.TuneFrequency((float) ViewModel.FrequencyMhz);
+        _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Right);
+        _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Left);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -439,6 +438,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         _signal1Params = audioParams.Copy();
         _signal2Params = audioParams.Copy();
+        
+        _radioPlayback.TuneFrequency((float) ViewModel.FrequencyMhz);
         
         // Convert dB to linear multiplier: 10^(dB/20)
         float linearMultiplier = MathF.Pow(10, ViewModel.SteppedDiffDbm / 20.0f);
