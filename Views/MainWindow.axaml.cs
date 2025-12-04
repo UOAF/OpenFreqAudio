@@ -627,17 +627,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        double minVal = 0.01, maxVal = 1.0;
-
-        // Convert dBm to linear scale
-        double linearValue = Math.Pow(10, e.NewValue / 10);
-
-        // Assuming a dBm range between -120 and 0 for normalization
-        double linearMin = Math.Pow(10, -120 / 10);
-        double linearMax = Math.Pow(10, 0 / 10);
-
-        // Normalize the linear value to the range [minVal, maxVal]
-        double normalizedValue = (e.NewValue / 10.0) * (maxVal - minVal) + minVal;
-        _radioPlayback.SetSquelchThreshold((float)normalizedValue);
+        double dB = -40 + (e.NewValue * 4.0);     // map 0–10 to -40 dB → 0 dB
+        double value = Math.Pow(10, dB / 20.0);   // convert dB to linear
+        Console.Out.WriteLine($"SetSquelchThreshold {value}");
+        _radioPlayback.SetSquelchThreshold((float)value);
     }
 }
