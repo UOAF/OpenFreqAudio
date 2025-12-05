@@ -22,6 +22,10 @@ namespace BMSAudioSim;
 /// 
 /// PHASE 2a OPTIMIZATIONS:
 /// - Pre-calculated squelch burst envelope (eliminates Exp/Pow during burst)
+/// 
+/// MULTI-SCALE FADING MODEL:
+/// - Fast flutter (20-80ms): Rapid multipath interference, stays above squelch
+/// - Deep fades (400-2000ms): Severe signal loss, can trigger squelch pops
 /// </summary>
 public class RadioEffect
 {
@@ -106,10 +110,20 @@ public class RadioEffect
     private readonly float[] _squelchBurstFilterHistory = new float[4]; // 4-tap moving average (balanced)
     private int _squelchBurstFilterIndex = 0;
     
-    // Dropout state (digital = full muting or corruption)
+    // Fast flutter state (rapid multipath fading, 20-80ms)
     private int _dropoutSamplesLeft = 0;
     private int _dropoutFadeSamples = 0;
+    private int _dropoutInitialSamples = 0; // Track initial duration for envelope calculation
     private bool _dropoutIsMute = true; // true = mute, false = digital corruption
+    
+    // Deep fade state (slow severe fading, 400-2000ms, can trigger squelch)
+    private int _deepFadeSamplesLeft = 0;
+    private int _deepFadeFadeSamples = 0;
+    private int _deepFadeInitialSamples = 0;
+    
+    // Track effective gain for squelch decisions (includes fade effects)
+    private float _prevEffectiveGain = 1.0f;
+    
     private readonly Random _rng = new(Environment.TickCount);
 
     private static readonly ThreadLocal<Random> ThreadRng =
@@ -125,37 +139,8 @@ public class RadioEffect
         {
             lock (_lock)
             {
-                // Detect signal strength changes for squelch
-                bool wasWeak = _params.Gain < _squelchThreshold;
-                bool isWeak = value.Gain < _squelchThreshold;
-                
-                // Signal crossed threshold - transition immediately regardless of current state
-                if (wasWeak && !isWeak)
-                {
-                    // Signal came up - open squelch (fast digital)
-                    _squelchState = SquelchState.Opening;
-                    _squelchTransitionSamples = 0;
-                    _squelchTransitionLength = SquelchAttackSamples;
-                    
-                    // Trigger squelch burst (opening pop)
-                    _squelchBurstSamplesLeft = SquelchBurstDuration;
-                    Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
-                    _squelchBurstFilterIndex = 0;
-                }
-                else if (!wasWeak && isWeak)
-                {
-                    // Signal dropped - close squelch (fast digital)
-                    _squelchState = SquelchState.Closing;
-                    _squelchTransitionSamples = 0;
-                    _squelchTransitionLength = SquelchReleaseSamples;
-                    
-                    // Trigger squelch burst (closing pop)
-                    _squelchBurstSamplesLeft = SquelchBurstDuration;
-                    Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
-                    _squelchBurstFilterIndex = 0;
-                }
-                
                 _params = value;
+                // Note: Squelch decisions now based on effective gain (calculated in Process)
             }
         }
     }
@@ -187,6 +172,7 @@ public class RadioEffect
         
         // Initialize squelch state based on initial signal strength
         _squelchState = initial.Gain >= _squelchThreshold ? SquelchState.Open : SquelchState.Closed;
+        _prevEffectiveGain = initial.Gain;
     }
     
     /// <summary>
@@ -238,8 +224,8 @@ public class RadioEffect
             _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
             
             // Re-evaluate squelch state with new threshold
-            bool wasWeak = _params.Gain < oldThreshold;
-            bool isWeak = _params.Gain < _squelchThreshold;
+            bool wasWeak = _prevEffectiveGain < oldThreshold;
+            bool isWeak = _prevEffectiveGain < _squelchThreshold;
             
             // Handle all states - signal crossed threshold
             if (wasWeak && !isWeak)
@@ -284,7 +270,7 @@ public class RadioEffect
             Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
             _squelchBurstFilterIndex = 0;
             
-            Console.Out.WriteLine($"Triggering Squelch Burst {_squelchBurstSamplesLeft}");
+            Console.Out.WriteLine($"Triggering Squelch Burst");
         }
     }
 
@@ -300,25 +286,127 @@ public class RadioEffect
 
         int frames = samples / _channels;
 
-        // RF Fading (analog FM signal loss) - exponential distribution
-        if (p.NoiseLevel > 0.5f && _dropoutSamplesLeft <= 0 && rng.NextDouble() < 0.0005)
+        // === FAST FLUTTER: Rapid multipath fading (20-80ms) ===
+        // This is Poisson process for "picket-fencing" effect
+        // DropoutProb is the rate (events per second)
+        if (_dropoutSamplesLeft <= 0 && p.DropoutRate > 0.001f)
         {
-            double u = rng.NextDouble();
-            double meanDropMs = 80.0; // Average 80ms dropout
-            double minDropMs = 20.0;  // Minimum 20ms
-            double fadeMs = 8.0;      // Fast fade (digital squelch action)
-            double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
-            _dropoutSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
-            _dropoutFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
+            double bufferDurationSec = (double)frames / _sampleRate;
+            double expectedEvents = p.DropoutRate * bufferDurationSec;
+            double dropoutProbability = 1.0 - Math.Exp(-expectedEvents);
             
-            // Analog FM fading: Just signal loss, no corruption
-            // (corruption would require digital codec, which we don't have)
-            _dropoutIsMute = true; // Always mute for analog fading
+            if (rng.NextDouble() < dropoutProbability)
+            {
+                double u = rng.NextDouble();
+                double meanDropMs = 80.0; // Average 80ms (fast flutter)
+                double minDropMs = 20.0;  // Minimum 20ms
+                double fadeMs = 8.0;      // Fast fade
+                double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
+                _dropoutSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
+                _dropoutFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
+                _dropoutInitialSamples = _dropoutSamplesLeft;
+                _dropoutIsMute = true; // Analog FM fading
+            }
+        }
+
+        // === DEEP FADES: Slow severe dropouts (400-2000ms) ===
+        // Independent Poisson process for terrain nulls, severe multipath
+        // These CAN drop signal below squelch threshold → trigger pops
+        if (_deepFadeSamplesLeft <= 0 && p.DeepFadeRate > 0.001f)
+        {
+            double bufferDurationSec = (double)frames / _sampleRate;
+            double expectedEvents = p.DeepFadeRate * bufferDurationSec;
+            double fadeProbability = 1.0 - Math.Exp(-expectedEvents);
+            
+            if (rng.NextDouble() < fadeProbability)
+            {
+                double u = rng.NextDouble();
+                double meanDropMs = 1200.0;  // Average 1.2 seconds (deep fade)
+                double minDropMs = 400.0;    // Minimum 400ms
+                double fadeMs = 50.0;        // Slower fade (50ms)
+                double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
+                _deepFadeSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
+                _deepFadeFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
+                _deepFadeInitialSamples = _deepFadeSamplesLeft;
+            }
         }
 
         for (int frame = 0; frame < frames; frame++)
         {
-            // === Digital squelch gate (fast, no burst) ===
+            // === Calculate effective gain (includes fade effects) ===
+            float effectiveGain = p.Gain;
+            
+            // Apply fast flutter envelope
+            bool inDrop = _dropoutSamplesLeft > 0;
+            if (inDrop)
+            {
+                int fadeIn = _dropoutFadeSamples;
+                int fadeOut = _dropoutFadeSamples;
+                int age = _dropoutInitialSamples - _dropoutSamplesLeft;
+                
+                float dropoutEnvelope;
+                if (age < fadeIn)
+                    dropoutEnvelope = 1f - (float)age / fadeIn;
+                else if (_dropoutSamplesLeft < fadeOut)
+                    dropoutEnvelope = (float)(fadeOut - _dropoutSamplesLeft) / fadeOut;
+                else
+                    dropoutEnvelope = 0f;
+                
+                effectiveGain *= dropoutEnvelope;
+            }
+            
+            // Apply deep fade envelope
+            bool inDeepFade = _deepFadeSamplesLeft > 0;
+            if (inDeepFade)
+            {
+                int fadeIn = _deepFadeFadeSamples;
+                int fadeOut = _deepFadeFadeSamples;
+                int age = _deepFadeInitialSamples - _deepFadeSamplesLeft;
+                
+                float deepFadeEnvelope;
+                if (age < fadeIn)
+                    deepFadeEnvelope = 1f - (float)age / fadeIn;
+                else if (_deepFadeSamplesLeft < fadeOut)
+                    deepFadeEnvelope = (float)(fadeOut - _deepFadeSamplesLeft) / fadeOut;
+                else
+                    deepFadeEnvelope = 0f;
+                
+                effectiveGain *= deepFadeEnvelope;
+            }
+            
+            // === Digital squelch gate (responds to effective gain) ===
+            // Check if effective gain crossed squelch threshold
+            bool wasWeak = _prevEffectiveGain < _squelchThreshold;
+            bool isWeak = effectiveGain < _squelchThreshold;
+            
+            if (wasWeak && !isWeak)
+            {
+                // Effective gain came up - open squelch (deep fade ended)
+                _squelchState = SquelchState.Opening;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchAttackSamples;
+                
+                // Trigger squelch burst (opening pop)
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
+            }
+            else if (!wasWeak && isWeak)
+            {
+                // Effective gain dropped - close squelch (deep fade started)
+                _squelchState = SquelchState.Closing;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchReleaseSamples;
+                
+                // Trigger squelch burst (closing pop)
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
+            }
+            
+            _prevEffectiveGain = effectiveGain;
+            
+            // Calculate squelch gate gain
             float squelchGain = 1f;
             
             switch (_squelchState)
@@ -387,34 +475,6 @@ public class RadioEffect
                 _squelchBurstSamplesLeft--;
             }
 
-            // === Dropout envelope (RF fading) ===
-            bool inDrop = _dropoutSamplesLeft > 0;
-            float dropoutEnvelope = 1f;
-
-            if (inDrop)
-            {
-                int fadeIn = _dropoutFadeSamples;
-                int fadeOut = _dropoutFadeSamples;
-                int totalDrop = _dropoutSamplesLeft + fadeIn + fadeOut;
-                int age = totalDrop - _dropoutSamplesLeft;
-                
-                if (age < fadeIn)
-                {
-                    // Fast fade to mute (squelch closing)
-                    dropoutEnvelope = 1f - (float)age / fadeIn;
-                }
-                else if (_dropoutSamplesLeft < fadeOut)
-                {
-                    // Fast fade back (squelch opening)
-                    dropoutEnvelope = (float)(_dropoutFadeSamples - _dropoutSamplesLeft) / fadeOut;
-                }
-                else
-                {
-                    // Full dropout (signal loss)
-                    dropoutEnvelope = 0f;
-                }
-            }
-
             for (int c = 0; c < _channels; c++)
             {
                 int idx = offset + frame * _channels + c;
@@ -423,12 +483,40 @@ public class RadioEffect
                 // Apply squelch gate (clean digital, no burst)
                 x *= squelchGain;
 
-                // === RF Fading (analog signal loss) ===
+                // === RF Fading (both fast flutter and deep fades) ===
+                // Apply fades to audio signal (these already affected effectiveGain for squelch)
                 if (inDrop)
                 {
-                    // Analog FM fading: Just signal attenuation
-                    // No digital corruption artifacts (no codec to corrupt!)
+                    int fadeIn = _dropoutFadeSamples;
+                    int fadeOut = _dropoutFadeSamples;
+                    int age = _dropoutInitialSamples - _dropoutSamplesLeft;
+                    
+                    float dropoutEnvelope;
+                    if (age < fadeIn)
+                        dropoutEnvelope = 1f - (float)age / fadeIn;
+                    else if (_dropoutSamplesLeft < fadeOut)
+                        dropoutEnvelope = (float)(fadeOut - _dropoutSamplesLeft) / fadeOut;
+                    else
+                        dropoutEnvelope = 0f;
+                    
                     x *= dropoutEnvelope;
+                }
+                
+                if (inDeepFade)
+                {
+                    int fadeIn = _deepFadeFadeSamples;
+                    int fadeOut = _deepFadeFadeSamples;
+                    int age = _deepFadeInitialSamples - _deepFadeSamplesLeft;
+                    
+                    float deepFadeEnvelope;
+                    if (age < fadeIn)
+                        deepFadeEnvelope = 1f - (float)age / fadeIn;
+                    else if (_deepFadeSamplesLeft < fadeOut)
+                        deepFadeEnvelope = (float)(fadeOut - _deepFadeSamplesLeft) / fadeOut;
+                    else
+                        deepFadeEnvelope = 0f;
+                    
+                    x *= deepFadeEnvelope;
                 }
 
                 // === Digital brick-wall filter (biquad) ===
@@ -453,7 +541,7 @@ public class RadioEffect
                 
                 _prevOut[c] = y;
                 
-                // Apply gain
+                // Apply gain (using original p.Gain, not effectiveGain - fades already applied)
                 float val = y * p.Gain;
 
                 // === Analog receiver noise (optional) ===
@@ -481,6 +569,7 @@ public class RadioEffect
             }
 
             if (inDrop) _dropoutSamplesLeft--;
+            if (inDeepFade) _deepFadeSamplesLeft--;
         }
     }
 }

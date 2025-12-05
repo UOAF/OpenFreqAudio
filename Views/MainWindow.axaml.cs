@@ -435,7 +435,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         GainText.Text = audioParams.Gain.ToString();
         LowPassHzText.Text = audioParams.LowpassHz.ToString();
         NoiseLvlText.Text = audioParams.NoiseLevel.ToString();
-        DropoutProbText.Text = audioParams.DropoutProb.ToString();
+        DropoutRateText.Text = audioParams.DropoutRate.ToString();
+        DeepFadeRateText.Text = audioParams.DeepFadeRate.ToString();
 
         _signal1Params = audioParams.Copy();
         _signal2Params = audioParams.Copy();

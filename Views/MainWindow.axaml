@@ -164,8 +164,8 @@
                     <TextBlock Text="Gain:" FontWeight="Bold" />
                     <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
                     <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
-                    <TextBlock Text="Dropout Probability:" FontWeight="Bold" />
-                    <TextBlock Text="Flutter Depth:" FontWeight="Bold" />
+                    <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
+                    <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
 
                 </StackPanel>
 
@@ -173,8 +173,8 @@
                     <TextBlock Name="GainText" Text="n/a" />
                     <TextBlock Name="LowPassHzText" Text="n/a" />
                     <TextBlock Name="NoiseLvlText" Text="n/a" />
-                    <TextBlock Name="DropoutProbText" Text="n/a" />
-                    <TextBlock Name="FlutterDepthText" Text="n/a" />
+                    <TextBlock Name="DropoutRateText" Text="n/a" />
+                    <TextBlock Name="DeepFadeRateText" Text="n/a" />
                 </StackPanel>
             </Grid>
         </Grid>

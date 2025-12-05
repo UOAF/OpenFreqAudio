@@ -219,7 +219,7 @@ public class RadioPlayback
             _streams.Add(streamId, stream);
             
             // Trigger initial squelch burst if stream is hearable
-            if (audioParams.Gain >= _squelchThreshold)
+            if (audioParams.Gain >= _squelchThreshold && _squelchThreshold > 0.01)
             {
                 Console.Out.WriteLine($"Stream {streamId} starting - triggering squelch burst");
                 stream.RadioEffect.TriggerSquelchBurst();
@@ -238,7 +238,7 @@ public class RadioPlayback
                 return; // Stream doesn't exist
             
             // Mark stream as stopping - DSP callback will handle the burst and cleanup
-            if (stream.CurrentParams.Gain >= _squelchThreshold)
+            if (stream.CurrentParams.Gain >= _squelchThreshold && _squelchThreshold > 0.01)
             {
                 Console.Out.WriteLine($"Stream {streamId} stopping - triggering squelch burst");
                 stream.IsStopping = true;

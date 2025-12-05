@@ -19,7 +19,8 @@ namespace BMSAudioSim
         public float Gain; // linear gain
         public float LowpassHz; // cutoff for low-pass filter (analog voice bandwidth)
         public float NoiseLevel; // 0..1 (analog static/hiss level)
-        public float DropoutProb; // multipath fading rate (events per second, can exceed 1.0)
+        public float DropoutRate; // fast multipath flutter (events per second, can exceed 1.0)
+        public float DeepFadeRate; // slow deep fades (events per second, typically 0-0.5)
         public float RadioFrequencyMHz;
 
         // RF propagation parameters (for physics-based stepped-on interference)
@@ -34,7 +35,8 @@ namespace BMSAudioSim
         {
             return new AudioParams()
             {
-                Distance_km = Distance_km, DropoutProb = DropoutProb, LowpassHz = LowpassHz, NoiseLevel = NoiseLevel,
+                Distance_km = Distance_km, DropoutRate = DropoutRate, DeepFadeRate = DeepFadeRate,
+                LowpassHz = LowpassHz, NoiseLevel = NoiseLevel,
                 Gain = Gain, PathLoss_dB = PathLoss_dB, RadioFrequencyMHz = RadioFrequencyMHz, SNR_dB = SNR_dB,
                 TerrainProfile = TerrainProfile
             };
@@ -283,6 +285,10 @@ namespace BMSAudioSim
         /// <summary>
         /// Calculate noise level and dropout probability from SNR.
         /// Physics-informed: based on FM threshold effect and thermal noise characteristics.
+        /// 
+        /// MULTI-SCALE FADING MODEL:
+        /// - DropoutProb: Fast flutter (20-80ms, 0-1.2 events/sec) - rapid multipath interference
+        /// - DeepFadeProb: Slow deep fades (400-2000ms, 0-0.3 events/sec) - terrain nulls, severe multipath
         /// </summary>
         private void CalculateNoiseAndDropout(AudioParams ap, double snrDb, bool isVHF)
         {
@@ -313,7 +319,8 @@ namespace BMSAudioSim
                     ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
             }
 
-            // Multipath fading and dropouts (events per second)
+            // === FAST FLUTTER: Rapid multipath fading (20-80ms) ===
+            // This is the "picket-fencing" effect from rapid phase cancellation
             double dropout;
             if (snrDb > 15.0)
                 dropout = 0.0; // Clean signal
@@ -328,7 +335,26 @@ namespace BMSAudioSim
             if (isVHF)
                 dropout *= 0.7;
 
-            ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.5);
+            ap.DropoutRate = (float)Math.Clamp(dropout, 0.0, 1.5);
+
+            // === DEEP FADES: Slow severe dropouts (400-2000ms) ===
+            // These are from terrain shadowing, deep multipath nulls, atmospheric ducting changes
+            // They can drop signal below squelch threshold → trigger squelch pops
+            double deepFade;
+            if (snrDb > 10.0)
+                deepFade = 0.0; // Good signal - no deep fades
+            else if (snrDb > 5.0)
+                deepFade = (10.0 - snrDb) / 5.0 * 0.05; // 0 → 0.05 events/sec
+            else if (snrDb > 0.0)
+                deepFade = 0.05 + (5.0 - snrDb) / 5.0 * 0.10; // 0.05 → 0.15 events/sec
+            else
+                deepFade = 0.15 + Math.Min(-snrDb / 10.0, 0.15); // 0.15 → 0.30 events/sec
+
+            // UHF more susceptible to deep fades (terrain nulls, shorter wavelength)
+            if (!isVHF)
+                deepFade *= 1.5;
+
+            ap.DeepFadeRate = (float)Math.Clamp(deepFade, 0.0, 0.5);
         }
 
         /// <summary>
@@ -355,7 +381,7 @@ namespace BMSAudioSim
             double rfGainLinear;
 
             // === CHECK FOR CLEAR LOS FIRST ===
-            if (fresnelClearance >= 0.6 && diffLoss < 3.0)
+            if (fresnelClearance >= 1.0 || (fresnelClearance >= 0.6 && diffLoss < 3.0))
             {
                 Console.WriteLine($"  → Taking CLEAR LOS path");
                 // Clear LOS - no terrain degradation needed
@@ -378,140 +404,44 @@ namespace BMSAudioSim
             // Based on knife-edge diffraction theory, but applied continuously
 
             // Calculate approximate Fresnel parameter from clearance
-            // CORRECTED MAPPING:
-            // clearance = 1.0 (100% clear) → v = -2.0 (well below obstacle)
-            // clearance = 0.0 (obstacle at Fresnel zone) → v = 0.0 (grazing)
-            // clearance = -1.0 (obstacle beyond Fresnel zone) → v = +2.0 (blocked)
-            double v_approx = -2.0 * fresnelClearance;
+            double fresnelObstruction = Math.Max(0.0, 1.0 - fresnelClearance);
 
-            // Calculate knife-edge diffraction loss (ITU-R P.526)
-            // Only applies when v > -0.78 (obstructed or grazing)
-            double theoreticalDiffractionLoss = 0.0;
-            if (v_approx > -0.78)
+            // Wavelength-dependent correction factors
+            double wavelengthFactor = isVHF ? VhfDiffractionBonus_dB : -UhfDiffractionPenalty_dB;
+
+            // Apply diffraction loss with wavelength correction
+            double totalLoss = diffLoss - wavelengthFactor;
+
+            // Additional attenuation for severe obstruction (complete blockage)
+            if (fresnelObstruction > 0.8)
             {
-                theoreticalDiffractionLoss = KnifeEdgeLoss_dB(v_approx);
+                double blockageFactor = (fresnelObstruction - 0.8) / 0.2; // 0.0 at 0.8, 1.0 at 1.0
+                totalLoss += blockageFactor * 20.0; // Up to 20 dB additional loss for complete blockage
             }
 
-            // For SEVERE obstruction (< 20% clearance), trust the actual measured diffraction loss
-            // The approximation breaks down for multiple obstacles
-            if (fresnelClearance < 0.2)
-            {
-                // Use the larger of: approximation vs actual measurement
-                theoreticalDiffractionLoss = Math.Max(theoreticalDiffractionLoss, diffLoss);
-            }
+            // Apply total loss
+            double obstructedGainDb = baseGainDb - totalLoss;
+            obstructedGainDb = Math.Clamp(obstructedGainDb, MinimumGainDb, 50.0);
 
-            // Apply wavelength-dependent corrections
-            double wavelengthCorrection;
-            if (isVHF)
-            {
-                // VHF: Longer wavelength diffracts better than knife-edge theory predicts
-                wavelengthCorrection = -VhfDiffractionBonus_dB;
-                
-                // However, for obstructions beyond 1.5 Fresnel zones,
-                // wavelength advantage diminishes - you can't diffract around a mountain!
-                if (fresnelClearance < -0.5)
-                {
-                    // Start reducing VHF advantage at 1.5 zones blocked
-                    // Use aggressive exponential scaling - essentially eliminates VHF advantage at 2+ zones
-                    double excessBlocked = Math.Max(0.0, -fresnelClearance - 0.5); // 0 at -0.5, 1.5 at -2.0
-                    
-                    // Exponential reduction: 2^(-2x) gives very fast decay
-                    // At 1.5 zones (-0.5 clearance): factor ≈ 1.0 (no reduction)
-                    // At 2.0 zones (-1.0 clearance): factor ≈ 0.25 (75% reduction)
-                    // At 2.5 zones (-1.5 clearance): factor ≈ 0.06 (94% reduction)
-                    double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
-                    wavelengthCorrection *= reductionFactor;
-                    
-                    Console.WriteLine($"[DEBUG] VHF advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
-                }
-            }
-            else
-            {
-                // UHF: Shorter wavelength, more LOS-dependent
-                wavelengthCorrection = UhfDiffractionPenalty_dB;
-            }
-
-            // Combine theoretical loss with wavelength correction
-            double totalTerrainLoss = theoreticalDiffractionLoss + wavelengthCorrection;
-
-            // For very severe obstruction, use the actual measured diffraction loss
-            // (knife-edge theory breaks down for multiple obstacles)
-            if (fresnelClearance < 0.2)
-            {
-                totalTerrainLoss = Math.Max(totalTerrainLoss, diffLoss);
-            }
-
-            // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
-            // For mountains blocking multiple Fresnel zones, add additional loss factor.
-            if (fresnelClearance < 0.4 && diffLoss > 15.0)
-            {
-                // Calculate how many Fresnel radii the terrain penetrates into obstruction zone
-                // fresnelClearance = 1.0 - (worstExcess / F1_radius)
-                // So: totalPenetration = worstExcess / F1_radius = 1.0 - fresnelClearance (when negative)
-                double totalPenetration = Math.Max(0.0, 1.0 - fresnelClearance);
-                
-                // Knife-edge theory handles up to ~0.6 clearance (40% obstruction)
-                // Apply penalty for deeper penetration
-                double additionalZonesBlocked = Math.Max(0.0, totalPenetration - 0.6);
-                
-                if (additionalZonesBlocked > 0.1)
-                {
-                    // Multi-zone penalty with exponential scaling for severe obstructions
-                    // Base: 12 dB per zone for moderate obstruction (up to 1.5 zones)
-                    // Exponential: penalty increases dramatically beyond 1.5 zones
-                    double multiZonePenalty;
-                    
-                    if (additionalZonesBlocked < 1.0)
-                    {
-                        // Linear region: 12 dB per zone
-                        multiZonePenalty = additionalZonesBlocked * 12.0;
-                    }
-                    else
-                    {
-                        // Exponential region for severe obstruction (>2 total zones blocked)
-                        // First zone: 12 dB
-                        // Additional zones: 18 dB × (2.5^n) where n is zones beyond first
-                        // This creates very aggressive scaling for massive obstructions
-                        multiZonePenalty = 12.0; // First zone
-                        double excessZones = additionalZonesBlocked - 1.0;
-                        multiZonePenalty += 18.0 * (Math.Pow(2.5, excessZones) - 1.0);
-                    }
-
-                    // VHF gets less relief for massive obstructions
-                    if (isVHF)
-                        multiZonePenalty *= 0.95;
-                    else
-                        multiZonePenalty *= 1.3; // UHF suffers more from multi-zone blockage
-
-                    totalTerrainLoss += multiZonePenalty;
-
-                    Console.WriteLine(
-                        $"[DEBUG] Multi-zone blockage: {totalPenetration:F2} Fresnel radii, {additionalZonesBlocked:F2} zones → +{multiZonePenalty:F1} dB penalty");
-                }
-            }
-
-            // Apply terrain loss to base gain
-            double finalGainDb = baseGainDb - totalTerrainLoss;
-
-            // UHF hard cutoff: severe obstructions should completely block UHF
-            // When 3+ Fresnel zones are blocked, signal is essentially gone
-            if (!isVHF && fresnelClearance < -2.0) // More than 3 zones blocked
-            {
-                finalGainDb = Math.Min(finalGainDb, MinimumGainDb + 10.0); // Cap at -50 dB
-            }
-
-            // Clamp to physical limits
-            finalGainDb = Math.Clamp(finalGainDb, MinimumGainDb, 20.0);
-
-            // Convert to linear gain
-            rfGainLinear = Math.Pow(10.0, finalGainDb / 20.0);
-            // Apply AGC to get audio gain (0.0-1.0)
+            // Convert to linear gain and apply AGC
+            rfGainLinear = Math.Pow(10.0, obstructedGainDb / 20.0);
             ap.Gain = ApplyAGC((float)rfGainLinear);
-            Console.WriteLine($"[DEBUG] AGC: rfGain={rfGainLinear:F2} → audioGain={ApplyAGC((float)rfGainLinear):F3}");
 
-            // Calculate SNR from final gain
-            effectiveSignalDbm = rxSensitivity + finalGainDb;
+            // Calculate final SNR
+            effectiveSignalDbm = rxSensitivity + obstructedGainDb;
             snrDb = effectiveSignalDbm - noiseFloorDbm;
+
+            Console.WriteLine($"  Final: totalLoss={totalLoss:F1} dB, obstructedGainDb={obstructedGainDb:F1} dB, SNR={snrDb:F1} dB");
+
+            // Calculate noise and dropout based on degraded SNR
+            CalculateNoiseAndDropout(ap, snrDb, isVHF);
+            ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+        }
+
+        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, bool isVHF)
+        {
+            // Update noise/dropout without recalculating gain
+            // (used when gain is already correctly set but we need to recalculate noise/dropout)
 
             // Calculate noise and dropout from SNR (physics-based)
             CalculateNoiseAndDropout(ap, snrDb, isVHF);
@@ -553,7 +483,8 @@ namespace BMSAudioSim
                 ap.Gain = 1.0f;
                 ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
                 ap.NoiseLevel = 0.01f;
-                ap.DropoutProb = 0.0f;
+                ap.DropoutRate = 0.0f;
+                ap.DeepFadeRate = 0.0f;
                 FinalizeAudioParams(ap, dist, 40.0, 0.0, new List<(double, double)>(), includeTerrainProfile);
                 return ap;
             }
