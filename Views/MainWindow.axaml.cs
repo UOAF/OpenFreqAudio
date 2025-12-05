@@ -419,13 +419,13 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
 
-        var audioParams = _fastPathAudioSim.ComputeAudioForPath(
+        var audioParams = _fastPathAudioSim.CalculateAudioParams(
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.y),
-            txH: ViewModel.TXAltitude,
+            ViewModel.TXAltitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.TxDbm, ViewModel.RxDbm, ViewModel.FrequencyMhz * 10e5, true);
+            ViewModel.RXAltitude, ViewModel.TxDbm, ViewModel.FrequencyMhz, ViewModel.FrequencyMhz <= 200 ? -113 : -107, true);
 
         if (audioParams == null) throw new Exception("audioParams is null");
         if (audioParams.TerrainProfile == null) throw new Exception("terrainProfile is null");

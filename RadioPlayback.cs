@@ -46,6 +46,7 @@ public class RadioPlayback
         // Different frequencies can have different radio types (VHF/UHF) and independent squelch
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; } = null;
         public float NoiseFadeGain { get; set; } = 0f; // Per-frequency fade envelope
+        public double MinimumGain { get; set; }
     }
     
     /// <summary>
@@ -87,7 +88,7 @@ public class RadioPlayback
     
     // Background noise fade timing (shared constant)
     private const int NoiseFadeSamples = 2400; // ~50ms fade at 48kHz
-    private const float NoiseBaseLevel = 0.08f; // Base noise level (subtle but audible)
+    //private const float NoiseBaseLevel = 0.08f; // Base noise level (subtle but audible)
     
     /// <summary>
     /// Copy stream buffer to output buffer, upmixing mono to stereo if needed
@@ -337,7 +338,9 @@ public class RadioPlayback
                     : BackgroundNoiseGenerator.RadioType.UHF_FM;
                 freqConfig.NoiseGenerator.SetRadioType(radioType);
                 
-                Console.Out.WriteLine($"[TuneFrequency] Created {radioType} noise generator for {frequencyMHz:F2} MHz");
+                // Set Freq Noise Floor
+                freqConfig.MinimumGain = FastPathAudioSim.CalculateBackgroundNoiseAmplitude(frequencyMHz);
+                Console.Out.WriteLine($"[TuneFrequency] Created {radioType} noise generator for {frequencyMHz:F2} MHz, NoiseFloorDbm = {freqConfig.MinimumGain}");
             }
 
             // Start master stream if not already started
@@ -606,7 +609,8 @@ public class RadioPlayback
             {
                 // Snapshot active streams (including stopping ones with bursts left)
                 activeStreams = _streams.Values
-                    .Where(s => !s.IsStopping || s.StoppingBurstSamplesLeft > 0)
+                    .Where(s => (!s.IsStopping || s.StoppingBurstSamplesLeft > 0) && s.CurrentParams.Gain > 0 &&
+                                s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain)
                     .ToList();
                 
                 // Snapshot frequency configs (shallow copy is fine, configs are value-like)
@@ -640,8 +644,6 @@ public class RadioPlayback
             // - Squelch threshold (affects when noise plays)
             // - Fade envelope (independent fade in/out)
             
-            const float BackgroundNoiseEffectiveGain = NoiseBaseLevel;
-            bool noiseIsSquelched = BackgroundNoiseEffectiveGain < currentSquelchThreshold;
             
             foreach (var kvp in frequencySnapshot)
             {
@@ -652,17 +654,23 @@ public class RadioPlayback
                 if (!freqConfig.IsTuned || freqConfig.NoiseGenerator == null)
                     continue;
                 
+                float freqConfigMinimumGain = (float) freqConfig.MinimumGain;
+                
                 // Check if THIS frequency has any hearable streams
                 bool freqHasHearableStreams = activeStreams.Any(s => 
                     Math.Abs(s.FrequencyMHz - freq) < 0.001f && 
+                    s.CurrentParams.Gain >= freqConfig.MinimumGain &&
                     !s.IsStopping && 
                     s.RadioEffect.IsSquelchOpen);
+                
+              
+                bool noiseIsSquelched = freqConfigMinimumGain < currentSquelchThreshold || freqHasHearableStreams;
                 
                 // Generate noise for this frequency if no hearable streams and squelch allows
                 if (!freqHasHearableStreams && !noiseIsSquelched)
                 {
                     // Generate noise for this frequency
-                    float targetGain = NoiseBaseLevel * freqConfig.Volume;
+                    float targetGain = (float) freqConfig.MinimumGain * freqConfig.Volume;
                     float fadeStep = targetGain / NoiseFadeSamples;
                     
                     freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
@@ -715,7 +723,7 @@ public class RadioPlayback
                 else
                 {
                     // Fade out noise for this frequency
-                    float fadeStep = NoiseBaseLevel / NoiseFadeSamples;
+                    float fadeStep = (float)freqConfig.MinimumGain / NoiseFadeSamples;
                     if (freqConfig.NoiseFadeGain > 0f)
                         freqConfig.NoiseFadeGain = Math.Max(freqConfig.NoiseFadeGain - fadeStep, 0f);
                 }

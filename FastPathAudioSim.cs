@@ -1,7 +1,11 @@
-// Lightweight DEM-based path-loss -> audio-params proof-of-concept
 // - Assumes DEM mipmaps: mipmaps[0] = finest (native), mipmaps[last] = coarsest.
 // - Uses bilinear sampling and an adaptive sample/refine policy.
 // - Returns AudioParams (gain linear, lowpassHz, noiseLevel [0..1], dropoutProb).
+//
+// PHYSICS MODEL:
+// - Knife-edge diffraction theory (ITU-R P.526) as foundation
+// - Smooth continuous degradation
+// - Wavelength-dependent corrections for VHF (better diffraction) vs UHF (more LOS-dependent)
 
 using System;
 using System.Collections.Generic;
@@ -15,14 +19,14 @@ namespace BMSAudioSim
         public float Gain; // linear gain
         public float LowpassHz; // cutoff for low-pass filter (analog voice bandwidth)
         public float NoiseLevel; // 0..1 (analog static/hiss level)
-        public float DropoutProb; // 0..1 (multipath fading events per second)
+        public float DropoutProb; // multipath fading rate (events per second, can exceed 1.0)
         public float RadioFrequencyMHz;
-        
+
         // RF propagation parameters (for physics-based stepped-on interference)
-        public float Distance_km;    // Distance from transmitter to receiver
-        public float SNR_dB;         // Signal-to-noise ratio
-        public float PathLoss_dB;    // Total path loss
-        
+        public float Distance_km; // Distance from transmitter to receiver
+        public float SNR_dB; // Signal-to-noise ratio
+        public float PathLoss_dB; // Total path loss
+
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
 
@@ -86,12 +90,17 @@ namespace BMSAudioSim
         private const double EarthRadius = 6378000.0; // meters
         private const double SpeedOfLight = 299792458.0; // m/s
         private const double FourPi = 12.566370614359172; // 4 * π (precomputed)
-        
+
         // RF modulation constants
         private const double VhfUhfBoundaryMHz = 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
         private const float VhfBandwidthHz = 3000.0f; // AM voice bandwidth
         private const float UhfBandwidthHz = 3400.0f; // FM voice bandwidth
-        
+
+        // Physics calibration parameters (tunable based on field measurements)
+        private const double VhfDiffractionBonus_dB = 3.0; // VHF diffracts better than knife-edge theory predicts
+        private const double UhfDiffractionPenalty_dB = 6.0; // UHF is more LOS-dependent
+        private const double MinimumGainDb = -60.0; // Below this, signal is completely lost
+
         private readonly DEMReader dem;
         private readonly double originX, originY, cellSizeMeters;
         private readonly int maxSamplesPerPath = 4096;
@@ -144,7 +153,7 @@ namespace BMSAudioSim
             return 20.0 * Math.Log10(FourPi * distanceMeters / lambda);
         }
 
-        // Knife-edge diffraction loss (dB)
+        // Knife-edge diffraction loss (dB) - ITU-R P.526
         private static double KnifeEdgeLoss_dB(double v)
         {
             if (v < -0.78) return 0.0;
@@ -152,8 +161,69 @@ namespace BMSAudioSim
             return 6.9 + 20.0 * Math.Log10(term);
         }
 
+        /// <summary>
+        /// Calculate the thermal noise floor amplitude for background noise playback.
+        /// This is the noise level heard through speakers when squelch is open but no signal present.
+        /// </summary>
+        /// <param name="frequencyMHz">Radio frequency in MHz</param>
+        /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
+        /// <returns>Background noise amplitude (0.0 to 1.0 scale where 1.0 = 0 dBm)</returns>
+        public static float CalculateBackgroundNoiseAmplitude(double frequencyMHz,
+            double? receiverSensitivityDbm = null)
+        {
+            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
+
+            // Use provided sensitivity or default values
+            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
+
+            // Thermal noise floor calculation
+            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
+            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz); // ≈ -139.2 dBm
+            double receiverNoiseFigure = 7.0; // dB
+            double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm
+
+            // Noise floor relative to receiver sensitivity
+            double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
+            // VHF (default -113 dBm): -132 - (-113) = -19 dB
+            // UHF (default -107 dBm): -132 - (-107) = -25 dB
+
+            // Convert to linear amplitude (0 dB = 1.0)
+            float noiseFloorAmplitude = (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
+            // VHF: ≈ 0.112
+            // UHF: ≈ 0.056
+
+            // Reduce by 6 dB for playback (allows weak signals at noise floor + 3dB to be heard)
+            return noiseFloorAmplitude * 0.5f;
+            // VHF: ≈ 0.056
+            // UHF: ≈ 0.028
+        }
+
+        /// <summary>
+        /// Calculate minimum gain threshold for signal detection.
+        /// Signals below this are considered drowned by thermal noise.
+        /// </summary>
+        /// <param name="frequencyMHz">Radio frequency in MHz</param>
+        /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
+        public static float CalculateNoiseFloorAmplitude(double frequencyMHz, double? receiverSensitivityDbm = null)
+        {
+            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
+
+            // Use provided sensitivity or default values
+            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
+
+            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
+            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
+            double receiverNoiseFigure = 7.0;
+            double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
+            double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
+
+            return (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
+            // VHF (default -113 dBm): ≈ 0.112
+            // UHF (default -107 dBm): ≈ 0.056
+        }
+
         // Helper to finalize AudioParams with common fields and optional terrain profile
-        private void FinalizeAudioParams(AudioParams ap, double dist, double snrDb, double pathLossDb, 
+        private void FinalizeAudioParams(AudioParams ap, double dist, double snrDb, double pathLossDb,
             List<(double dist, double elev)> profile, bool includeTerrainProfile)
         {
             ap.Distance_km = (float)(dist / 1000.0);
@@ -192,380 +262,383 @@ namespace BMSAudioSim
             {
                 var (distA, elevA) = result[i];
                 var (distB, elevB) = result[i + 1];
-
-                double midDist = 0.5 * (distA + distB);
-                double frac = midDist / D;
-                double losMid = (1 - frac) * txBase + frac * rxBase;
-                double terrainMid = SampleElevation(txX + (midDist / D) * dx, txY + (midDist / D) * dy);
-
-                if (terrainMid > losMid - 200.0)
+                double tA = distA / D, tB = distB / D;
+                double losA = txBase + tA * (rxBase - txBase);
+                double losB = txBase + tB * (rxBase - txBase);
+                double excessA = elevA - losA;
+                double excessB = elevB - losB;
+                if (Math.Abs(excessB - excessA) > 5.0)
                 {
-                    result.Insert(i + 1, (midDist, terrainMid));
-                    i = Math.Max(-1, i - 2);
+                    double tMid = (tA + tB) * 0.5;
+                    double sx = txX + tMid * dx;
+                    double sy = txY + tMid * dy;
+                    double elevMid = SampleElevation(sx, sy);
+                    result.Insert(i + 1, (tMid * D, elevMid));
                 }
             }
-
-            if (result.Count > desiredSamples)
-                result.RemoveRange(desiredSamples, result.Count - desiredSamples);
 
             return result;
         }
 
-
-        // ================================================================
-        // Main path computation
-        // ================================================================
-        public AudioParams ComputeAudioForPath(
-            double txX, double txY, double txH,
-            double rxX, double rxY, double rxH,
-            double txPowerDbm, double receiverSensitivityDbm, double freqHz,
-            bool includeTerrainProfile = false) // Opt-in debug data
+        /// <summary>
+        /// Calculate noise level and dropout probability from SNR.
+        /// Physics-informed: based on FM threshold effect and thermal noise characteristics.
+        /// </summary>
+        private void CalculateNoiseAndDropout(AudioParams ap, double snrDb, bool isVHF)
         {
-            AudioParams ap = new AudioParams();
-            ap.RadioFrequencyMHz = (float)freqHz / 1_000_000;
-
-            // --- Basic geometry ---
-            double dx = rxX - txX, dy = rxY - txY;
-            double distSquared = dx * dx + dy * dy;
-            double dist = Math.Sqrt(distSquared);
-            if (dist < 1.0) dist = 1.0;
-
-            // === Early exit for extreme distances ===
-            // >500km is unrealistic for VHF/UHF tactical radio
-            if (dist > 500000.0) 
-            {
-                ap.Gain = 0.0f;
-                ap.LowpassHz = VhfBandwidthHz;
-                ap.NoiseLevel = 0.95f;
-                ap.DropoutProb = 0.0f;
-                ap.Distance_km = (float)(dist / 1000.0);
-                return ap;
-            }
-
-            // === Earth curvature and atmospheric refraction ===
-            double refractivityK = CalculateKAvg(txH, rxH);
-            double R_eff = EarthRadius * refractivityK;
-
-            // === RF propagation parameters ===
-            double lambda = SpeedOfLight / freqHz;
-            double fspl = FSPL_dB(dist, freqHz);
-
-            // === Terrain profile sampling (adaptive based on Fresnel zone) ===
-            double r1 = 0.5 * Math.Sqrt(lambda * dist);
-            double samplesAcross = (freqHz > 300e6) ? 8.0 : 5.0;
-            double targetSpacing = Math.Max(Math.Min(r1 / samplesAcross, 100.0), 5.0);
-            int desiredSamples = (int)Math.Min(maxSamplesPerPath, Math.Max(64, Math.Ceiling(dist / targetSpacing)));
-            var profile = SampleProfileAdaptive(txX, txY, rxX, rxY, desiredSamples);
-
-            // === Line-of-sight and diffraction analysis ===
-            double txTop = SampleElevation(txX, txY) + txH;
-            double rxTop = SampleElevation(rxX, rxY) + rxH;
-            double worstExcess = double.NegativeInfinity;
-            double worstDistFromTx = 0.0;
-            double oceanFrac = 0.0;
-            double inverseTwoReff = 1.0 / (2.0 * R_eff); // Precompute for loop efficiency
-
-            foreach (var pt in profile)
-            {
-                // pt.dist = distance from TX to sample (meters)
-                // Compute curvature bulge (meters) at this sample relative to straight chord
-                // bulge = x * (D - x) / (2 * R_eff)
-                double bulge = pt.dist * (dist - pt.dist) * inverseTwoReff;
-
-                // effective ground elevation includes curvature bulge
-                double effectiveGround = pt.elev + bulge;
-
-                // LOS line between antenna tops (straight line)
-                double zLine = txTop + (pt.dist / dist) * (rxTop - txTop);
-
-                // compare effective ground to LOS
-                double excess = effectiveGround - zLine;
-                if (excess > worstExcess)
-                {
-                    worstExcess = excess;
-                    worstDistFromTx = pt.dist;
-                }
-            }
-
-            oceanFrac /= profile.Count;
-
-            // === Diffraction loss calculation (knife-edge approximation) ===
-            double diffLoss = 0.0;
-            if (worstExcess > 0.0)
-            {
-                double d1 = Math.Max(1.0, worstDistFromTx);
-                double d2 = Math.Max(1.0, dist - worstDistFromTx);
-                double v = worstExcess * Math.Sqrt((2.0 / lambda) * ((d1 + d2) / (d1 * d2)));
-                diffLoss = KnifeEdgeLoss_dB(v);
-            }
-
-            // === Total path loss ===
-            double weatherLoss = weatherDbPerKm * (dist / 1000.0);
-            double pathLossDb = fspl + diffLoss + weatherLoss;
-
-            // --- Tunables (adjust to taste) ---
-            const double seaR0 = 0.95; // baseline seawater reflection magnitude (0..1)
-            const double Hscale = 200.0; // altitude softening scale (meters) - larger => slower softening
-            const double Dscale = 200000.0; // distance softening scale (meters) - larger => slower softening
-            const double sigmaSeaDefault = 0.05; // default sea rms (m) when no data (calm sea)
-
-            // --- Cheap specular point: midpoint approximation ---
-            double specX = 0.5 * (txX + rxX);
-            double specY = 0.5 * (txY + rxY);
-            double specElev = SampleElevation(specX, specY);
-
-            double twoRayDb = 0;
-            // Only proceed if path is mostly over water (oceanFrac computed earlier)
-            if (oceanFrac > 0.2)
-            {
-                // --------------------------------------------------------------------
-                // Two-ray model with Earth curvature and standard refraction
-                // --------------------------------------------------------------------
-
-                // Compute central angle between antennas (surface arc)
-                double theta = dist / R_eff; // radians
-
-                // Direct (chord) path length between antenna tops
-                double Ld = Math.Sqrt(
-                    (R_eff + txTop) * (R_eff + txTop) +
-                    (R_eff + rxTop) * (R_eff + rxTop) -
-                    2.0 * (R_eff + txTop) * (R_eff + rxTop) * Math.Cos(theta)
-                );
-
-                // Approximate specular reflection at midpoint on curved Earth
-                double phi = theta / 2.0;
-
-                double L1 = Math.Sqrt(
-                    (R_eff + txTop) * (R_eff + txTop) + R_eff * R_eff -
-                    2.0 * (R_eff + txTop) * R_eff * Math.Cos(phi)
-                );
-
-                double L2 = Math.Sqrt(
-                    (R_eff + rxTop) * (R_eff + rxTop) + R_eff * R_eff -
-                    2.0 * (R_eff + rxTop) * R_eff * Math.Cos(theta - phi)
-                );
-
-                double Lr = L1 + L2; // reflected total path
-                double delta = Lr - Ld; // path length difference
-                double phiRad = 2.0 * Math.PI * delta / lambda; // phase shift
-
-                // incidence cosine at TX (approx)
-                double cosInc = Math.Abs((R_eff + txTop - R_eff * Math.Cos(phi)) / Math.Max(1e-6, L1));
-
-                // simple sea sigma (we don't have wind/roughness data)
-                double sigmaSea = sigmaSeaDefault;
-
-                // Debye roughness factor (amplitude reduction factor sqrt of power factor)
-                double debPow = Math.Exp(-Math.Pow((4.0 * Math.PI * sigmaSea * cosInc / lambda), 2.0));
-                debPow = Math.Max(1e-8, debPow); // power factor (0..1)
-                double debAmp = Math.Sqrt(debPow); // amplitude factor
-
-                // altitude & distance softening (amplitude multipliers)
-                double altSoft = Math.Exp(-(txH + rxH) / Hscale); // reduces coherence with increasing heights
-                double distSoft = Math.Exp(-dist / Dscale); // reduces coherence for very long hops
-
-                // ocean fraction scaling (mixed land/sea reduces coherent reflection)
-                double oceanScale = Math.Clamp(oceanFrac, 0.0, 1.0);
-
-                // effective reflection amplitude (signed: negative for phase inversion at grazing)
-                double ReffMag = seaR0 * debAmp * altSoft * distSoft * oceanScale;
-                double R = -ReffMag; // negative for typical phase inversion at grazing (tunable)
-
-                double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
-
-                twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
-                twoRayDb = Math.Clamp(twoRayDb, -20.0, 6.0);
-
-                // Adjust total path loss
-                pathLossDb -= twoRayDb;
-            }
-
-            // --- Simplified noise floor estimation ---
-            // Thermal noise floor = -174 dBm/Hz + 10*log10(B)
-            double bandwidthHz = 3000.0; // typical AM voice channel
-            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz); // ≈ -139.2 dBm
-            double receiverNoiseFigure = 7.0; // dB
-            double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm typical
-
-            // --- Received power and SNR (needed for LOS checks) ---
-            double prDbm = txPowerDbm - pathLossDb;
-            double snrDb = Math.Clamp(prDbm - noiseFloorDbm, -20.0, 40.0);
-            double gainDb;
-            
-            bool isVHF = ap.RadioFrequencyMHz < VhfUhfBoundaryMHz; // VHF: 30-174 MHz, UHF: 225-512 MHz
-
-            // === STRICT LOS ENFORCEMENT (frequency-dependent) ===
-            // Calculate first Fresnel zone radius at worst obstruction point
-            double F1_radius = Math.Sqrt(lambda * dist / 4.0); // approximate for midpoint
-
-            // Fresnel clearance percentage (0 = fully blocked, 1 = fully clear)
-            double fresnelClearance = 1.0;
-            if (worstExcess > 0)
-            {
-                fresnelClearance = Math.Max(0.0, 1.0 - worstExcess / (F1_radius * 1.4));
-            }
-
-            // === UHF: STRICT LOS ===
-            if (!isVHF)
-            {
-                // HARD cutoff
-                if (worstExcess > F1_radius * 0.3 || diffLoss > 6.0)
-                {
-                    ap.Gain = 0.0f;
-                    ap.LowpassHz = UhfBandwidthHz;
-                    ap.NoiseLevel = 0.95f; // Full noise floor
-                    ap.DropoutProb = 0.0f; // No signal to drop out
-                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
-                    return ap;
-                }
-                
-                // Very tight tolerance for partial obstruction
-                // Even 20% Fresnel zone blockage severely degrades UHF
-                if (worstExcess > F1_radius * 0.1 || diffLoss > 3.0)
-                {
-                    // Heavy penalty but not complete loss
-                    double terrainPenaltyDb = 25.0 + diffLoss * 2.0;
-                    gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
-                    gainDb -= terrainPenaltyDb;
-                    
-                    ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
-                    ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.08f); // Severely limited
-                    ap.LowpassHz = UhfBandwidthHz;
-                    ap.NoiseLevel = 0.85f; // Very noisy
-                    ap.DropoutProb = 1.2f; // Heavy fading
-                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
-                    return ap;
-                }
-            }
-            // === VHF: MORE FORGIVING ===
-            else
-            {
-                // Complete blockage threshold (60%+ Fresnel zone blocked)
-                if (worstExcess > F1_radius * 0.6 || diffLoss > 20.0)
-                {
-                    ap.Gain = 0.0f;
-                    ap.LowpassHz = VhfBandwidthHz;
-                    ap.NoiseLevel = 0.95f;
-                    ap.DropoutProb = 0.0f;
-                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
-                    return ap;
-                }
-                
-                // Partial obstruction - smooth degradation
-                if (worstExcess > F1_radius * 0.2 || diffLoss > 8.0)
-                {
-                    // Apply smooth degradation based on Fresnel clearance
-                    double degradationFactor = Math.Pow(fresnelClearance, 2.0);
-                    
-                    // Moderate penalty
-                    double terrainPenaltyDb = 12.0 + diffLoss * 1.0;
-                    gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
-                    gainDb -= terrainPenaltyDb;
-                    
-                    ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
-                    ap.Gain = (float)(ap.Gain * degradationFactor);
-                    ap.Gain = Math.Clamp(ap.Gain, 0.0f, 0.35f);
-                    
-                    ap.LowpassHz = VhfBandwidthHz;
-                    ap.NoiseLevel = (float)(0.55 + (1.0 - degradationFactor) * 0.30);
-                    ap.DropoutProb = (float)(0.4 + (1.0 - degradationFactor) * 0.5);
-                    FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
-                    return ap;
-                }
-            }
-
-            // === CLEAN LOS PATH - Normal operation ===
-            gainDb = Math.Clamp(prDbm - receiverSensitivityDbm, -60.0, 0.0);
-            ap.Gain = (float)Math.Pow(10.0, gainDb / 20.0);
-
-            // === ANALOG MODULATION CHARACTERISTICS ===
-            
             if (isVHF)
             {
-                // === VHF AM (30-174 MHz): Amplitude Modulation ===
-                ap.LowpassHz = VhfBandwidthHz; // AM voice bandwidth (~300-3000 Hz)
-                
-                // Analog static increases smoothly with decreasing SNR
+                // VHF AM: Analog static increases smoothly with decreasing SNR
                 if (snrDb > 20.0)
-                {
                     ap.NoiseLevel = 0.02f; // Clean signal
-                }
                 else if (snrDb > 10.0)
-                {
-                    // Light static: 0.02 → 0.20
-                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18);
-                }
+                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02 → 0.20
                 else if (snrDb > 0.0)
-                {
-                    // Heavy static: 0.20 → 0.55
-                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35);
-                }
+                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20 → 0.55
                 else
-                {
-                    // Barely intelligible: 0.55 → 0.85
-                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30));
-                }
+                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55 → 0.85
             }
             else
             {
-                // === UHF FM (225-512 MHz): Frequency Modulation ===
-                ap.LowpassHz = UhfBandwidthHz; // FM voice bandwidth (~300-3400 Hz)
-                
-                // FM "quieting" - noise suppression improves with stronger signal
-                // FM threshold effect: below ~10 dB SNR, noise increases rapidly
+                // UHF FM: FM threshold effect - noise suppression until below threshold
                 if (snrDb > 15.0)
-                {
                     ap.NoiseLevel = 0.01f; // Excellent FM quieting
-                }
                 else if (snrDb > 10.0)
-                {
-                    // Good quieting: 0.01 → 0.10
-                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09);
-                }
+                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01 → 0.10
                 else if (snrDb > 5.0)
-                {
-                    // FM threshold region: 0.10 → 0.40
-                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30);
-                }
+                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10 → 0.40 (FM threshold)
                 else if (snrDb > 0.0)
-                {
-                    // Below FM threshold: 0.40 → 0.75
-                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35);
-                }
+                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40 → 0.75
                 else
-                {
-                    // Very weak signal: 0.75 → 0.95
-                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20));
-                }
+                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
             }
 
-            // === MULTIPATH FADING AND DROPOUTS ===
+            // Multipath fading and dropouts (events per second)
             double dropout;
             if (snrDb > 15.0)
-            {
-                dropout = 0.0; // Clean signal, no fading
-            }
+                dropout = 0.0; // Clean signal
             else if (snrDb > 5.0)
-            {
-                // Light fading at marginal SNR
-                dropout = (15.0 - snrDb) / 10.0 * 0.3; // 0→0.3 events/sec
-            }
+                dropout = (15.0 - snrDb) / 10.0 * 0.3; // 0 → 0.3 events/sec
             else if (snrDb > 0.0)
-            {
-                // Moderate fading
-                dropout = 0.3 + (5.0 - snrDb) / 5.0 * 0.4; // 0.3→0.7 events/sec
-            }
+                dropout = 0.3 + (5.0 - snrDb) / 5.0 * 0.4; // 0.3 → 0.7 events/sec
             else
-            {
-                // Heavy fading
-                dropout = 0.7 + Math.Min(-snrDb / 10.0, 0.5); // 0.7→1.2 events/sec
-            }
+                dropout = 0.7 + Math.Min(-snrDb / 10.0, 0.5); // 0.7 → 1.2 events/sec
 
             // VHF is less affected by multipath (longer wavelength)
             if (isVHF)
                 dropout *= 0.7;
 
             ap.DropoutProb = (float)Math.Clamp(dropout, 0.0, 1.5);
+        }
+
+        /// <summary>
+        /// Apply physics-informed smooth degradation based on terrain obstruction.
+        /// Uses knife-edge diffraction theory with wavelength-dependent corrections.
+        /// No discrete branches - single continuous function for realistic "degradation window".
+        /// </summary>
+        private void ApplyTerrainDegradation(AudioParams ap, double fresnelClearance, double diffLoss,
+            double baseGainDb, bool isVHF, double rxSensitivity, double worstExcess, double F1_radius)
+        {
+            Console.WriteLine($"[DEBUG] ApplyTerrainDegradation:");
+            Console.WriteLine($"  fresnelClearance: {fresnelClearance:F3}");
+            Console.WriteLine($"  diffLoss: {diffLoss:F1} dB");
+            Console.WriteLine($"  baseGainDb: {baseGainDb:F1} dB");
+
+            double effectiveSignalDbm;
+            double snrDb;
+
+            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
+            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
+            double receiverNoiseFigure = 7.0;
+            double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
+
+            double rfGainLinear;
+
+            // === CHECK FOR CLEAR LOS FIRST ===
+            if (fresnelClearance >= 0.6 && diffLoss < 3.0)
+            {
+                Console.WriteLine($"  → Taking CLEAR LOS path");
+                // Clear LOS - no terrain degradation needed
+                rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
+                ap.Gain = ApplyAGC((float)rfGainLinear);
+
+                // Calculate SNR for clean signal
+                effectiveSignalDbm = rxSensitivity + baseGainDb;
+                noiseFloorDbm = thermalNoise + receiverNoiseFigure;
+                snrDb = effectiveSignalDbm - noiseFloorDbm;
+
+                CalculateNoiseAndDropout(ap, snrDb, isVHF);
+                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                return;
+            }
+
+            Console.WriteLine($"  → Taking OBSTRUCTED path");
+
+            // === PHYSICS-INFORMED SMOOTH DEGRADATION ===
+            // Based on knife-edge diffraction theory, but applied continuously
+
+            // Calculate approximate Fresnel parameter from clearance
+            // CORRECTED MAPPING:
+            // clearance = 1.0 (100% clear) → v = -2.0 (well below obstacle)
+            // clearance = 0.0 (obstacle at Fresnel zone) → v = 0.0 (grazing)
+            // clearance = -1.0 (obstacle beyond Fresnel zone) → v = +2.0 (blocked)
+            double v_approx = -2.0 * fresnelClearance;
+
+            // Calculate knife-edge diffraction loss (ITU-R P.526)
+            // Only applies when v > -0.78 (obstructed or grazing)
+            double theoreticalDiffractionLoss = 0.0;
+            if (v_approx > -0.78)
+            {
+                theoreticalDiffractionLoss = KnifeEdgeLoss_dB(v_approx);
+            }
+
+            // For SEVERE obstruction (< 20% clearance), trust the actual measured diffraction loss
+            // The approximation breaks down for multiple obstacles
+            if (fresnelClearance < 0.2)
+            {
+                // Use the larger of: approximation vs actual measurement
+                theoreticalDiffractionLoss = Math.Max(theoreticalDiffractionLoss, diffLoss);
+            }
+
+            // Apply wavelength-dependent corrections
+            double wavelengthCorrection;
+            if (isVHF)
+            {
+                // VHF: Longer wavelength diffracts better than knife-edge theory predicts
+                wavelengthCorrection = -VhfDiffractionBonus_dB;
+                
+                // However, for obstructions beyond 1.5 Fresnel zones,
+                // wavelength advantage diminishes - you can't diffract around a mountain!
+                if (fresnelClearance < -0.5)
+                {
+                    // Start reducing VHF advantage at 1.5 zones blocked
+                    // Use aggressive exponential scaling - essentially eliminates VHF advantage at 2+ zones
+                    double excessBlocked = Math.Max(0.0, -fresnelClearance - 0.5); // 0 at -0.5, 1.5 at -2.0
+                    
+                    // Exponential reduction: 2^(-2x) gives very fast decay
+                    // At 1.5 zones (-0.5 clearance): factor ≈ 1.0 (no reduction)
+                    // At 2.0 zones (-1.0 clearance): factor ≈ 0.25 (75% reduction)
+                    // At 2.5 zones (-1.5 clearance): factor ≈ 0.06 (94% reduction)
+                    double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
+                    wavelengthCorrection *= reductionFactor;
+                    
+                    Console.WriteLine($"[DEBUG] VHF advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
+                }
+            }
+            else
+            {
+                // UHF: Shorter wavelength, more LOS-dependent
+                wavelengthCorrection = UhfDiffractionPenalty_dB;
+            }
+
+            // Combine theoretical loss with wavelength correction
+            double totalTerrainLoss = theoreticalDiffractionLoss + wavelengthCorrection;
+
+            // For very severe obstruction, use the actual measured diffraction loss
+            // (knife-edge theory breaks down for multiple obstacles)
+            if (fresnelClearance < 0.2)
+            {
+                totalTerrainLoss = Math.Max(totalTerrainLoss, diffLoss);
+            }
+
+            // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
+            // For mountains blocking multiple Fresnel zones, add additional loss factor.
+            if (fresnelClearance < 0.4 && diffLoss > 15.0)
+            {
+                // Calculate how many Fresnel radii the terrain penetrates into obstruction zone
+                // fresnelClearance = 1.0 - (worstExcess / F1_radius)
+                // So: totalPenetration = worstExcess / F1_radius = 1.0 - fresnelClearance (when negative)
+                double totalPenetration = Math.Max(0.0, 1.0 - fresnelClearance);
+                
+                // Knife-edge theory handles up to ~0.6 clearance (40% obstruction)
+                // Apply penalty for deeper penetration
+                double additionalZonesBlocked = Math.Max(0.0, totalPenetration - 0.6);
+                
+                if (additionalZonesBlocked > 0.1)
+                {
+                    // Multi-zone penalty with exponential scaling for severe obstructions
+                    // Base: 12 dB per zone for moderate obstruction (up to 1.5 zones)
+                    // Exponential: penalty increases dramatically beyond 1.5 zones
+                    double multiZonePenalty;
+                    
+                    if (additionalZonesBlocked < 1.0)
+                    {
+                        // Linear region: 12 dB per zone
+                        multiZonePenalty = additionalZonesBlocked * 12.0;
+                    }
+                    else
+                    {
+                        // Exponential region for severe obstruction (>2 total zones blocked)
+                        // First zone: 12 dB
+                        // Additional zones: 18 dB × (2.5^n) where n is zones beyond first
+                        // This creates very aggressive scaling for massive obstructions
+                        multiZonePenalty = 12.0; // First zone
+                        double excessZones = additionalZonesBlocked - 1.0;
+                        multiZonePenalty += 18.0 * (Math.Pow(2.5, excessZones) - 1.0);
+                    }
+
+                    // VHF gets less relief for massive obstructions
+                    if (isVHF)
+                        multiZonePenalty *= 0.95;
+                    else
+                        multiZonePenalty *= 1.3; // UHF suffers more from multi-zone blockage
+
+                    totalTerrainLoss += multiZonePenalty;
+
+                    Console.WriteLine(
+                        $"[DEBUG] Multi-zone blockage: {totalPenetration:F2} Fresnel radii, {additionalZonesBlocked:F2} zones → +{multiZonePenalty:F1} dB penalty");
+                }
+            }
+
+            // Apply terrain loss to base gain
+            double finalGainDb = baseGainDb - totalTerrainLoss;
+
+            // UHF hard cutoff: severe obstructions should completely block UHF
+            // When 3+ Fresnel zones are blocked, signal is essentially gone
+            if (!isVHF && fresnelClearance < -2.0) // More than 3 zones blocked
+            {
+                finalGainDb = Math.Min(finalGainDb, MinimumGainDb + 10.0); // Cap at -50 dB
+            }
+
+            // Clamp to physical limits
+            finalGainDb = Math.Clamp(finalGainDb, MinimumGainDb, 20.0);
+
+            // Convert to linear gain
+            rfGainLinear = Math.Pow(10.0, finalGainDb / 20.0);
+            // Apply AGC to get audio gain (0.0-1.0)
+            ap.Gain = ApplyAGC((float)rfGainLinear);
+            Console.WriteLine($"[DEBUG] AGC: rfGain={rfGainLinear:F2} → audioGain={ApplyAGC((float)rfGainLinear):F3}");
+
+            // Calculate SNR from final gain
+            effectiveSignalDbm = rxSensitivity + finalGainDb;
+            snrDb = effectiveSignalDbm - noiseFloorDbm;
+
+            // Calculate noise and dropout from SNR (physics-based)
+            CalculateNoiseAndDropout(ap, snrDb, isVHF);
+
+            // Set bandwidth
+            ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+        }
+
+        public AudioParams CalculateAudioParams(
+            double txX, double txY, double txAlt,
+            double rxX, double rxY, double rxAlt,
+            double txPowerDbm, double frequencyMHz,
+            double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
+            bool includeTerrainProfile = false,
+            bool altitudeIsMSL = false)
+        {
+            // Convert AGL to MSL
+            if (!altitudeIsMSL)
+            {
+                txAlt += SampleElevation(txX, txY);
+                rxAlt += SampleElevation(rxX, rxY);
+            }
+
+            var ap = new AudioParams { RadioFrequencyMHz = (float)frequencyMHz };
+            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
+
+            // Use provided sensitivity or default values
+            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
+
+            // Distance between transmitter and receiver
+            double dx = rxX - txX;
+            double dy = rxY - txY;
+            double dz = rxAlt - txAlt;
+            double dist2D = Math.Sqrt(dx * dx + dy * dy);
+            double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (dist < 1.0)
+            {
+                ap.Gain = 1.0f;
+                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                ap.NoiseLevel = 0.01f;
+                ap.DropoutProb = 0.0f;
+                FinalizeAudioParams(ap, dist, 40.0, 0.0, new List<(double, double)>(), includeTerrainProfile);
+                return ap;
+            }
+
+            // Free-space path loss
+            double freqHz = frequencyMHz * 1e6;
+            double fspl = FSPL_dB(dist, freqHz);
+
+            // Weather attenuation (light rain/fog)
+            double weatherLoss = weatherDbPerKm * (dist / 1000.0);
+
+            // Atmospheric refraction (effective Earth radius)
+            double kAvg = CalculateKAvg(txAlt, rxAlt);
+            double effectiveEarthRadius = kAvg * EarthRadius;
+
+            // Received power before terrain effects
+            double prDbm = txPowerDbm - fspl - weatherLoss;
+
+            // Base gain without terrain effects
+            double baseGainDb = Math.Clamp(prDbm - rxSensitivity, MinimumGainDb, 50.0);
+
+            // Sample terrain profile
+            var profile = SampleProfileAdaptive(txX, txY, rxX, rxY, maxSamplesPerPath);
+            double snrDb = 0;
+            if (profile.Count < 2)
+            {
+                ap.Gain = (float)Math.Pow(10.0, baseGainDb / 20.0);
+                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                snrDb = prDbm - (rxSensitivity - baseGainDb);
+                CalculateNoiseAndDropout(ap, snrDb, isVHF);
+                FinalizeAudioParams(ap, dist, snrDb, fspl + weatherLoss, profile, includeTerrainProfile);
+                return ap;
+            }
+
+            // Calculate wavelength and First Fresnel zone radius
+            double lambda = SpeedOfLight / freqHz;
+            double F1_radius = 0.0;
+            double worstExcess = double.MinValue;
+            double diffLoss = 0.0;
+
+            // Find worst obstruction along path
+            for (int i = 1; i < profile.Count - 1; i++)
+            {
+                var (d, h) = profile[i];
+                double d1 = d;
+                double d2 = dist2D - d;
+                if (d2 < 1.0) continue;
+
+                // Fresnel zone radius at this point
+                double F1 = Math.Sqrt((lambda * d1 * d2) / (d1 + d2));
+                if (F1 > F1_radius) F1_radius = F1;
+
+                // LOS height at this distance (accounting for Earth curvature)
+                double curvature = (d1 * d2) / (2.0 * effectiveEarthRadius);
+                double losHeight = txAlt + (rxAlt - txAlt) * (d1 / dist2D) - curvature;
+
+                // Clearance excess: negative = clear, positive = obstructed
+                double excess = h - (losHeight + F1);
+                if (excess > worstExcess)
+                {
+                    worstExcess = excess;
+
+                    // Calculate diffraction parameter
+                    double h_diff = h - losHeight;
+                    double v = h_diff * Math.Sqrt(2.0 * (d1 + d2) / (lambda * d1 * d2));
+                    diffLoss = KnifeEdgeLoss_dB(v);
+                }
+            }
+
+            // Calculate Fresnel clearance (1.0 = perfect, 0.0 = grazing, negative = blocked)
+            double fresnelClearance = F1_radius > 0 ? (1.0 - worstExcess / F1_radius) : 1.0;
+
+            Console.WriteLine($"[DEBUG] Terrain Analysis:");
+            Console.WriteLine($"  worstExcess: {worstExcess:F1}m");
+            Console.WriteLine($"  F1_radius: {F1_radius:F1}m");
+            Console.WriteLine($"  fresnelClearance: {fresnelClearance:F3}");
+            Console.WriteLine($"  diffLoss: {diffLoss:F1} dB");
+            Console.WriteLine($"  Profile points: {profile.Count}");
+
+            // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
+            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, isVHF, rxSensitivity, worstExcess, F1_radius);
+
+            // Calculate final path loss and SNR for output
+            double pathLossDb = fspl + weatherLoss + (baseGainDb - 20.0 * Math.Log10(Math.Max(ap.Gain, 1e-6)));
+            snrDb = prDbm - pathLossDb;
 
             // Finalize and return
             FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
@@ -580,7 +653,7 @@ namespace BMSAudioSim
 
             if (senderAltitude < 0) senderAltitude = 0;
             if (receiverAltitude < 0) receiverAltitude = 0;
-            
+
             double altitudeDiff = senderAltitude - receiverAltitude;
             if (altitudeDiff == 0) return 1.0;
 
@@ -589,7 +662,7 @@ namespace BMSAudioSim
             const double h_b = 12192; // Breakpoint altitude in meters (~40k ft)
             const double N_b = 66.65; // Breakpoint refractivity
             const double LogNsOverNb = 1.5829767628777844; // Precomputed Math.Log(N_s / N_b)
-            
+
             double H_b = (h_b - receiverAltitude) / LogNsOverNb;
             double altDiffOverHb = altitudeDiff / H_b;
 
@@ -600,6 +673,30 @@ namespace BMSAudioSim
             double kAvg = 1.0 / (1.0 - term1 * (altDiffOverHb / term3));
 
             return kAvg;
+        }
+
+        /// <summary>
+        /// Apply AGC (Automatic Gain Control) curve to map RF gain to audio gain.
+        /// </summary>
+        private static float ApplyAGC(float rfGain)
+        {
+            // Use logarithmic compression (similar to real AGC circuits)
+            // Formula: audioGain = tanh(log10(rfGain + 1) * k) where k controls compression
+
+            if (rfGain <= 0.0f)
+                return 0.0f;
+
+            // Logarithmic scaling factor (tune this to taste)
+            const double agcCompressionFactor = 1.2;
+
+            // Log compression: compress the dynamic range
+            double logGain = Math.Log10(rfGain + 1.0) * agcCompressionFactor;
+
+            // Soft saturation using tanh (prevents hard clipping)
+            double audioGain = Math.Tanh(logGain);
+
+            // Scale to comfortable range (max 1.0)
+            return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
     }
 }
