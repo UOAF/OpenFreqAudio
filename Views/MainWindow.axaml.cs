@@ -21,6 +21,7 @@ using ReactiveUI.Avalonia;
 using ScottPlot;
 using SkiaSharp;
 using Color = ScottPlot.Color;
+using Colors = ScottPlot.Colors;
 using Path = System.IO.Path;
 
 namespace BMSAudioSim.Views;
@@ -424,7 +425,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-
+        
+        _fastPathAudioSim.ReturnAudioParams(_signal1Params);
+        
         var audioParams = _fastPathAudioSim.CalculateAudioParams(
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_senderPos.Value.y),
@@ -436,7 +439,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         if (audioParams == null) throw new Exception("audioParams is null");
         if (audioParams.TerrainProfile == null) throw new Exception("terrainProfile is null");
 
-        UpdateProfileGraph(audioParams.TerrainProfile);
+        UpdateProfileGraph(audioParams);
 
         GainText.Text = audioParams.Gain.ToString();
         LowPassHzText.Text = audioParams.LowpassHz.ToString();
@@ -487,86 +490,160 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
     }
 
-    private void UpdateProfileGraph(List<(double dist, double elev)> profile)
+   private void UpdateProfileGraph(AudioParams audioParams)
+{
+    HeightProfilePlot.Plot.Clear();
+    if (audioParams.TerrainProfile?.Count == 0)
+        return;
+
+    double[] xValues = new double[audioParams.TerrainProfile.Count];
+    double[] yValues = new double[audioParams.TerrainProfile.Count];
+
+    for (int i = 0; i < audioParams.TerrainProfile.Count; i++)
     {
-        HeightProfilePlot.Plot.Clear();
-        if (profile.Count == 0)
-            return;
-
-        double[] xValues = new double[profile.Count];
-        double[] yValues = new double[profile.Count];
-
-        for (int i = 0; i < profile.Count; i++)
-        {
-            xValues[i] = profile[i].dist;
-            yValues[i] = profile[i].elev;
-        }
-
-        var scatter = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
-        scatter.Color = Color.FromHex("#2E86AB").WithAlpha(0.2);
-        scatter.LineWidth = 0;
-        scatter.FillY = true;
-        scatter.FillYValue = yValues.Min();
-
-        PixelPadding padding = new(80, 30, 30, 50);
-        HeightProfilePlot.Plot.Layout.Fixed(padding);
-
-        var line = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
-        line.Color = Color.FromHex("#2E86AB");
-        line.LineWidth = 2.5f;
-        line.Smooth = true;
-
-        Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-
-        var txAbsoluteHeight = ViewModel.TXAltitude + profile.First().elev;
-        var rxAbsoluteHeight = ViewModel.RXAltitude + profile.Last().elev;
-
-        var senderMarker = HeightProfilePlot.Plot.Add.Marker(xValues[0], txAbsoluteHeight);
-        senderMarker.Color = Color.FromHex("#06D6A0");
-        senderMarker.Size = 12;
-        senderMarker.Shape = MarkerShape.FilledCircle;
-
-        var receiverMarker = HeightProfilePlot.Plot.Add.Marker(xValues[profile.Count - 1], rxAbsoluteHeight);
-        receiverMarker.Color = Color.FromHex("#EF476F");
-        receiverMarker.Size = 12;
-        receiverMarker.Shape = MarkerShape.FilledCircle;
-
-        var lineTXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(txAbsoluteHeight);
-        lineTXAlt.Text = $"{txAbsoluteHeight:0} m";
-        lineTXAlt.LabelAlignment = Alignment.LowerLeft;
-        lineTXAlt.Color = Color.FromHex("#06D6A0");
-
-        var lineRXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(rxAbsoluteHeight);
-        lineRXAlt.Text = $"{rxAbsoluteHeight:0} m";
-        lineRXAlt.LabelAlignment = Alignment.LowerRight;
-        lineRXAlt.LabelOppositeAxis = true;
-        lineRXAlt.Color = Color.FromHex("#EF476F");
-
-        HeightProfilePlot.Plot.Title("Height Profile: Sender to Receiver");
-        HeightProfilePlot.Plot.XLabel("Distance (m)");
-        HeightProfilePlot.Plot.YLabel("Elevation (m)");
-
-        HeightProfilePlot.Plot.Axes.Title.Label.FontSize = 14;
-        HeightProfilePlot.Plot.Axes.Title.Label.Bold = true;
-
-        HeightProfilePlot.Plot.Grid.MajorLineColor = Color.FromHex("#E0E0E0");
-        HeightProfilePlot.Plot.Grid.MinorLineColor = Color.FromHex("#F0F0F0");
-
-        HeightProfilePlot.Plot.Axes.AutoScale();
-        HeightProfilePlot.Plot.Axes.Margins(0.05, 0.15);
-
-        HeightProfilePlot.Refresh();
-
-        double totalDistance = xValues[xValues.Length - 1] - xValues[0];
-        float minHeight = (float)yValues.Min();
-        float maxHeight = (float)yValues.Max();
-        float avgHeight = (float)yValues.Average();
-        float elevationGain = (float)(yValues[yValues.Length - 1] - yValues[0]);
-
-        ProfileInfoText.Text = $"Samples: {profile.Count} | Distance: {totalDistance / 1000:F1} km | " +
-                               $"Min: {minHeight:F1} m | Max: {maxHeight:F1} m | " +
-                               $"Avg: {avgHeight:F1} m | Gain: {elevationGain:+0.0;-0.0} m";
+        xValues[i] = audioParams.TerrainProfile[i].dist;
+        yValues[i] = audioParams.TerrainProfile[i].elev;
     }
+
+    var scatter = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
+    scatter.Color = Color.FromHex("#2E86AB").WithAlpha(0.2);
+    scatter.LineWidth = 0;
+    scatter.FillY = true;
+    scatter.FillYValue = yValues.Min();
+
+    PixelPadding padding = new(80, 30, 30, 50);
+    HeightProfilePlot.Plot.Layout.Fixed(padding);
+
+    var line = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
+    line.Color = Color.FromHex("#2E86AB");
+    line.LineWidth = 2.5f;
+    line.Smooth = true;
+
+    Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
+
+    var txAbsoluteHeight = ViewModel.TXAltitude + audioParams.TerrainProfile.First().elev;
+    var rxAbsoluteHeight = ViewModel.RXAltitude + audioParams.TerrainProfile.Last().elev;
+
+    var senderMarker = HeightProfilePlot.Plot.Add.Marker(xValues[0], txAbsoluteHeight);
+    senderMarker.Color = Color.FromHex("#06D6A0");
+    senderMarker.Size = 12;
+    senderMarker.Shape = MarkerShape.FilledCircle;
+
+    var receiverMarker = HeightProfilePlot.Plot.Add.Marker(xValues[audioParams.TerrainProfile.Count - 1], rxAbsoluteHeight);
+    receiverMarker.Color = Color.FromHex("#EF476F");
+    receiverMarker.Size = 12;
+    receiverMarker.Shape = MarkerShape.FilledCircle;
+
+    // ==================== CURVED LOS PATH WITH EARTH CURVATURE ====================
+    double totalDistance = xValues[xValues.Length - 1] - xValues[0];
+    
+    const double earthRadius = 6378000.0; // meters
+    double kAvg = FastPathAudioSim.CalculateKAvg(txAbsoluteHeight, rxAbsoluteHeight); // standard atmospheric refraction
+    double effectiveEarthRadius = kAvg * earthRadius;
+    
+    // Calculate LOS curve
+    int losPoints = 200;
+    double[] losDist = new double[losPoints];
+    double[] losHeight = new double[losPoints];
+    double[] fresnelUpper = new double[losPoints];
+    double[] fresnelLower = new double[losPoints];
+    
+    // Wavelength for Fresnel zone
+    double lambda = 299792458.0 / (audioParams.RadioFrequencyMHz * 1e6);
+    
+    for (int i = 0; i < losPoints; i++)
+    {
+        double t = i / (double)(losPoints - 1);
+        double d = totalDistance * t;
+        losDist[i] = d;
+        
+        // Distance from TX and RX
+        double d1 = d;
+        double d2 = totalDistance - d;
+        
+        // Earth curvature at this point
+        double curvature = (d1 * d2) / (2.0 * effectiveEarthRadius);
+        
+        // LOS height (linear interpolation minus curvature)
+        double straightLOS = txAbsoluteHeight + (rxAbsoluteHeight - txAbsoluteHeight) * t;
+        losHeight[i] = straightLOS - curvature;
+        
+        // First Fresnel zone radius at this point
+        double F1 = 0;
+        if (d1 > 0 && d2 > 0)
+        {
+            F1 = Math.Sqrt((lambda * d1 * d2) / (d1 + d2));
+        }
+        
+        fresnelUpper[i] = losHeight[i] + F1;
+        fresnelLower[i] = losHeight[i] - F1;
+    }
+    
+    // Plot curved LOS line
+    var losLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, losHeight);
+    losLine.Color = Colors.Red.WithAlpha(0.8);
+    losLine.LineWidth = 2.0f;
+    losLine.LinePattern = LinePattern.Dashed;
+    losLine.LegendText = "Radio LOS (curved)";
+    
+    // Plot Fresnel zone boundaries
+    var fresnelUpperLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelUpper);
+    fresnelUpperLine.Color = Colors.Orange.WithAlpha(0.4);
+    fresnelUpperLine.LineWidth = 1.0f;
+    fresnelUpperLine.LinePattern = LinePattern.Dotted;
+    fresnelUpperLine.LegendText = "1st Fresnel Zone";
+    
+    var fresnelLowerLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelLower);
+    fresnelLowerLine.Color = Colors.Orange.WithAlpha(0.4);
+    fresnelLowerLine.LineWidth = 1.0f;
+    fresnelLowerLine.LinePattern = LinePattern.Dotted;
+    
+    // Optional: Fill between Fresnel zone boundaries
+    var fresnelFill = HeightProfilePlot.Plot.Add.FillY(losDist, fresnelLower, fresnelUpper);
+    fresnelFill.FillColor = Colors.Orange.WithAlpha(0.1);
+    fresnelFill.LineWidth = 0;
+    
+    // ==================== ORIGINAL MARKERS (keep for reference) ====================
+    var lineTXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(txAbsoluteHeight);
+    lineTXAlt.Text = $"{txAbsoluteHeight:0} m";
+    lineTXAlt.LabelAlignment = Alignment.LowerLeft;
+    lineTXAlt.Color = Color.FromHex("#06D6A0").WithAlpha(0.3); // Make more transparent
+    lineTXAlt.LinePattern = LinePattern.Dotted;
+
+    var lineRXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(rxAbsoluteHeight);
+    lineRXAlt.Text = $"{rxAbsoluteHeight:0} m";
+    lineRXAlt.LabelAlignment = Alignment.LowerRight;
+    lineRXAlt.LabelOppositeAxis = true;
+    lineRXAlt.Color = Color.FromHex("#EF476F").WithAlpha(0.3); // Make more transparent
+    lineRXAlt.LinePattern = LinePattern.Dotted;
+
+    HeightProfilePlot.Plot.Title("Height Profile: Sender to Receiver");
+    HeightProfilePlot.Plot.XLabel("Distance (m)");
+    HeightProfilePlot.Plot.YLabel("Elevation (m)");
+
+    HeightProfilePlot.Plot.Axes.Title.Label.FontSize = 14;
+    HeightProfilePlot.Plot.Axes.Title.Label.Bold = true;
+
+    HeightProfilePlot.Plot.Grid.MajorLineColor = Color.FromHex("#E0E0E0");
+    HeightProfilePlot.Plot.Grid.MinorLineColor = Color.FromHex("#F0F0F0");
+    
+    // Show legend
+    HeightProfilePlot.Plot.ShowLegend(Alignment.UpperRight);
+
+    HeightProfilePlot.Plot.Axes.AutoScale();
+    HeightProfilePlot.Plot.Axes.Margins(0.05, 0.15);
+
+    HeightProfilePlot.Refresh();
+
+    float minHeight = (float)yValues.Min();
+    float maxHeight = (float)yValues.Max();
+    float avgHeight = (float)yValues.Average();
+    float elevationGain = (float)(yValues[yValues.Length - 1] - yValues[0]);
+
+    ProfileInfoText.Text = $"Samples: {audioParams.TerrainProfile.Count} | Distance: {totalDistance / 1000:F1} km | " +
+                           $"Min: {minHeight:F1} m | Max: {maxHeight:F1} m | " +
+                           $"Avg: {avgHeight:F1} m | Gain: {elevationGain:+0.0;-0.0} m";
+}
 
     private void OnAltSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {

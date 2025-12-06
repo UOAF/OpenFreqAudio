@@ -18,6 +18,7 @@ public partial class App : Application
         
         Log.Logger = new LoggerConfiguration()
             .WriteTo.Console()
+            .MinimumLevel.Debug()
             .CreateLogger();
     }
 
