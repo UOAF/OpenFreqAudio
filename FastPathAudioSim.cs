@@ -8,12 +8,63 @@
 // - Wavelength-dependent corrections for VHF (better diffraction) vs UHF (more LOS-dependent)
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using Microsoft.Extensions.Logging;
 
 namespace BMSAudioSim
 {
+    // ================================================================
+    // Object pool for AudioParams to reduce allocations
+    // ================================================================
+    public class AudioParamsPool
+    {
+        private readonly ConcurrentBag<AudioParams> _pool = new();
+        private int _count = 0;
+        private readonly int _maxPoolSize;
+
+        public AudioParamsPool(int maxPoolSize = 100)
+        {
+            _maxPoolSize = maxPoolSize;
+        }
+
+        public AudioParams Rent()
+        {
+            if (_pool.TryTake(out var obj))
+            {
+                return obj;
+            }
+            return new AudioParams();
+        }
+
+        public void Return(AudioParams obj)
+        {
+            if (obj == null) return;
+
+            // Reset the object
+            obj.Gain = 0;
+            obj.LowpassHz = 0;
+            obj.NoiseLevel = 0;
+            obj.DropoutRate = 0;
+            obj.DeepFadeRate = 0;
+            obj.RadioFrequencyMHz = 0;
+            obj.Distance_km = 0;
+            obj.SNR_dB = 0;
+            obj.PathLoss_dB = 0;
+            obj.TerrainProfile = null;
+
+            // Only return to pool if we haven't exceeded max size
+            if (_count < _maxPoolSize)
+            {
+                _pool.Add(obj);
+                System.Threading.Interlocked.Increment(ref _count);
+            }
+        }
+    }
+
+    // ================================================================
     public class AudioParams
     {
         public float Gain; // linear gain
@@ -105,20 +156,34 @@ namespace BMSAudioSim
 
         private readonly DEMReader dem;
         private readonly double originX, originY, cellSizeMeters;
-        private readonly int maxSamplesPerPath = 4096;
+        private readonly int maxSamplesPerPath = 512;
         private readonly double weatherDbPerKm = 0.02;
+        private readonly ILogger<FastPathAudioSim> _logger;
+        private readonly AudioParamsPool paramsPool;
 
-        public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters)
+        public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters, 
+            ILogger<FastPathAudioSim> logger, AudioParamsPool paramsPool = null)
         {
             this.dem = dem;
             this.originX = originX;
             this.originY = originY;
             this.cellSizeMeters = cellSizeMeters;
+            this.paramsPool = paramsPool ?? new AudioParamsPool();
+            this._logger = logger;
         }
 
         public double PixelsToMeters(double pixelDistance)
         {
             return pixelDistance * cellSizeMeters;
+        }
+
+        /// <summary>
+        /// Return an AudioParams object to the pool for reuse.
+        /// Call this when you're done using an AudioParams object to reduce allocations.
+        /// </summary>
+        public void ReturnAudioParams(AudioParams ap)
+        {
+            paramsPool.Return(ap);
         }
 
         // Bilinear elevation sampling
@@ -239,7 +304,8 @@ namespace BMSAudioSim
         private List<(double dist, double elev)> SampleProfileAdaptive(
             double txX, double txY, double rxX, double rxY, int desiredSamples)
         {
-            var result = new List<(double, double)>();
+            // Pre-allocate with maximum expected capacity to avoid resizing
+            var result = new List<(double, double)>(desiredSamples);
             double dx = rxX - txX, dy = rxY - txY;
             double D = Math.Sqrt(dx * dx + dy * dy);
             if (D < 1.0)
@@ -365,10 +431,10 @@ namespace BMSAudioSim
         private void ApplyTerrainDegradation(AudioParams ap, double fresnelClearance, double diffLoss,
             double baseGainDb, bool isVHF, double rxSensitivity, double worstExcess, double F1_radius)
         {
-            Console.WriteLine($"[DEBUG] ApplyTerrainDegradation:");
-            Console.WriteLine($"  fresnelClearance: {fresnelClearance:F3}");
-            Console.WriteLine($"  diffLoss: {diffLoss:F1} dB");
-            Console.WriteLine($"  baseGainDb: {baseGainDb:F1} dB");
+            _logger.LogDebug($"ApplyTerrainDegradation:");
+            _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
+            _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
+            _logger.LogDebug($"  baseGainDb: {baseGainDb:F1} dB");
 
             double effectiveSignalDbm;
             double snrDb;
@@ -383,7 +449,7 @@ namespace BMSAudioSim
             // === CHECK FOR CLEAR LOS FIRST ===
             if (fresnelClearance >= 1.0 || (fresnelClearance >= 0.6 && diffLoss < 3.0))
             {
-                Console.WriteLine($"  → Taking CLEAR LOS path");
+                _logger.LogDebug($"  → Taking CLEAR LOS path");
                 // Clear LOS - no terrain degradation needed
                 rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
@@ -398,7 +464,7 @@ namespace BMSAudioSim
                 return;
             }
 
-            Console.WriteLine($"  → Taking OBSTRUCTED path");
+            _logger.LogDebug($"  → Taking OBSTRUCTED path");
 
             // === PHYSICS-INFORMED SMOOTH DEGRADATION ===
             // Based on knife-edge diffraction theory, but applied continuously
@@ -431,7 +497,7 @@ namespace BMSAudioSim
             effectiveSignalDbm = rxSensitivity + obstructedGainDb;
             snrDb = effectiveSignalDbm - noiseFloorDbm;
 
-            Console.WriteLine($"  Final: totalLoss={totalLoss:F1} dB, obstructedGainDb={obstructedGainDb:F1} dB, SNR={snrDb:F1} dB");
+            _logger.LogDebug($"  Final: totalLoss={totalLoss:F1} dB, obstructedGainDb={obstructedGainDb:F1} dB, SNR={snrDb:F1} dB");
 
             // Calculate noise and dropout based on degraded SNR
             CalculateNoiseAndDropout(ap, snrDb, isVHF);
@@ -465,7 +531,9 @@ namespace BMSAudioSim
                 rxAlt += SampleElevation(rxX, rxY);
             }
 
-            var ap = new AudioParams { RadioFrequencyMHz = (float)frequencyMHz };
+            // Rent from pool instead of allocating
+            var ap = paramsPool.Rent();
+            ap.RadioFrequencyMHz = (float)frequencyMHz;
             bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
 
             // Use provided sensitivity or default values
@@ -525,6 +593,12 @@ namespace BMSAudioSim
             double worstExcess = double.MinValue;
             double diffLoss = 0.0;
 
+            // Cache frequently used calculations outside the loop
+            double invDist2D = 1.0 / dist2D;
+            double rxMinusTx = rxAlt - txAlt;
+            double twoOverEffectiveRadius = 2.0 / effectiveEarthRadius;
+            double lambdaInv = 1.0 / lambda;
+
             // Find worst obstruction along path
             for (int i = 1; i < profile.Count - 1; i++)
             {
@@ -534,12 +608,13 @@ namespace BMSAudioSim
                 if (d2 < 1.0) continue;
 
                 // Fresnel zone radius at this point
-                double F1 = Math.Sqrt((lambda * d1 * d2) / (d1 + d2));
+                double d1d2 = d1 * d2;
+                double F1 = Math.Sqrt((lambda * d1d2) / (d1 + d2));
                 if (F1 > F1_radius) F1_radius = F1;
 
                 // LOS height at this distance (accounting for Earth curvature)
-                double curvature = (d1 * d2) / (2.0 * effectiveEarthRadius);
-                double losHeight = txAlt + (rxAlt - txAlt) * (d1 / dist2D) - curvature;
+                double curvature = d1d2 * twoOverEffectiveRadius;
+                double losHeight = txAlt + rxMinusTx * (d1 * invDist2D) - curvature;
 
                 // Clearance excess: negative = clear, positive = obstructed
                 double excess = h - (losHeight + F1);
@@ -549,7 +624,7 @@ namespace BMSAudioSim
 
                     // Calculate diffraction parameter
                     double h_diff = h - losHeight;
-                    double v = h_diff * Math.Sqrt(2.0 * (d1 + d2) / (lambda * d1 * d2));
+                    double v = h_diff * Math.Sqrt(2.0 * (d1 + d2) * lambdaInv / d1d2);
                     diffLoss = KnifeEdgeLoss_dB(v);
                 }
             }
@@ -557,12 +632,12 @@ namespace BMSAudioSim
             // Calculate Fresnel clearance (1.0 = perfect, 0.0 = grazing, negative = blocked)
             double fresnelClearance = F1_radius > 0 ? (1.0 - worstExcess / F1_radius) : 1.0;
 
-            Console.WriteLine($"[DEBUG] Terrain Analysis:");
-            Console.WriteLine($"  worstExcess: {worstExcess:F1}m");
-            Console.WriteLine($"  F1_radius: {F1_radius:F1}m");
-            Console.WriteLine($"  fresnelClearance: {fresnelClearance:F3}");
-            Console.WriteLine($"  diffLoss: {diffLoss:F1} dB");
-            Console.WriteLine($"  Profile points: {profile.Count}");
+            _logger.LogDebug($"Terrain Analysis:");
+            _logger.LogDebug($"  worstExcess: {worstExcess:F1}m");
+            _logger.LogDebug($"  F1_radius: {F1_radius:F1}m");
+            _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
+            _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
+            _logger.LogDebug($"  Profile points: {profile.Count}");
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
             ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, isVHF, rxSensitivity, worstExcess, F1_radius);

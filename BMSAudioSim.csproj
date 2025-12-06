@@ -31,6 +31,7 @@
         <PackageReference Include="Avalonia.Desktop" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.8"/>
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
         <PackageReference Include="PanAndZoom" Version="11.3.6" />
         <PackageReference Include="ReactiveUI.Avalonia" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Diagnostics" Version="11.3.8">
@@ -42,6 +43,9 @@
         <PackageReference Include="ManagedBass" Version="4.0.2" />
         <PackageReference Include="NAudio" Version="2.2.1" />
         <PackageReference Include="NAudio.Core" Version="2.2.1" />
+        <PackageReference Include="Serilog" Version="4.3.0" />
+        <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
+        <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
         <!-- Explicit SkiaSharp 3.x to fix version conflict -->
         <PackageReference Include="SkiaSharp" Version="3.119.0" />
         <PackageReference Include="ScottPlot.Avalonia" Version="5.1.57" />

@@ -2,7 +2,9 @@
 using System;
 using Avalonia.Controls;
 using Avalonia.Media;
+using Microsoft.Extensions.DependencyInjection;
 using ReactiveUI.Avalonia;
+using Serilog;
 
 namespace BMSAudioSim;
 
@@ -27,6 +29,7 @@ sealed class Program
         }
     }
 
+    
 
     private static async void ShowErrorNotification(Exception ex)
     {

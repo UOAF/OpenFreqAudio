@@ -15,6 +15,7 @@ using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using BMSAudioSim.ViewModels;
+using Microsoft.Extensions.Logging;
 using ReactiveUI;
 using ReactiveUI.Avalonia;
 using ScottPlot;
@@ -39,6 +40,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private AudioParams _signal1Params;
     private AudioParams _signal2Params;
     private RadioPlayback _radioPlayback = new();
+    private ILoggerFactory _loggerFactory;
+    private MainWindowViewModel _viewModel;
 
     private readonly string _stream1Id = "stream1";
     private readonly string _stream1File = "countdown.ogg";
@@ -50,8 +53,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private Ellipse? _senderMarker;
     private Ellipse? _receiverMarker;
 
-    public MainWindow()
+    public MainWindow(MainWindowViewModel viewModel, ILoggerFactory loggerFactory)
     {
+        _viewModel = viewModel;
+        _loggerFactory = loggerFactory;
+        DataContext = viewModel;
         this.WhenActivated(disposables =>
         {
             /* Handle view activation etc. */
@@ -117,7 +123,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             // Load the raw heightmap data
             var cellSizeM = 1024d * 1000d / HEIGHTMAP_SIZE;
             if (_demReader != null)
-                _fastPathAudioSim = new FastPathAudioSim(_demReader, originX: 0, originY: 0, cellSizeMeters: cellSizeM);
+                _fastPathAudioSim = new FastPathAudioSim(_demReader, originX: 0, originY: 0, cellSizeMeters: cellSizeM, _loggerFactory.CreateLogger<FastPathAudioSim>());
 
             StatusText.Text = "Creating preview image (this can take a minute)...";
             // Generate preview image path
