@@ -8,9 +8,6 @@ namespace BMSAudioSim;
 /// Sample-based stepped-on interference mixer.
 /// Instead of synthesizing the physics, plays a recorded stepped-on sample
 /// with variations based on radio frequency, signal strength, and interference level.
-/// 
-/// PHASE 2a OPTIMIZATIONS:
-/// - Sine lookup table for pitch/amplitude modulation (3-10x faster than Math.Sin)
 /// </summary>
 public class Radiomixer
 {
@@ -27,47 +24,6 @@ public class Radiomixer
     private double _pitchModPhase = 0;
     private double _ampModPhase = 0;
     private readonly Random _rng = new Random();
-    
-    /// <summary>
-    /// Fast sine lookup table with linear interpolation
-    /// </summary>
-    private static class SineLookup
-    {
-        private const int TableSize = 2048; // Power of 2 for fast modulo
-        private static readonly float[] _table;
-        private const float IndexScale = TableSize / (2f * MathF.PI);
-        private const int IndexMask = TableSize - 1; // For fast modulo
-        
-        static SineLookup()
-        {
-            _table = new float[TableSize];
-            for (int i = 0; i < TableSize; i++)
-            {
-                _table[i] = MathF.Sin(i * 2f * MathF.PI / TableSize);
-            }
-        }
-        
-        /// <summary>
-        /// Fast sine with linear interpolation
-        /// Accuracy: error < 0.0005 (imperceptible in audio)
-        /// Speed: 3-10x faster than Math.Sin()
-        /// </summary>
-        public static float Sin(double x)
-        {
-            // Wrap to [0, 2π] using modulo
-            float xf = (float)(x % (2.0 * Math.PI));
-            if (xf < 0) xf += 2f * MathF.PI;
-            
-            // Get table index with fractional part
-            float indexF = xf * IndexScale;
-            int index = (int)indexF;
-            float frac = indexF - index;
-            
-            // Linear interpolation between two table entries
-            int nextIndex = (index + 1) & IndexMask; // Fast modulo for power of 2
-            return _table[index] * (1f - frac) + _table[nextIndex] * frac;
-        }
-    }
     
     /// <summary>
     /// Load the stepped-on interference sample from file using BASS.
@@ -246,8 +202,6 @@ public class Radiomixer
     /// 3. Vary amplitude based on signal strength and interference level
     /// 4. Add subtle pitch/amplitude modulation for variation
     /// 5. Mix with suppressed audio from both transmitters
-    /// 
-    /// PHASE 2a: Uses sine lookup table instead of Math.Sin() (3-10x faster)
     /// </summary>
     public void ProcessSteppedOn(
         float[] buffer1,
@@ -258,6 +212,18 @@ public class Radiomixer
         float gain1 = 1.0f,
         float gain2 = 1.0f)
     {
+        // Validate buffer sizes to prevent IndexOutOfRangeException
+        // This can happen during channel tuning/untuning when buffers are being reallocated
+        int minLength = Math.Min(Math.Min(buffer1.Length, buffer2.Length), output.Length);
+        if (minLength == 0)
+        {
+            Array.Clear(output);
+            return;
+        }
+        
+        // Limit processing to the smallest buffer size
+        int processLength = minLength;
+        
         const float SQUELCH_THRESHOLD = 0.03f;
 
         // No signals → silence
@@ -271,13 +237,13 @@ public class Radiomixer
         // Only one signal → no interference
         if (gain1 < SQUELCH_THRESHOLD)
         {
-            Array.Copy(buffer2, output, buffer2.Length);
+            Array.Copy(buffer2, output, processLength);
             _isPlaying = false;
             return;
         }
         if (gain2 < SQUELCH_THRESHOLD)
         {
-            Array.Copy(buffer1, output, buffer1.Length);
+            Array.Copy(buffer1, output, processLength);
             _isPlaying = false;
             return;
         }
@@ -287,9 +253,9 @@ public class Radiomixer
         {
             // Use the stronger signal
             if (gain1 >= gain2)
-                Array.Copy(buffer1, output, output.Length);
+                Array.Copy(buffer1, output, processLength);
             else
-                Array.Copy(buffer2, output, output.Length);
+                Array.Copy(buffer2, output, processLength);
             _isPlaying = false;
             return;
         }
@@ -298,7 +264,7 @@ public class Radiomixer
         if (_steppedOnSample == null || _steppedOnSample.Length == 0)
         {
             // Fallback: simple mix if no sample loaded
-            for (int i = 0; i < output.Length; i++)
+            for (int i = 0; i < processLength; i++)
             {
                 output[i] = buffer1[i] * stepped.CaptureRatio + 
                            buffer2[i] * (1.0f - stepped.CaptureRatio);
@@ -373,7 +339,7 @@ public class Radiomixer
         // Use floating-point position for smooth playback
         float playbackPos = _playbackPosition;
         
-        for (int i = 0; i < output.Length; i++)
+        for (int i = 0; i < processLength; i++)
         {
             // === SUPPRESSED AUDIO ===
             // Mix stronger and weaker signals according to capture effect
@@ -383,11 +349,10 @@ public class Radiomixer
             
             // === STEPPED-ON SAMPLE PLAYBACK ===
             
-            // PHASE 2a: Use sine lookup instead of Math.Sin() - 3-10x faster
             // Pitch modulation (makes it warble slightly)
             _pitchModPhase += 2 * Math.PI * pitchModRate * dt;
             if (_pitchModPhase > Math.PI * 2) _pitchModPhase -= Math.PI * 2;
-            float pitchMod = SineLookup.Sin(_pitchModPhase) * pitchModDepth;
+            float pitchMod = (float)Math.Sin(_pitchModPhase) * pitchModDepth;
             
             // Instantaneous playback speed (adjusted for sample rate difference)
             float sampleRateRatio = (float)_sampleRate / sampleRate;
@@ -405,10 +370,10 @@ public class Radiomixer
             float sampleValue = _steppedOnSample[sampleIndex] * (1.0f - frac) + 
                                _steppedOnSample[nextIndex] * frac;
             
-            // PHASE 2a: Amplitude modulation with sine lookup
+            // Amplitude modulation (makes it beat/pulse)
             _ampModPhase += 2 * Math.PI * ampModRate * dt;
             if (_ampModPhase > Math.PI * 2) _ampModPhase -= Math.PI * 2;
-            float ampMod = SineLookup.Sin(_ampModPhase);
+            float ampMod = (float)Math.Sin(_ampModPhase);
             
             float amplitude = steppedOnAmplitude * (1.0f - ampModDepth + ampModDepth * (ampMod * 0.5f + 0.5f));
             
@@ -428,6 +393,12 @@ public class Radiomixer
         
         // Store position for next call
         _playbackPosition = playbackPos;
+        
+        // Clear any remaining samples in output if we didn't fill the entire buffer
+        if (processLength < output.Length)
+        {
+            Array.Clear(output, processLength, output.Length - processLength);
+        }
     }
     
     /// <summary>
