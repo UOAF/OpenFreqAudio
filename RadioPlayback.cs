@@ -809,6 +809,7 @@ public class RadioPlayback
                         _frequencyMixBuffer,
                         steppedParams,
                         _sampleRate,
+                        _squelchThreshold,
                         primaryGain,
                         secondaryGain
                     );

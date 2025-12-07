@@ -699,7 +699,10 @@ namespace BMSAudioSim
                 double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
                 ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
-                snrDb = prDbm - (rxSensitivity - baseGainDb);
+                
+                // SNR = Received Power - Noise Floor
+                snrDb = prDbm - rxSensitivity;
+                
                 CalculateNoiseAndDropout(ap, snrDb, isVHF);
                 FinalizeAudioParams(ap, dist, snrDb, fspl + weatherLoss, profile, includeTerrainProfile);
                 return ap;
@@ -763,7 +766,10 @@ namespace BMSAudioSim
 
             // Calculate final path loss and SNR for output
             double pathLossDb = fspl + weatherLoss + (baseGainDb - 20.0 * Math.Log10(Math.Max(ap.Gain, 1e-6)));
-            snrDb = prDbm - pathLossDb;
+            
+            // SNR = Received Power - Noise Floor
+            // rxSensitivity is the receiver noise floor (minimum detectable signal)
+            snrDb = prDbm - rxSensitivity;
 
             // Finalize and return
             FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
