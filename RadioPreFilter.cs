@@ -28,7 +28,7 @@ public class RadioPreFilter
         
         // Standard voice band filters
         float lowCut = 300f;
-        float highCut = 2200f; // Narrowed to match F-16 radio (was 3300 Hz)
+        float highCut = (float)bandwidthHz;
 
         _highPass = BiquadFilter.HighPass(sampleRate, lowCut, 0.707f);
         _lowPass = BiquadFilter.LowPass(sampleRate, highCut, 0.707f);

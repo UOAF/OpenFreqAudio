@@ -463,7 +463,7 @@ namespace BMSAudioSim
                 snrDb = effectiveSignalDbm - noiseFloorDbm;
 
                 CalculateNoiseAndDropout(ap, snrDb, isVHF);
-                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
                 return;
             }
 
@@ -616,7 +616,7 @@ namespace BMSAudioSim
             CalculateNoiseAndDropout(ap, snrDb, isVHF);
 
             // Set bandwidth
-            ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
         }
 
 
@@ -630,7 +630,7 @@ namespace BMSAudioSim
             CalculateNoiseAndDropout(ap, snrDb, isVHF);
 
             // Set bandwidth
-            ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
         }
 
         public AudioParams CalculateAudioParams(
@@ -666,7 +666,7 @@ namespace BMSAudioSim
             if (dist < 1.0)
             {
                 ap.Gain = 1.0f;
-                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                ap.LowpassHz = isVHF ? 3300f : 3500f;
                 ap.NoiseLevel = 0.01f;
                 ap.DropoutRate = 0.0f;
                 ap.DeepFadeRate = 0.0f;
@@ -698,7 +698,7 @@ namespace BMSAudioSim
             {
                 double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
-                ap.LowpassHz = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
                 
                 // SNR = Received Power - Noise Floor
                 snrDb = prDbm - rxSensitivity;
@@ -829,5 +829,51 @@ namespace BMSAudioSim
             // Scale to comfortable range (max 1.0)
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
+        
+        private float CalculateDynamicBandwidth(double snrDb, bool isVHF)
+        {
+            // Full bandwidth targets
+            float maxBandwidth = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+    
+            // Minimum intelligible bandwidth (telephone quality)
+            const float minBandwidth = 1200f;
+    
+            if (snrDb > 20.0)
+            {
+                // Excellent signal - full bandwidth
+                return maxBandwidth;
+            }
+            else if (snrDb > 10.0)
+            {
+                // Good signal - slight HF rolloff (3000 → 2600 Hz)
+                float reduction = (float)((20.0 - snrDb) / 10.0 * 0.15); // 0% → 15% reduction
+                return maxBandwidth * (1f - reduction);
+            }
+            else if (snrDb > 5.0)
+            {
+                // Marginal signal - noticeable narrowing (2600 → 2000 Hz)
+                float startBw = maxBandwidth * 0.85f;
+                float endBw = maxBandwidth * 0.60f;
+                float t = (float)((10.0 - snrDb) / 5.0);
+                return startBw + t * (endBw - startBw);
+            }
+            else if (snrDb > 0.0)
+            {
+                // Poor signal - telephone quality (2000 → 1500 Hz)
+                float startBw = maxBandwidth * 0.60f;
+                float endBw = maxBandwidth * 0.45f;
+                float t = (float)((5.0 - snrDb) / 5.0);
+                return startBw + t * (endBw - startBw);
+            }
+            else
+            {
+                // Very poor - minimal intelligibility (1500 → 1200 Hz)
+                float startBw = maxBandwidth * 0.45f;
+                float reduction = (float) Math.Min(-snrDb / 10.0, 0.2); // Additional 20% max
+                return Math.Max(minBandwidth, startBw * (1f - (float)reduction));
+            }
+        }
     }
+    
+    
 }
