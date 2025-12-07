@@ -16,10 +16,17 @@ public partial class App : Application
     {
         AvaloniaXamlLoader.Load(this);
         
+        #if DEBUG
         Log.Logger = new LoggerConfiguration()
             .WriteTo.Console()
             .MinimumLevel.Debug()
             .CreateLogger();
+        #else
+        Log.Logger = new LoggerConfiguration()
+            .WriteTo.Console()
+            .MinimumLevel.Information()
+            .CreateLogger();
+        #endif
     }
 
     public override void OnFrameworkInitializationCompleted()

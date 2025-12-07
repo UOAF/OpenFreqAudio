@@ -487,14 +487,6 @@ namespace BMSAudioSim
                 theoreticalDiffractionLoss = KnifeEdgeLoss_dB(v_approx);
             }
 
-            // For SEVERE obstruction (< 20% clearance), trust the actual measured diffraction loss
-            // The approximation breaks down for multiple obstacles
-            if (fresnelClearance < 0.2)
-            {
-                // Use the larger of: approximation vs actual measurement
-                theoreticalDiffractionLoss = Math.Max(theoreticalDiffractionLoss, diffLoss);
-            }
-
             // Apply wavelength-dependent corrections
             double wavelengthCorrection;
             if (isVHF)
@@ -530,11 +522,27 @@ namespace BMSAudioSim
             // Combine theoretical loss with wavelength correction
             double totalTerrainLoss = theoreticalDiffractionLoss + wavelengthCorrection;
 
-            // For very severe obstruction, use the actual measured diffraction loss
-            // (knife-edge theory breaks down for multiple obstacles)
-            if (fresnelClearance < 0.2)
+            // SMOOTH BLENDING: For severe obstruction, blend between theoretical and measured diffraction loss
+            // - clearance > 0.4: Use pure theoretical (approximation works well)
+            // - clearance 0.1-0.4: Smooth linear blend
+            // - clearance < 0.1: Use pure measured (multiple obstacles, theory breaks down)
+            if (fresnelClearance < 0.4)
             {
-                totalTerrainLoss = Math.Max(totalTerrainLoss, diffLoss);
+                double blendFactor;
+                if (fresnelClearance < 0.1)
+                {
+                    blendFactor = 1.0; // Full measured loss (severe obstruction)
+                }
+                else
+                {
+                    // Linear blend from 0.1 (full measured) to 0.4 (full theoretical)
+                    blendFactor = (0.4 - fresnelClearance) / 0.3;
+                }
+                
+                // Blend: theoretical * (1 - blend) + measured * blend
+                totalTerrainLoss = totalTerrainLoss * (1.0 - blendFactor) + diffLoss * blendFactor;
+                
+                _logger.LogDebug($"Blending: theoretical={theoreticalDiffractionLoss + wavelengthCorrection:F1} dB, measured={diffLoss:F1} dB, blend={blendFactor:F3} → final={totalTerrainLoss:F1} dB");
             }
 
             // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
@@ -717,7 +725,7 @@ namespace BMSAudioSim
             // Cache frequently used calculations outside the loop
             double invDist2D = 1.0 / dist2D;
             double rxMinusTx = rxAlt - txAlt;
-            double twoOverEffectiveRadius = 2.0 / effectiveEarthRadius;
+            double invTwoEffectiveRadius = 1.0 / (2.0 * effectiveEarthRadius); // FIX: was dividing by half radius
             double lambdaInv = 1.0 / lambda;
 
             // Find worst obstruction along path
@@ -734,7 +742,7 @@ namespace BMSAudioSim
                 if (F1 > F1_radius) F1_radius = F1;
 
                 // LOS height at this distance (accounting for Earth curvature)
-                double curvature = d1d2 * twoOverEffectiveRadius;
+                double curvature = d1d2 * invTwoEffectiveRadius;
                 double losHeight = txAlt + rxMinusTx * (d1 * invDist2D) - curvature;
 
                 // Clearance excess: negative = clear, positive = obstructed
