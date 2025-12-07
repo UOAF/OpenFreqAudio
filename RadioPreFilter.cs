@@ -5,8 +5,6 @@ namespace BMSAudioSim;
 /// <summary>
 /// Radio pre-filter with bandpass filtering, AGC, and soft saturation
 /// 
-/// PHASE 2a OPTIMIZATIONS:
-/// - Fast tanh approximation for saturation (3-5x faster than MathF.Tanh)
 /// </summary>
 public class RadioPreFilter
 {
@@ -124,7 +122,6 @@ public class RadioPreFilter
                 else if (x < -0.85f)
                     x = -0.85f + (x + 0.85f) * 0.35f;
                 
-                // PHASE 2a: Fast tanh instead of MathF.Tanh() - 3-5x faster
                 x = FastTanh(x * 1.5f);
 
                 buffer[idx] = x;

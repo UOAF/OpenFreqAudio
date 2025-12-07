@@ -17,12 +17,6 @@ namespace BMSAudioSim;
 /// NOTE: Transmissions are ANALOG FM - no digital vocoder, packets, or bit errors!
 /// Digital processing happens ONLY in the receiver's audio backend after demodulation.
 /// 
-/// PHASE 1 OPTIMIZATIONS:
-/// - Cached filter coefficients per sample rate (eliminates sin/cos on every RadioEffect creation)
-/// 
-/// PHASE 2a OPTIMIZATIONS:
-/// - Pre-calculated squelch burst envelope (eliminates Exp/Pow during burst)
-/// 
 /// MULTI-SCALE FADING MODEL:
 /// - Fast flutter (20-80ms): Rapid multipath interference, stays above squelch
 /// - Deep fades (400-2000ms): Severe signal loss, can trigger squelch pops
@@ -38,7 +32,7 @@ public class RadioEffect
     // User-configurable squelch threshold
     private float _squelchThreshold = 0.03f;
     
-    // PHASE 1: Pre-calculated filter coefficients (cached per sample rate)
+    // Pre-calculated filter coefficients (cached per sample rate)
     private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> _filterCache 
         = new Dictionary<int, (float, float, float, float, float)>();
     private static readonly object _filterCacheLock = new object();
@@ -76,12 +70,11 @@ public class RadioEffect
     private const int SquelchBurstDuration = 720; // ~15ms at 48kHz (longer, softer)
     private const float SquelchBurstAmplitude = 0.12f; // Audible but not harsh (increased for filtered version)
     
-    // PHASE 2a: Pre-calculated burst envelope (eliminates Exp/Pow calculations during burst)
+    // Pre-calculated burst envelope
     private static readonly float[] _squelchBurstEnvelope = GenerateBurstEnvelope();
     
     /// <summary>
     /// Generate the squelch burst envelope once at startup.
-    /// PHASE 2a: This eliminates MathF.Exp() and MathF.Pow() calls during burst playback
     /// </summary>
     private static float[] GenerateBurstEnvelope()
     {
@@ -153,7 +146,7 @@ public class RadioEffect
         _prevOut = new float[channels];
         _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
         
-        // PHASE 1: Get or calculate filter coefficients (cached per sample rate)
+        // Get or calculate filter coefficients (cached per sample rate)
         lock (_filterCacheLock)
         {
             if (!_filterCache.TryGetValue(sampleRate, out var coeffs))
@@ -177,7 +170,6 @@ public class RadioEffect
     
     /// <summary>
     /// Calculate digital brick-wall filter coefficients (300Hz - 2700Hz bandpass)
-    /// PHASE 1: This is now cached per sample rate instead of recalculated every time
     /// </summary>
     private static (float b0, float b1, float b2, float a1, float a2) CalculateFilterCoefficients(int sampleRate)
     {
@@ -444,7 +436,6 @@ public class RadioEffect
             float squelchBurstSample = 0f;
             if (_squelchBurstSamplesLeft > 0)
             {
-                // PHASE 2a: Use pre-calculated envelope instead of Exp/Pow - 75x faster!
                 int age = SquelchBurstDuration - _squelchBurstSamplesLeft;
                 float envelope = _squelchBurstEnvelope[age];
                 
@@ -520,7 +511,6 @@ public class RadioEffect
                 }
 
                 // === Digital brick-wall filter (biquad) ===
-                // PHASE 1: Using pre-calculated coefficients (b0, b1, b2, a1, a2)
                 // State indices for this channel: [x[n-1], x[n-2], y[n-1], y[n-2]]
                 int stateBase = c * 4;
                 

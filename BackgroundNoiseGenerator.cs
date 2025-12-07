@@ -8,10 +8,6 @@ namespace BMSAudioSim;
 /// Noise characteristics vary by radio type:
 /// - VHF (AM): Crackling static with occasional pops (atmospheric noise, ignition interference)
 /// - UHF (FM): Smooth white noise/hiss (FM threshold noise, "sssshhh" sound)
-/// 
-/// PHASE 2b OPTIMIZATIONS:
-/// - Fast Voss-McCartney pink noise algorithm (2-3x faster than filter method)
-/// - Pre-calculated sin lookup for modulation (reuses Radiomixer's approach)
 /// </summary>
 public class BackgroundNoiseGenerator
 {
@@ -19,7 +15,7 @@ public class BackgroundNoiseGenerator
     private readonly int _channels;
     private readonly Random _rng;
     
-    // PHASE 2b: Fast pink noise using Voss-McCartney dice-rolling algorithm
+    // Pink noise using Voss-McCartney dice-rolling algorithm
     // Instead of 7 multiplies + 7 adds per sample, averages ~2 operations
     private int _pinkNoiseCounter = 0;
     private float _pinkNoiseSum = 0f;
@@ -33,7 +29,7 @@ public class BackgroundNoiseGenerator
     private double _modulationPhase = 0;
     private const double ModulationFrequency = 3.0; // Hz
     
-    // PHASE 2b: Sine lookup table for modulation (shared with Radiomixer approach)
+    // Sine lookup table for modulation
     private static class SineLookup
     {
         private const int TableSize = 2048;
@@ -118,7 +114,6 @@ public class BackgroundNoiseGenerator
                 _ => GenerateUHFNoise()
             };
             
-            // PHASE 2b: Use sine lookup for modulation (3-10x faster than Math.Sin)
             _modulationPhase += 2.0 * Math.PI * ModulationFrequency * dt;
             if (_modulationPhase > 2.0 * Math.PI)
                 _modulationPhase -= 2.0 * Math.PI;
@@ -143,7 +138,7 @@ public class BackgroundNoiseGenerator
     /// </summary>
     private float GenerateVHFNoise()
     {
-        // PHASE 2b: Fast pink noise using Voss-McCartney algorithm
+        // Pink noise using Voss-McCartney algorithm
         float pinkNoise = GeneratePinkNoiseFast();
         
         // Occasional crackles/pops (atmospheric noise, ignition interference)
@@ -180,7 +175,6 @@ public class BackgroundNoiseGenerator
     /// </summary>
     private float GenerateUHFNoise()
     {
-        // PHASE 2b: Fast pink noise
         float pinkNoise = GeneratePinkNoiseFast();
         
         // Add slight high-frequency component for the "hiss" character
@@ -192,18 +186,10 @@ public class BackgroundNoiseGenerator
     
     /// <summary>
     /// Fast pink noise using Voss-McCartney dice-rolling algorithm
-    /// 
-    /// PHASE 2b: Much faster than filter-based approach
-    /// - Old method: 7 multiplies + 7 adds per sample
-    /// - New method: ~2 operations per sample average (only updates changed dice)
-    /// 
     /// Algorithm: Maintain N dice, update one die on each call based on counter bits
     /// The dice that change least frequently contribute low frequencies
     /// The dice that change most frequently contribute high frequencies
     /// Sum of all dice gives pink noise (1/f spectrum)
-    /// 
-    /// Speedup: 2-3x faster than filter method
-    /// Quality: Equivalent spectral characteristics
     /// </summary>
     private float GeneratePinkNoiseFast()
     {

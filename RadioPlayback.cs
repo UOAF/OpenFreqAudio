@@ -11,11 +11,6 @@ namespace BMSAudioSim;
 /// <summary>
 /// Manages multiple concurrent radio transmissions across multiple frequencies
 /// with automatic stepped-on interference per frequency and multi-frequency listening
-/// 
-/// PHASE 1 OPTIMIZATIONS:
-/// - Pre-allocated buffers (eliminates allocation spikes)
-/// - Reduced DSP lock time (snapshot pattern)
-/// - Reused noise generator (no recreation on stream changes)
 /// </summary>
 public class RadioPlayback
 {
@@ -42,7 +37,6 @@ public class RadioPlayback
         public Radiomixer Mixer { get; set; } = new Radiomixer();
         public bool IsTuned { get; set; } = false; // Is user listening to this frequency?
         
-        // PHASE 2b FIX: Each frequency needs its own noise generator
         // Different frequencies can have different radio types (VHF/UHF) and independent squelch
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; } = null;
         public float NoiseFadeGain { get; set; } = 0f; // Per-frequency fade envelope
@@ -68,7 +62,7 @@ public class RadioPlayback
     private DSPProcedure? _dspProc;
     private bool _dspSetup = false; // Track if DSP callback has been set up
     
-    // PHASE 1: Pre-allocated processing buffers
+    // Pre-allocated processing buffers
     // BASS can request up to 20000 samples (~417ms at 48kHz) for streaming
     // Allocate generous size to avoid any runtime allocations
     private const int MaxBufferSize = 24576; // ~512ms at 48kHz, ~557ms at 44.1kHz
@@ -327,7 +321,7 @@ public class RadioPlayback
             var freqConfig = _frequencies[frequencyMHz];
             freqConfig.IsTuned = true;
             
-            // PHASE 2b FIX: Create noise generator for this frequency if not already created
+            // Create noise generator for this frequency if not already created
             if (freqConfig.NoiseGenerator == null)
             {
                 freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyMHz);
@@ -572,7 +566,7 @@ public class RadioPlayback
         {
             int samples = length / sizeof(float);
             
-            // PHASE 1: Check buffer size - should be rare with 24576 pre-allocation
+            // Check buffer size - should be rare with 24576 pre-allocation
             if (samples > MaxBufferSize)
             {
                 Console.WriteLine($"[DSP] Buffer size {samples} exceeds {MaxBufferSize}, reallocating...");
@@ -600,7 +594,7 @@ public class RadioPlayback
                 }
             }
 
-            // === PHASE 1: QUICK SNAPSHOT (minimize lock time) ===
+            // === QUICK SNAPSHOT (minimize lock time) ===
             List<RadioStream> activeStreams;
             Dictionary<float, FrequencyConfig> frequencySnapshot;
             float currentSquelchThreshold;
@@ -637,13 +631,11 @@ public class RadioPlayback
             // Clear output buffer
             Array.Clear(_dspScratch, 0, samples);
 
-            // PHASE 2b FIX: Process background noise PER FREQUENCY
             // Each frequency can have its own:
             // - Radio type (VHF/UHF)
             // - Channel routing (left/right/both)
             // - Squelch threshold (affects when noise plays)
             // - Fade envelope (independent fade in/out)
-            
             
             foreach (var kvp in frequencySnapshot)
             {

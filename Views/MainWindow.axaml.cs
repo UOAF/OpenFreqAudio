@@ -584,7 +584,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     losLine.Color = Colors.Red.WithAlpha(0.8);
     losLine.LineWidth = 2.0f;
     losLine.LinePattern = LinePattern.Dashed;
-    losLine.LegendText = "Radio LOS (curved)";
+    losLine.LegendText = "Radio LOS";
     
     // Plot Fresnel zone boundaries
     var fresnelUpperLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelUpper);
