@@ -7,14 +7,11 @@
 // - Smooth continuous degradation
 // - Wavelength-dependent corrections for VHF (better diffraction) vs UHF (more LOS-dependent)
 
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
 using System.IO.MemoryMappedFiles;
 using Microsoft.Extensions.Logging;
 
-namespace BMSAudioSim
+namespace OpenFreqAudio
 {
     // ================================================================
     // Object pool for AudioParams to reduce allocations
@@ -152,7 +149,7 @@ namespace BMSAudioSim
 
         // Physics calibration parameters (tunable based on field measurements)
         private const double VhfDiffractionBonus_dB = 3.0; // VHF diffracts better than knife-edge theory predicts
-        private const double UhfDiffractionPenalty_dB = 6.0; // UHF is more LOS-dependent
+        private const double UhfDiffractionPenalty_dB = 7.0; // UHF is more LOS-dependent
         private const double MinimumGainDb = -60.0; // Below this, signal is completely lost
 
         private readonly DEMReader dem;
@@ -538,11 +535,12 @@ namespace BMSAudioSim
                     // Linear blend from 0.1 (full measured) to 0.4 (full theoretical)
                     blendFactor = (0.4 - fresnelClearance) / 0.3;
                 }
-                
+
                 // Blend: theoretical * (1 - blend) + measured * blend
                 totalTerrainLoss = totalTerrainLoss * (1.0 - blendFactor) + diffLoss * blendFactor;
-                
-                _logger.LogDebug($"Blending: theoretical={theoreticalDiffractionLoss + wavelengthCorrection:F1} dB, measured={diffLoss:F1} dB, blend={blendFactor:F3} → final={totalTerrainLoss:F1} dB");
+
+                _logger.LogDebug(
+                    $"Blending: theoretical={theoreticalDiffractionLoss + wavelengthCorrection:F1} dB, measured={diffLoss:F1} dB, blend={blendFactor:F3} → final={totalTerrainLoss:F1} dB");
             }
 
             // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
@@ -628,7 +626,6 @@ namespace BMSAudioSim
         }
 
 
-
         public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, bool isVHF)
         {
             // Update noise/dropout without recalculating gain
@@ -642,32 +639,41 @@ namespace BMSAudioSim
         }
 
         public AudioParams CalculateAudioParams(
-            double txX, double txY, double txAlt,
-            double rxX, double rxY, double rxAlt,
-            double txPowerDbm, double frequencyMHz,
+            double? txX, double? txY, double? txAlt,
+            double? rxX, double? rxY, double? rxAlt,
+            double frequencyMHz, double txPowerDbm = 40,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool altitudeIsMSL = false)
         {
+            // Rent from pool instead of allocating
+            var ap = paramsPool.Rent();
+            ap.RadioFrequencyMHz = (float) frequencyMHz;
+
+            // Stupid C# does not recognize null-safety with the early return;
+            double txXVal = txX.Value;
+            double txYVal = txY.Value;
+            double txAltVal = txAlt.Value;
+            double rxXVal = rxX.Value;
+            double rxYVal = rxY.Value;
+            double rxAltVal = rxAlt.Value;
+
             // Convert AGL to MSL
             if (!altitudeIsMSL)
             {
-                txAlt += SampleElevation(txX, txY);
-                rxAlt += SampleElevation(rxX, rxY);
+                txAltVal += SampleElevation(txXVal, txYVal);
+                rxAltVal += SampleElevation(rxXVal, rxYVal);
             }
 
-            // Rent from pool instead of allocating
-            var ap = paramsPool.Rent();
-            ap.RadioFrequencyMHz = (float)frequencyMHz;
             bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
 
             // Use provided sensitivity or default values
             double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
 
             // Distance between transmitter and receiver
-            double dx = rxX - txX;
-            double dy = rxY - txY;
-            double dz = rxAlt - txAlt;
+            double dx = rxXVal - txXVal;
+            double dy = rxYVal - txYVal;
+            double dz = rxAltVal - txAltVal;
             double dist2D = Math.Sqrt(dx * dx + dy * dy);
             double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -690,7 +696,7 @@ namespace BMSAudioSim
             double weatherLoss = weatherDbPerKm * (dist / 1000.0);
 
             // Atmospheric refraction (effective Earth radius)
-            double kAvg = CalculateKAvg(txAlt, rxAlt);
+            double kAvg = CalculateKAvg(txAltVal, rxAltVal);
             double effectiveEarthRadius = kAvg * EarthRadius;
 
             // Received power before terrain effects
@@ -700,17 +706,17 @@ namespace BMSAudioSim
             double baseGainDb = Math.Clamp(prDbm - rxSensitivity, MinimumGainDb, 50.0);
 
             // Sample terrain profile
-            var profile = SampleProfileAdaptive(txX, txY, rxX, rxY, maxSamplesPerPath);
+            var profile = SampleProfileAdaptive(txXVal, txYVal, rxXVal, rxYVal, maxSamplesPerPath);
             double snrDb = 0;
             if (profile.Count < 2)
             {
                 double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
                 ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
-                
+
                 // SNR = Received Power - Noise Floor
                 snrDb = prDbm - rxSensitivity;
-                
+
                 CalculateNoiseAndDropout(ap, snrDb, isVHF);
                 FinalizeAudioParams(ap, dist, snrDb, fspl + weatherLoss, profile, includeTerrainProfile);
                 return ap;
@@ -724,7 +730,7 @@ namespace BMSAudioSim
 
             // Cache frequently used calculations outside the loop
             double invDist2D = 1.0 / dist2D;
-            double rxMinusTx = rxAlt - txAlt;
+            double rxMinusTx = rxAltVal - txAltVal;
             double invTwoEffectiveRadius = 1.0 / (2.0 * effectiveEarthRadius); // FIX: was dividing by half radius
             double lambdaInv = 1.0 / lambda;
 
@@ -743,14 +749,14 @@ namespace BMSAudioSim
 
                 // LOS height at this distance (accounting for Earth curvature)
                 double curvature = d1d2 * invTwoEffectiveRadius;
-                double losHeight = txAlt + rxMinusTx * (d1 * invDist2D) - curvature;
+                double losHeight = txAltVal + rxMinusTx * (d1 * invDist2D) - curvature;
 
                 // Clearance excess: negative = clear, positive = obstructed
                 double excess = h - (losHeight + F1);
                 if (excess > worstExcess)
                 {
                     worstExcess = excess;
-            
+
                     // Calculate diffraction parameter
                     double h_diff = h - losHeight;
                     double v = h_diff * Math.Sqrt(2.0 * (d1 + d2) * lambdaInv / d1d2);
@@ -774,7 +780,7 @@ namespace BMSAudioSim
 
             // Calculate final path loss and SNR for output
             double pathLossDb = fspl + weatherLoss + (baseGainDb - 20.0 * Math.Log10(Math.Max(ap.Gain, 1e-6)));
-            
+
             // SNR = Received Power - Noise Floor
             // rxSensitivity is the receiver noise floor (minimum detectable signal)
             snrDb = prDbm - rxSensitivity;
@@ -837,15 +843,15 @@ namespace BMSAudioSim
             // Scale to comfortable range (max 1.0)
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
-        
+
         private float CalculateDynamicBandwidth(double snrDb, bool isVHF)
         {
             // Full bandwidth targets
             float maxBandwidth = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
-    
+
             // Minimum intelligible bandwidth (telephone quality)
             const float minBandwidth = 1200f;
-    
+
             if (snrDb > 20.0)
             {
                 // Excellent signal - full bandwidth
@@ -877,11 +883,21 @@ namespace BMSAudioSim
             {
                 // Very poor - minimal intelligibility (1500 → 1200 Hz)
                 float startBw = maxBandwidth * 0.45f;
-                float reduction = (float) Math.Min(-snrDb / 10.0, 0.2); // Additional 20% max
+                float reduction = (float)Math.Min(-snrDb / 10.0, 0.2); // Additional 20% max
                 return Math.Max(minBandwidth, startBw * (1f - (float)reduction));
             }
         }
+
+        public AudioParams GetDefaultAudioParams(double frequencyMHz)
+        {
+            var ap = paramsPool.Rent();
+            ap.RadioFrequencyMHz = (float) frequencyMHz;
+            ap.Gain = 1.0f;
+            ap.LowpassHz = 3500;
+            ap.NoiseLevel = 0f;
+            ap.DropoutRate = 0f;
+            ap.DeepFadeRate = 0f;
+            return ap;
+        }
     }
-    
-    
 }

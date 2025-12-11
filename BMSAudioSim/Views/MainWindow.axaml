@@ -1,0 +1,182 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:BMSAudioSim.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:avalonia="clr-namespace:ScottPlot.Avalonia;assembly=ScottPlot.Avalonia"
+        MinHeight="1000"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="1000"
+        x:Class="BMSAudioSim.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="BMSAudioSim">
+
+    <Grid RowDefinitions="1*,8*,3*">
+        <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="20" VerticalAlignment="Center">
+            <Button Click="OnLoadClicked">Load Heightmap</Button>
+            <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center" Grid.Column="1">No heightmap loaded</TextBlock>
+        </StackPanel>
+
+        <!-- Main Content: Heightmap and Graph side by side -->
+        <Grid Grid.Row="1" ColumnDefinitions="*,*" Margin="10">
+            <!-- Left: Heightmap Image -->
+            <Border Grid.Column="0" Margin="0,0,5,0" BorderBrush="Gray" BorderThickness="1">
+                <Grid RowDefinitions="Auto,*">
+                    <TextBlock Text="Click to place sender • Click again to place receiver"
+                               HorizontalAlignment="Left"
+                               VerticalAlignment="Top"
+                               Margin="10"
+                               Foreground="White"
+                               Background="#80000000"
+                               Padding="5"
+                               FontSize="11"
+                               IsHitTestVisible="False" />
+
+                    <ScrollViewer Grid.Row="1"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Auto">
+                        <ZoomBorder Name="ZoomBorder" Stretch="None" ZoomSpeed="1.2"
+                                    ClipToBounds="True" Focusable="True"
+                                    VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
+                                    ZoomChanged="ZoomBorder_OnZoomChanged">
+                            <Grid>
+                                <!-- Heightmap image -->
+                                <Image x:Name="HeightmapImage"
+                                       Stretch="Uniform"
+                                       PointerPressed="OnImagePointerPressed"
+                                       RenderOptions.BitmapInterpolationMode="HighQuality"
+                                       HorizontalAlignment="Stretch"
+                                       VerticalAlignment="Stretch" />
+
+                                <!-- Canvas for drawing position markers - must not block clicks -->
+                                <Canvas x:Name="MarkerCanvas"
+                                        Background="Transparent"
+                                        IsHitTestVisible="False"
+                                        HorizontalAlignment="Stretch"
+                                        VerticalAlignment="Stretch" />
+
+                                <!-- Instructions overlay -->
+
+                            </Grid>
+                        </ZoomBorder>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+
+
+            <!-- Right: Height Profile Graph -->
+            <Border Grid.Column="1" Margin="5,0,0,0" BorderBrush="Gray" BorderThickness="1">
+                <Grid ColumnDefinitions="Auto,*, Auto">
+                    <Grid Grid.Column="0" RowDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Row="0" FontWeight="SemiBold">TX AGL</TextBlock>
+                        <Slider Grid.Row="1" Orientation="Vertical" Minimum="0" Maximum="12000" TickPlacement="TopLeft"
+                                TickFrequency="10" Value="{Binding TXAltitude}"
+                                ValueChanged="OnAltSliderChanged">
+                        </Slider>
+                        <TextBlock Grid.Row="2" HorizontalAlignment="Center"
+                                   Text="{Binding TXAltitude, StringFormat='{}{0} m'}">
+                        </TextBlock>
+                    </Grid>
+                    <Grid Grid.Column="1" RowDefinitions="Auto,*">
+                        <TextBlock Grid.Row="0"
+                                   Name="ProfileInfoText"
+                                   Text="Height Profile"
+                                   HorizontalAlignment="Center"
+                                   Margin="10,5"
+                                   FontWeight="SemiBold"
+                                   FontSize="11" />
+                        <avalonia:AvaPlot Name="HeightProfilePlot"
+                                          Grid.Row="1"
+                                          Margin="10" />
+                    </Grid>
+                    <Grid Grid.Column="2" RowDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Row="0" FontWeight="SemiBold">RX AGL</TextBlock>
+                        <Slider Grid.Row="1" Orientation="Vertical" Minimum="0" Maximum="12000"
+                                TickPlacement="BottomRight"
+                                TickFrequency="1000" Value="{Binding RXAltitude}" ValueChanged="OnAltSliderChanged">
+                        </Slider>
+                        <TextBlock Grid.Row="2" HorizontalAlignment="Center"
+                                   Text="{Binding RXAltitude, StringFormat='{}{0} m'}">
+                        </TextBlock>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- Bottom Info Panel -->
+        <Grid Grid.Row="2" Margin="10" ColumnDefinitions="*,*,*" Name="ConfigPanel" IsEnabled="False">
+            <StackPanel Grid.Column="0" Margin="5">
+                <TextBlock Text="Sender:" FontWeight="Bold" />
+                <TextBlock Name="SenderPosText" Text="Not set" />
+                <StackPanel>
+                    <TextBlock Text="{Binding TxDbm, StringFormat='{}{0} dBm'}"></TextBlock>
+                    <Slider Minimum="10" Maximum="50" Value="{Binding TxDbm}" ValueChanged="OnAltSliderChanged"></Slider>
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton Name="RadioButtonUhf" IsChecked="True"
+                                     IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF (left)" />
+                        <RadioButton Content="VHF (right)" Margin="5, 0" />
+                        <TextBlock VerticalAlignment="Center" Text="Frequency " Margin="15, 0, 0, 0" />
+                        <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}" />
+                        
+                        <TextBlock Margin="5, 0" Text="Squelch" VerticalAlignment="Center"/>
+                        <TextBlock Margin="5, 0" Text="{Binding Squelch}" VerticalAlignment="Center"/>
+                        <Slider Minimum="0" Maximum="10"
+                                TickPlacement="Outside"
+                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Squelch}"
+                                ValueChanged="OnSquelchSliderChanged" MinWidth="80" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <TextBlock Text="Signal 1 Playback" VerticalAlignment="Center" Width="120"/>
+                        <RadioButton GroupName="Signal1Playback" Content="Continuous" IsChecked="{Binding Signal1Continuous}"/>
+                        <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
+                        <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                        <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
+                        <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
+                        <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
+                        <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                    </StackPanel>
+                    
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Signal Boost" VerticalAlignment="Center"/>
+                        <TextBlock Margin="10, 0, 0, 0" Text="Signal 1" VerticalAlignment="Center" />
+                        <Slider Minimum="-15" Maximum="15"
+                                TickPlacement="Outside"
+                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SteppedDiffDbm}"
+                                ValueChanged="OnAltSliderChanged" MinWidth="200">
+                        </Slider>
+                        <TextBlock Text="Signal 2" VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Margin="5">
+                <TextBlock Text="Receiver:" FontWeight="Bold" />
+                <TextBlock Name="ReceiverPosText" Text="Not set" />
+                <StackPanel Grid.Row="1">
+                    <TextBlock Text="{Binding RxDbm, StringFormat='{}{0} dBm'}"></TextBlock>
+                    <Slider Minimum="-110" Maximum="-50" Value="{Binding RxDbm}" ValueChanged="OnAltSliderChanged"></Slider>
+                </StackPanel>
+            </StackPanel>
+            <Grid Grid.Column="2" ColumnDefinitions="6*,4*" Margin="5">
+                <StackPanel Grid.Column="0">
+                    <TextBlock Text="Gain:" FontWeight="Bold" />
+                    <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
+                    <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
+                    <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
+                    <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
+
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                    <TextBlock Name="GainText" Text="n/a" />
+                    <TextBlock Name="LowPassHzText" Text="n/a" />
+                    <TextBlock Name="NoiseLvlText" Text="n/a" />
+                    <TextBlock Name="DropoutRateText" Text="n/a" />
+                    <TextBlock Name="DeepFadeRateText" Text="n/a" />
+                </StackPanel>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

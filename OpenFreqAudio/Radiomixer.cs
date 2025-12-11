@@ -1,8 +1,7 @@
-using System;
 using BMSAudioSim.Models;
 using ManagedBass;
 
-namespace BMSAudioSim;
+namespace OpenFreqAudio;
 
 /// <summary>
 /// Sample-based stepped-on interference mixer.
@@ -165,13 +164,13 @@ public class Radiomixer
 
         // Scale beat frequency proportionally to radio frequency
         // This creates natural pitch variation across the frequency spectrum
-        float beatHz = referenceBeatHz * (avgFreqMHz / referenceFreqMHz);
+        float beatHz = referenceBeatHz * (avgFreqMHz / referenceFreqMHz) * 0.6f;
 
         // Clamp to realistic ranges
         if (result.IsVHF)
-            beatHz = Math.Clamp(beatHz, 150.0f, 300.0f);
+            beatHz = Math.Clamp(beatHz, 150.0f, 250.0f);
         else
-            beatHz = Math.Clamp(beatHz, 250.0f, 450.0f);
+            beatHz = Math.Clamp(beatHz, 180.0f, 320.0f);
 
         result.BeatFrequency_Hz = beatHz;
 

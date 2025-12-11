@@ -1,8 +1,4 @@
-using System;
-using System.Collections.Generic;
-using System.Threading;
-
-namespace BMSAudioSim;
+namespace OpenFreqAudio;
 
 /// <summary>
 /// Modern military radio receiver effects (AN/ARC-210/222 style)
@@ -50,6 +46,18 @@ public class RadioEffect
     private int _squelchTransitionLength = 0;
     private const int SquelchAttackSamples = 12;   // ~0.25ms at 48kHz (very fast digital)
     private const int SquelchReleaseSamples = 240;  // ~5ms at 48kHz (fast digital)
+    
+    // DC whine state
+    private double _whinePhase = 0.0;
+    private const float WhineFreq = 520f;    // typical avionics inverter whine (400–800 Hz)
+    private const float WhineLevel = 0.003f; // extremely subtle, like cockpit background
+    
+    // Oxygen-mask style muffling
+    private float _muffleLP;        // simple one-pole low-pass history
+    private const float MuffleCutoff = 900f;   // muffled low-pass
+    private float _muffleA;         // filter coefficient
+    private float[] _muffleLPChannels;
+    private float[] _muffleLP2Channels;
     
     /// <summary>
     /// Check if squelch is currently open (allowing audio through)
@@ -166,6 +174,12 @@ public class RadioEffect
         // Initialize squelch state based on initial signal strength
         _squelchState = initial.Gain >= _squelchThreshold ? SquelchState.Open : SquelchState.Closed;
         _prevEffectiveGain = initial.Gain;
+        
+        // Precompute one-pole LPF coefficient for muffling (oxygen mask effect)
+        // Lower cutoff = more muffled (typical military masks: 600-700 Hz)
+        _muffleA = MathF.Exp(-2f * MathF.PI * MuffleCutoff / _sampleRate);
+        _muffleLPChannels = new float[_channels];
+        _muffleLP2Channels = new float[_channels];
     }
     
     /// <summary>
@@ -465,6 +479,12 @@ public class RadioEffect
                 
                 _squelchBurstSamplesLeft--;
             }
+            
+            // Generate subtle DC whine (actually AC tone)
+            double whineIncrement = 2.0 * Math.PI * WhineFreq / _sampleRate;
+            float whineSample = (float)Math.Sin(_whinePhase) * WhineLevel;
+            _whinePhase += whineIncrement;
+            if (_whinePhase > Math.PI * 2) _whinePhase -= Math.PI * 2;
 
             for (int c = 0; c < _channels; c++)
             {
@@ -509,6 +529,22 @@ public class RadioEffect
                     
                     x *= deepFadeEnvelope;
                 }
+                
+                
+                // === Oxygen mask (two-pole strong LPF + nasal boost) ===
+                float lp1 = _muffleLPChannels[c];
+                lp1 = _muffleA * lp1 + (1f - _muffleA) * x;
+                _muffleLPChannels[c] = lp1;
+
+                float lp2 = _muffleLP2Channels[c];
+                lp2 = _muffleA * lp2 + (1f - _muffleA) * lp1;
+                _muffleLP2Channels[c] = lp2;
+
+// Stronger nasal boost for helmet/mask resonance
+                float nasal = x * 0.55f;
+
+// Blend to final mask sound
+                x = (lp2 * 0.75f) + (nasal * 0.25f);
 
                 // === Digital brick-wall filter (biquad) ===
                 // State indices for this channel: [x[n-1], x[n-2], y[n-1], y[n-2]]
@@ -534,19 +570,27 @@ public class RadioEffect
                 // Apply gain (using original p.Gain, not effectiveGain - fades already applied)
                 float val = y * p.Gain;
 
-                // === Analog receiver noise (optional) ===
-                // In weak signal conditions, analog FM receivers exhibit:
-                // - Thermal noise (becomes dominant below FM threshold)
-                // - Background hiss
-                // This is different from digital quantization noise!
-                if (p.NoiseLevel > 0.1f && squelchGain > 0f)
+                // === Noise ===
+                // Apply physics-calculated noise when signal is transmitting
+                // Noise is based on RF propagation conditions (SNR, distance, terrain)
+                if (p.NoiseLevel > 0.001f && squelchGain > 0f)
                 {
-                    // Thermal/background noise (analog characteristic)
-                    // Only when signal is weak and squelch is open
-                    float thermalNoise = (float)(rng.NextDouble() * 2.0 - 1.0) * p.NoiseLevel * 0.02f;
-                    val += thermalNoise;
+                    // Use pink-ish noise (more natural than pure white)
+                    // Average multiple samples for spectral shaping
+                    float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                    float noise2 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                    float noise3 = (float)(rng.NextDouble() * 2.0 - 1.0);
+                    float noise4 = (float)(rng.NextDouble() * 2.0 - 1.0);
+    
+                    // 4-sample average creates ~6dB/octave rolloff (pink-ish)
+                    float radioNoise = (noise1 + noise2 + noise3 + noise4) / 4.0f;
+    
+                    // Map physics noise level to audible amplitude
+                    float noiseGain = MathF.Sqrt(p.NoiseLevel) * 0.3f;
+    
+                    val += radioNoise * noiseGain;
                 }
-
+                
                 // Clamp to safe range
                 val = Math.Clamp(val, -1f, 1f);
                 
@@ -554,6 +598,11 @@ public class RadioEffect
                 // This happens outside the signal chain so it's always audible
                 // regardless of gain or squelch state
                 val += squelchBurstSample;
+
+                if (!inDrop && _squelchState != SquelchState.Closed)
+                {
+                    val += whineSample;
+                } 
                 
                 buffer[idx] = Math.Clamp(val, -1f, 1f);
             }

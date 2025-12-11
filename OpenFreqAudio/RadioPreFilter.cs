@@ -1,6 +1,4 @@
-using System;
-
-namespace BMSAudioSim;
+namespace OpenFreqAudio;
 
 /// <summary>
 /// Radio pre-filter with bandpass filtering, AGC, and soft saturation

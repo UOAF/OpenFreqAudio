@@ -1,6 +1,4 @@
-using System;
-
-namespace BMSAudioSim;
+namespace OpenFreqAudio;
 
 /// <summary>
 /// Generates background radio noise (static/hiss) when no transmissions are active
@@ -68,7 +66,7 @@ public class BackgroundNoiseGenerator
     
     private RadioType _radioType = RadioType.UHF_FM;
     
-    public BackgroundNoiseGenerator(int sampleRate, int channels, float frequencyMhz)
+    public BackgroundNoiseGenerator(int sampleRate, int channels, double frequencyMhz)
     {
         _sampleRate = sampleRate;
         _channels = channels;
