@@ -714,7 +714,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
         var squelchValue = SquelchSliderToDb(e.NewValue);
-        Console.Out.WriteLine($"SetSquelchThreshold {squelchValue}");
         _radioPlayback.SetSquelchThreshold((float)squelchValue);
     }
 
