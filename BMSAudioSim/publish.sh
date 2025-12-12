@@ -15,4 +15,4 @@ cp Assets/windows/* publish/windows
 cp bin/Release/net9.0/linux-x64/publish/BMSAudioSim publish/linux
 cp bin/Release/net9.0/win-x64/publish/BMSAudioSim.exe publish/windows
 cp README.md publish/
-
+cd publish && zip -r bmsaudiosim.zip *

@@ -200,6 +200,23 @@ public class RadioPlayback
         public float NoiseFadeGain { get; set; } = 0f;
         public double MinimumGain { get; set; }
         public bool WasHearableLastFrame { get; set; } = false;
+        public float SquelchThreshold { get; set; } = 0.1f;
+        public float StoredSquelchThreshold { get; set; } = 0.1f;
+
+        public bool IsNoiseMuted { get; set; }
+
+        public void MuteNoiseAndStoreSquelch()
+        {
+            StoredSquelchThreshold = SquelchThreshold;
+            SquelchThreshold = 1f;
+            IsNoiseMuted = true;
+        }
+
+        public void UnmuteNoiseAndRestoreSquelch()
+        {
+            SquelchThreshold = StoredSquelchThreshold;
+            IsNoiseMuted = false;
+        }
     }
 
     public enum AudioChannel
@@ -225,8 +242,10 @@ public class RadioPlayback
     private float[] _noiseBuffer = new float[MaxBufferSize];
 
     private int _sampleRate = 48000;
+
     private int _channels = 2;
-    private float _squelchThreshold = 0.03f;
+
+    //private float _squelchThreshold = 0.03f;
     private const int NoiseFadeSamples = 2400;
 
     private static bool _bassInitialized = false;
@@ -256,6 +275,7 @@ public class RadioPlayback
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyMHz))
                 _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
+            float squelchThreshold = _frequencies[audioParams.RadioFrequencyMHz].SquelchThreshold;
 
             // Create BASS decode stream (float)
             int bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
@@ -423,7 +443,7 @@ public class RadioPlayback
                 }
             }, token);
 
-            stream.RadioEffect.SetSquelchThreshold(_squelchThreshold);
+            stream.RadioEffect.SetSquelchThreshold(squelchThreshold);
             _streams.Add(streamId, stream);
 
             Console.WriteLine(
@@ -538,7 +558,9 @@ public class RadioPlayback
         lock (_lock)
         {
             if (!_streams.TryGetValue(streamId, out var stream)) return;
-            if (stream.CurrentParams.Gain >= _squelchThreshold && _squelchThreshold > 0.01)
+            if (_frequencies.ContainsKey(stream.FrequencyMHz) &&
+                stream.CurrentParams.Gain >= _frequencies[stream.FrequencyMHz].SquelchThreshold &&
+                _frequencies[stream.FrequencyMHz].SquelchThreshold > 0.01f)
             {
                 stream.IsStopping = true;
                 stream.StoppingBurstSamplesLeft = 720;
@@ -624,13 +646,33 @@ public class RadioPlayback
         }
     }
 
-    public void SetSquelchThreshold(float threshold)
+    public void SetSquelchThreshold(double frequencyMHz, float threshold)
     {
         lock (_lock)
         {
-            _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
-            foreach (var s in _streams.Values) s.RadioEffect.SetSquelchThreshold(_squelchThreshold);
+            if (_frequencies.ContainsKey(frequencyMHz))
+            {
+                threshold = Math.Clamp(threshold, 0.001f, 1.0f);
+                _frequencies[frequencyMHz].SquelchThreshold = threshold;
+
+                var frequencyConfig = _frequencies[frequencyMHz];
+                foreach (var s in _streams.Values.Where(s => s.FrequencyMHz == frequencyMHz))
+                {
+                    s.RadioEffect.SetSquelchThreshold(threshold);
+                }
+            }
         }
+    }
+
+    public float? GetSquelchThreshold(double frequencyMHz)
+    {
+        lock (_lock)
+        {
+            if (_frequencies.ContainsKey(frequencyMHz))
+                return _frequencies[frequencyMHz].SquelchThreshold;
+        }
+
+        return null;
     }
 
     public void SetFrequencyVolume(float frequencyMHz, float volume)
@@ -748,15 +790,12 @@ public class RadioPlayback
 
             List<RadioStream> activeStreams;
             Dictionary<double, FrequencyConfig> frequencySnapshot;
-            float currentSquelch;
-
             lock (_lock)
             {
                 activeStreams = _streams.Values.Where(s =>
                     (!s.IsStopping || s.StoppingBurstSamplesLeft > 0) && s.CurrentParams.Gain > 0 &&
                     s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
                 frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
-                currentSquelch = _squelchThreshold;
             }
 
             int outputFrames = samples / _channels;
@@ -774,20 +813,22 @@ public class RadioPlayback
                     s.FrequencyMHz == freq && s.CurrentParams.Gain >= freqConfig.MinimumGain && !s.IsStopping &&
                     s.RadioEffect.IsSquelchOpen && s.HasReceivedAudio &&
                     (DateTime.UtcNow - s.LastAudioReceived).TotalMilliseconds < 500);
-                bool noiseIsSquelched = (float)freqConfig.MinimumGain < currentSquelch || freqHasHearableStreams;
+                bool noiseIsSquelched = (float)freqConfig.MinimumGain < freqConfig.SquelchThreshold ||
+                                        freqHasHearableStreams;
 
                 if (freqHasHearableStreams != freqConfig.WasHearableLastFrame)
                 {
                     freqStreams.FirstOrDefault()?.RadioEffect.TriggerSquelchBurst();
                 }
-                
+
                 lock (_lock)
                 {
                     if (_frequencies.TryGetValue(freq, out var fc))
                         fc.WasHearableLastFrame = freqHasHearableStreams;
                 }
-              
 
+
+                // Generate background noise
                 if (!freqHasHearableStreams && !noiseIsSquelched)
                 {
                     float targetGain = (float)freqConfig.MinimumGain * freqConfig.Volume;
@@ -824,6 +865,8 @@ public class RadioPlayback
                         }
                     }
                 }
+
+                // Someone is talking, process fading to/from noise
                 else
                 {
                     float fadeStep = (float)freqConfig.MinimumGain / NoiseFadeSamples;
@@ -945,7 +988,8 @@ public class RadioPlayback
                         secondary.CurrentParams, primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
                         primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB);
                     freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, steppedParams,
-                        _sampleRate, _squelchThreshold, primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
+                        _sampleRate, freqConfig.SquelchThreshold, primary.CurrentParams.Gain,
+                        secondary.CurrentParams.Gain);
                 }
 
                 float volume = freqConfig.Volume;
