@@ -12,21 +12,21 @@ public class BackgroundNoiseGenerator
     private readonly int _sampleRate;
     private readonly int _channels;
     private readonly Random _rng;
-    
+
     // Pink noise using Voss-McCartney dice-rolling algorithm
     // Instead of 7 multiplies + 7 adds per sample, averages ~2 operations
     private int _pinkNoiseCounter = 0;
     private float _pinkNoiseSum = 0f;
     private readonly float[] _pinkNoiseDice = new float[5]; // 5 dice for good spectral balance
-    
+
     // VHF crackle generator state
     private int _vhfCrackleSamplesLeft = 0;
     private float _vhfCrackleAmplitude = 0f;
-    
+
     // Low-frequency modulation for more organic feel
     private double _modulationPhase = 0;
     private const double ModulationFrequency = 3.0; // Hz
-    
+
     // Sine lookup table for modulation
     private static class SineLookup
     {
@@ -34,7 +34,7 @@ public class BackgroundNoiseGenerator
         private static readonly float[] _table;
         private const float IndexScale = TableSize / (2f * MathF.PI);
         private const int IndexMask = TableSize - 1;
-        
+
         static SineLookup()
         {
             _table = new float[TableSize];
@@ -43,35 +43,36 @@ public class BackgroundNoiseGenerator
                 _table[i] = MathF.Sin(i * 2f * MathF.PI / TableSize);
             }
         }
-        
+
         public static float Sin(double x)
         {
             float xf = (float)(x % (2.0 * Math.PI));
             if (xf < 0) xf += 2f * MathF.PI;
-    
+
             float indexF = xf * IndexScale;
             int index = (int)indexF & IndexMask;
             float frac = indexF - index;
-    
+
             int nextIndex = (index + 1) & IndexMask;
             return _table[index] * (1f - frac) + _table[nextIndex] * frac;
         }
     }
-    
+
     public enum RadioType
     {
-        VHF_AM,  // 30-88 MHz, AM modulation
-        UHF_FM   // 225-400 MHz, FM modulation
+        VHF_AM,
+        UHF_AM,
+        UHF_FM
     }
-    
+
     private RadioType _radioType = RadioType.UHF_FM;
-    
+
     public BackgroundNoiseGenerator(int sampleRate, int channels, double frequencyMhz)
     {
         _sampleRate = sampleRate;
         _channels = channels;
         _rng = new Random(Environment.TickCount);
-        
+
         // Initialize pink noise dice with random values
         for (int i = 0; i < _pinkNoiseDice.Length; i++)
         {
@@ -79,9 +80,9 @@ public class BackgroundNoiseGenerator
             _pinkNoiseSum += _pinkNoiseDice[i];
         }
 
-        _radioType = frequencyMhz <= 200.0f ? RadioType.UHF_FM : RadioType.VHF_AM;
+        _radioType = frequencyMhz < 200.0 ? RadioType.VHF_AM : RadioType.UHF_AM;
     }
-    
+
     /// <summary>
     /// Set the radio type to adjust noise characteristics
     /// </summary>
@@ -89,7 +90,7 @@ public class BackgroundNoiseGenerator
     {
         _radioType = radioType;
     }
-    
+
     /// <summary>
     /// Generate background noise into the provided buffer
     /// </summary>
@@ -100,28 +101,34 @@ public class BackgroundNoiseGenerator
     public void GenerateNoise(float[] buffer, int offset, int samples, float gain)
     {
         int frames = samples / _channels;
-        double dt = 1.0 / _sampleRate;
-        
+
         for (int frame = 0; frame < frames; frame++)
         {
             // Generate base noise sample
             float noiseSample = _radioType switch
             {
                 RadioType.VHF_AM => GenerateVHFNoise(),
-                RadioType.UHF_FM => GenerateUHFNoise(),
+                RadioType.UHF_AM => GenerateUHFNoise(),
+                RadioType.UHF_FM => GenerateFMNoise(),
                 _ => GenerateUHFNoise()
             };
-            
-            _modulationPhase += 2.0 * Math.PI * ModulationFrequency * dt;
-            if (_modulationPhase > 2.0 * Math.PI)
-                _modulationPhase -= 2.0 * Math.PI;
-            
-            float modulation = 0.85f + 0.15f * SineLookup.Sin(_modulationPhase);
-            noiseSample *= modulation;
-            
+
+            // For AM: no modulation, just straight noise
+            // For FM: use modulation
+            if (_radioType == RadioType.UHF_FM)
+            {
+                double dt = 1.0 / _sampleRate;
+                _modulationPhase += 2.0 * Math.PI * ModulationFrequency * dt;
+                if (_modulationPhase > 2.0 * Math.PI)
+                    _modulationPhase -= 2.0 * Math.PI;
+
+                float modulation = 0.85f + 0.15f * SineLookup.Sin(_modulationPhase);
+                noiseSample *= modulation;
+            }
+
             // Apply gain
             noiseSample *= gain;
-            
+
             // Write to all channels
             for (int c = 0; c < _channels; c++)
             {
@@ -130,7 +137,7 @@ public class BackgroundNoiseGenerator
             }
         }
     }
-    
+
     /// <summary>
     /// Generate VHF/AM style noise: crackling static with pops
     /// </summary>
@@ -138,7 +145,7 @@ public class BackgroundNoiseGenerator
     {
         // Pink noise using Voss-McCartney algorithm
         float pinkNoise = GeneratePinkNoiseFast();
-        
+
         // Occasional crackles/pops (atmospheric noise, ignition interference)
         if (_vhfCrackleSamplesLeft <= 0)
         {
@@ -149,39 +156,74 @@ public class BackgroundNoiseGenerator
                 _vhfCrackleAmplitude = 0.3f + (float)_rng.NextDouble() * 0.4f; // Variable intensity
             }
         }
-        
+
         float crackle = 0f;
         if (_vhfCrackleSamplesLeft > 0)
         {
             // Decaying crackle envelope
             float envelope = (float)_vhfCrackleSamplesLeft / 200f;
             envelope = MathF.Pow(envelope, 2.0f); // Exponential decay
-            
+
             // Sharp, noisy crackle
             float crackleNoise = (float)(_rng.NextDouble() * 2.0 - 1.0);
             crackle = crackleNoise * _vhfCrackleAmplitude * envelope;
-            
+
             _vhfCrackleSamplesLeft--;
         }
-        
+
         // Mix pink noise (continuous) with crackles (intermittent)
         return pinkNoise * 0.15f + crackle;
     }
-    
+
     /// <summary>
-    /// Generate UHF/FM style noise: smooth white noise/hiss
+    /// Generate UHF/AM style noise: lighter crackling than VHF
     /// </summary>
     private float GenerateUHFNoise()
     {
+        // Pink noise base
         float pinkNoise = GeneratePinkNoiseFast();
+    
+        // Lighter, less frequent crackles than VHF
+        if (_vhfCrackleSamplesLeft <= 0)
+        {
+            // Moderate crackle rate
+            if (_rng.NextDouble() < 0.0003) // ~14 events/sec
+            {
+                _vhfCrackleSamplesLeft = _rng.Next(40, 150); // Medium duration
+                _vhfCrackleAmplitude = 0.2f + (float)_rng.NextDouble() * 0.3f; // Medium intensity
+            }
+        }
+    
+        float crackle = 0f;
+        if (_vhfCrackleSamplesLeft > 0)
+        {
+            float envelope = (float)_vhfCrackleSamplesLeft / 150f;
+            envelope = MathF.Pow(envelope, 2.0f);
         
+            float crackleNoise = (float)(_rng.NextDouble() * 2.0 - 1.0);
+            crackle = crackleNoise * _vhfCrackleAmplitude * envelope;
+        
+            _vhfCrackleSamplesLeft--;
+        }
+    
+        // Mix pink noise with lighter crackles - INCREASED base level
+        return pinkNoise * 0.18f + crackle;  // Was 0.12f, now 0.18f
+    }
+
+    /// <summary>
+    /// Generate UHF/FM style noise: smooth white noise/hiss (future use)
+    /// </summary>
+    private float GenerateFMNoise()
+    {
+        float pinkNoise = GeneratePinkNoiseFast();
+
         // Add slight high-frequency component for the "hiss" character
         float whiteNoise = (float)(_rng.NextDouble() * 2.0 - 1.0);
-        
+
         // Blend: mostly pink with some white for FM hiss characteristic
         return pinkNoise * 0.7f + whiteNoise * 0.3f;
     }
-    
+
     /// <summary>
     /// Fast pink noise using Voss-McCartney dice-rolling algorithm
     /// Algorithm: Maintain N dice, update one die on each call based on counter bits
@@ -193,11 +235,11 @@ public class BackgroundNoiseGenerator
     {
         // Increment counter
         _pinkNoiseCounter++;
-        
+
         // Find which bits changed (XOR with previous value)
         // This determines which dice to roll
         int changed = _pinkNoiseCounter ^ (_pinkNoiseCounter - 1);
-        
+
         // Update dice based on changed bits
         // Dice 0 changes every sample (bit 0 always changes on increment)
         // Dice 1 changes every 2 samples (bit 1)
@@ -214,7 +256,7 @@ public class BackgroundNoiseGenerator
                 _pinkNoiseSum += _pinkNoiseDice[i];
             }
         }
-        
+
         // Average the dice to get pink noise
         // Normalize by number of dice for consistent amplitude
         return _pinkNoiseSum / _pinkNoiseDice.Length;

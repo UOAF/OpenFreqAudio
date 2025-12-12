@@ -5,7 +5,8 @@
 // PHYSICS MODEL:
 // - Knife-edge diffraction theory (ITU-R P.526) as foundation
 // - Smooth continuous degradation
-// - Wavelength-dependent corrections for VHF (better diffraction) vs UHF (more LOS-dependent)
+// - Wavelength-dependent corrections with configurable AM/FM modulation
+// - Parametrized radio band characteristics (bandwidth, diffraction, modulation type)
 
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
@@ -13,6 +14,42 @@ using Microsoft.Extensions.Logging;
 
 namespace OpenFreqAudio
 {
+    // ================================================================
+    // Radio modulation and band configuration
+    // ================================================================
+    
+    /// <summary>
+    /// Radio modulation type - affects bandwidth, noise characteristics, and future capture/threshold modeling
+    /// </summary>
+    public enum ModulationType
+    {
+        AM, FM
+    }
+    
+    /// <summary>
+    /// Configuration for a radio band's physical characteristics
+    /// </summary>
+    public class RadioBandConfig
+    {
+        public string BandName { get; init; }
+        public double FrequencyMin_MHz { get; init; }
+        public double FrequencyMax_MHz { get; init; }
+        public float VoiceBandwidth_Hz { get; init; }
+        public double DiffractionCorrection_dB { get; init; }
+        public ModulationType Modulation { get; init; }
+        
+        public RadioBandConfig(string bandName, double freqMin, double freqMax, 
+            float bandwidth, double diffractionDb, ModulationType modulation)
+        {
+            BandName = bandName;
+            FrequencyMin_MHz = freqMin;
+            FrequencyMax_MHz = freqMax;
+            VoiceBandwidth_Hz = bandwidth;
+            DiffractionCorrection_dB = diffractionDb;
+            Modulation = modulation;
+        }
+    }
+
     // ================================================================
     // Object pool for AudioParams to reduce allocations
     // ================================================================
@@ -141,16 +178,29 @@ namespace OpenFreqAudio
         private const double EarthRadius = 6378000.0; // meters
         private const double SpeedOfLight = 299792458.0; // m/s
         private const double FourPi = 12.566370614359172; // 4 * π (precomputed)
-
-        // RF modulation constants
-        private const double VhfUhfBoundaryMHz = 200.0; // VHF: 30-174 MHz, UHF: 225-512 MHz
-        private const float VhfBandwidthHz = 3000.0f; // AM voice bandwidth
-        private const float UhfBandwidthHz = 3400.0f; // FM voice bandwidth
-
-        // Physics calibration parameters (tunable based on field measurements)
-        private const double VhfDiffractionBonus_dB = 3.0; // VHF diffracts better than knife-edge theory predicts
-        private const double UhfDiffractionPenalty_dB = 7.0; // UHF is more LOS-dependent
         private const double MinimumGainDb = -60.0; // Below this, signal is completely lost
+
+        // Default radio band configurations
+        public static List<RadioBandConfig> bandConfigs = new()
+        {
+            new RadioBandConfig(
+                bandName: "VHF",
+                freqMin: 30.0,
+                freqMax: 199.99,
+                bandwidth: 3000.0f,           
+                diffractionDb: 3.0,           // Better diffraction than UHF
+                modulation: ModulationType.AM
+            ),
+            
+            new RadioBandConfig(
+                bandName: "UHF",
+                freqMin: 200,
+                freqMax: 520.0,
+                bandwidth: 3000.0f,           
+                diffractionDb: -7.0,          // More LOS-dependent
+                modulation: ModulationType.FM
+            )
+        };
 
         private readonly DEMReader dem;
         private readonly double originX, originY, cellSizeMeters;
@@ -168,6 +218,23 @@ namespace OpenFreqAudio
             this.cellSizeMeters = cellSizeMeters;
             this.paramsPool = paramsPool ?? new AudioParamsPool();
             _logger = logger;
+        }
+
+        /// <summary>
+        /// Determine which radio band configuration to use for a given frequency
+        /// </summary>
+        private RadioBandConfig GetBandConfig(double frequencyMHz)
+        {
+            foreach (var config in bandConfigs)
+            {
+                if (frequencyMHz >= config.FrequencyMin_MHz && frequencyMHz <= config.FrequencyMax_MHz)
+                {
+                    return config;
+                }
+            }
+            
+            // Default fallback to VHF-like characteristics if frequency doesn't match any band
+            return bandConfigs[0];
         }
 
         public double PixelsToMeters(double pixelDistance)
@@ -230,61 +297,66 @@ namespace OpenFreqAudio
         /// Calculate the thermal noise floor amplitude for background noise playback.
         /// This is the noise level heard through speakers when squelch is open but no signal present.
         /// </summary>
-        /// <param name="frequencyMHz">Radio frequency in MHz</param>
+        /// <param name="frequencyMhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
+        /// <param name="modulation">Modulation type (affects noise characteristics)</param>
         /// <returns>Background noise amplitude (0.0 to 1.0 scale where 1.0 = 0 dBm)</returns>
-        public static float CalculateBackgroundNoiseAmplitude(double frequencyMHz,
-            double? receiverSensitivityDbm = null)
+        public static float CalculateBackgroundNoiseAmplitude(double frequencyMhz,
+            double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
-
-            // Use provided sensitivity or default values
-            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
+            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => frequencyMhz >= cfg.FrequencyMin_MHz && frequencyMhz <= cfg.FrequencyMax_MHz)
+                ?.VoiceBandwidth_Hz ?? 0;
+            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
+            
+            // Default sensitivities based on modulation type
+            double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
 
             // Thermal noise floor calculation
-            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
-            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz); // ≈ -139.2 dBm
+            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz); // ≈ -139.2 dBm for 3000 Hz
             double receiverNoiseFigure = 7.0; // dB
             double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm
 
             // Noise floor relative to receiver sensitivity
             double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
-            // VHF (default -113 dBm): -132 - (-113) = -19 dB
-            // UHF (default -107 dBm): -132 - (-107) = -25 dB
+            // AM (default -113 dBm): -132 - (-113) = -19 dB
+            // FM (default -107 dBm): -132 - (-107) = -25 dB
 
             // Convert to linear amplitude (0 dB = 1.0)
             float noiseFloorAmplitude = (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
-            // VHF: ≈ 0.112
-            // UHF: ≈ 0.056
+            // AM: ≈ 0.112
+            // FM: ≈ 0.056
 
             // Reduce by 6 dB for playback (allows weak signals at noise floor + 3dB to be heard)
             return noiseFloorAmplitude * 0.5f;
-            // VHF: ≈ 0.056
-            // UHF: ≈ 0.028
+            // AM: ≈ 0.056
+            // FM: ≈ 0.028
         }
 
         /// <summary>
         /// Calculate minimum gain threshold for signal detection.
         /// Signals below this are considered drowned by thermal noise.
         /// </summary>
-        /// <param name="frequencyMHz">Radio frequency in MHz</param>
+        /// <param name="frequencyMhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
-        public static float CalculateNoiseFloorAmplitude(double frequencyMHz, double? receiverSensitivityDbm = null)
+        /// <param name="modulation">Modulation type (affects default sensitivity)</param>
+        public static float CalculateNoiseFloorAmplitude(double frequencyMhz, 
+            double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
+            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => cfg.FrequencyMin_MHz >= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
+                ?.VoiceBandwidth_Hz ?? 0;
+            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
+            
+            // Default sensitivities based on modulation type
+            double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
 
-            // Use provided sensitivity or default values
-            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
-
-            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
             double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
             double receiverNoiseFigure = 7.0;
             double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
             double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
 
             return (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
-            // VHF (default -113 dBm): ≈ 0.112
-            // UHF (default -107 dBm): ≈ 0.056
+            // AM (default -113 dBm): ≈ 0.112
+            // FM (default -107 dBm): ≈ 0.056
         }
 
         // Helper to finalize AudioParams with common fields and optional terrain profile
@@ -348,17 +420,17 @@ namespace OpenFreqAudio
 
         /// <summary>
         /// Calculate noise level and dropout probability from SNR.
-        /// Physics-informed: based on FM threshold effect and thermal noise characteristics.
+        /// Physics-informed: based on modulation type characteristics and thermal noise.
         /// 
         /// MULTI-SCALE FADING MODEL:
-        /// - DropoutProb: Fast flutter (20-80ms, 0-1.2 events/sec) - rapid multipath interference
-        /// - DeepFadeProb: Slow deep fades (400-2000ms, 0-0.3 events/sec) - terrain nulls, severe multipath
+        /// - DropoutRate: Fast flutter (20-80ms, 0-1.2 events/sec) - rapid multipath interference
+        /// - DeepFadeRate: Slow deep fades (400-2000ms, 0-0.3 events/sec) - terrain nulls, severe multipath
         /// </summary>
-        private void CalculateNoiseAndDropout(AudioParams ap, double snrDb, bool isVHF)
+        private void CalculateNoiseAndDropout(AudioParams ap, double snrDb, RadioBandConfig bandConfig)
         {
-            if (isVHF)
+            if (bandConfig.Modulation == ModulationType.AM)
             {
-                // VHF AM: Analog static increases smoothly with decreasing SNR
+                // AM: Analog static increases smoothly with decreasing SNR
                 if (snrDb > 20.0)
                     ap.NoiseLevel = 0.02f; // Clean signal
                 else if (snrDb > 10.0)
@@ -368,9 +440,9 @@ namespace OpenFreqAudio
                 else
                     ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55 → 0.85
             }
-            else
+            else // FM
             {
-                // UHF FM: FM threshold effect - noise suppression until below threshold
+                // FM: FM threshold effect - noise suppression until below threshold
                 if (snrDb > 15.0)
                     ap.NoiseLevel = 0.01f; // Excellent FM quieting
                 else if (snrDb > 10.0)
@@ -395,8 +467,9 @@ namespace OpenFreqAudio
             else
                 dropout = 0.7 + Math.Min(-snrDb / 10.0, 0.5); // 0.7 → 1.2 events/sec
 
-            // VHF is less affected by multipath (longer wavelength)
-            if (isVHF)
+            // Wavelength-dependent multipath: Longer wavelengths less affected
+            // VHF (AM) typically has longer wavelengths than UHF (FM)
+            if (bandConfig.DiffractionCorrection_dB > 0) // Positive correction = better diffraction = longer wavelength
                 dropout *= 0.7;
 
             ap.DropoutRate = (float)Math.Clamp(dropout, 0.0, 1.5);
@@ -415,7 +488,7 @@ namespace OpenFreqAudio
                 deepFade = 0.15 + Math.Min(-snrDb / 10.0, 0.15); // 0.15 → 0.30 events/sec
 
             // UHF more susceptible to deep fades (terrain nulls, shorter wavelength)
-            if (!isVHF)
+            if (bandConfig.DiffractionCorrection_dB < 0) // Negative correction = worse diffraction = shorter wavelength
                 deepFade *= 1.5;
 
             ap.DeepFadeRate = (float)Math.Clamp(deepFade, 0.0, 0.5);
@@ -427,17 +500,18 @@ namespace OpenFreqAudio
         /// No discrete branches - single continuous function for realistic "degradation window".
         /// </summary>
         private void ApplyTerrainDegradation(AudioParams ap, double fresnelClearance, double diffLoss,
-            double baseGainDb, bool isVHF, double rxSensitivity, double worstExcess, double F1_radius)
+            double baseGainDb, RadioBandConfig bandConfig, double rxSensitivity, double worstExcess, double F1_radius)
         {
             _logger.LogDebug($"ApplyTerrainDegradation:");
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
             _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
             _logger.LogDebug($"  baseGainDb: {baseGainDb:F1} dB");
+            _logger.LogDebug($"  Band: {bandConfig.BandName} ({bandConfig.Modulation})");
 
             double effectiveSignalDbm;
             double snrDb;
 
-            double bandwidthHz = isVHF ? 3000.0 : 3400.0;
+            double bandwidthHz = bandConfig.VoiceBandwidth_Hz;
             double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
             double receiverNoiseFigure = 7.0;
             double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
@@ -459,8 +533,8 @@ namespace OpenFreqAudio
                 noiseFloorDbm = thermalNoise + receiverNoiseFigure;
                 snrDb = effectiveSignalDbm - noiseFloorDbm;
 
-                CalculateNoiseAndDropout(ap, snrDb, isVHF);
-                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
+                CalculateNoiseAndDropout(ap, snrDb, bandConfig);
+                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
                 return;
             }
 
@@ -484,36 +558,26 @@ namespace OpenFreqAudio
                 theoreticalDiffractionLoss = KnifeEdgeLoss_dB(v_approx);
             }
 
-            // Apply wavelength-dependent corrections
-            double wavelengthCorrection;
-            if (isVHF)
+            // Apply wavelength-dependent corrections from band config
+            double wavelengthCorrection = bandConfig.DiffractionCorrection_dB;
+            
+            // However, for obstructions beyond 1.5 Fresnel zones,
+            // wavelength advantage diminishes - you can't diffract around a mountain!
+            if (bandConfig.DiffractionCorrection_dB > 0 && fresnelClearance < -0.5)
             {
-                // VHF: Longer wavelength diffracts better than knife-edge theory predicts
-                wavelengthCorrection = -VhfDiffractionBonus_dB;
+                // Start reducing wavelength advantage at 1.5 zones blocked
+                // Use aggressive exponential scaling - essentially eliminates advantage at 2+ zones
+                double excessBlocked = Math.Max(0.0, -fresnelClearance - 0.5); // 0 at -0.5, 1.5 at -2.0
 
-                // However, for obstructions beyond 1.5 Fresnel zones,
-                // wavelength advantage diminishes - you can't diffract around a mountain!
-                if (fresnelClearance < -0.5)
-                {
-                    // Start reducing VHF advantage at 1.5 zones blocked
-                    // Use aggressive exponential scaling - essentially eliminates VHF advantage at 2+ zones
-                    double excessBlocked = Math.Max(0.0, -fresnelClearance - 0.5); // 0 at -0.5, 1.5 at -2.0
+                // Exponential reduction: 2^(-2x) gives very fast decay
+                // At 1.5 zones (-0.5 clearance): factor ≈ 1.0 (no reduction)
+                // At 2.0 zones (-1.0 clearance): factor ≈ 0.25 (75% reduction)
+                // At 2.5 zones (-1.5 clearance): factor ≈ 0.06 (94% reduction)
+                double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
+                wavelengthCorrection *= reductionFactor;
 
-                    // Exponential reduction: 2^(-2x) gives very fast decay
-                    // At 1.5 zones (-0.5 clearance): factor ≈ 1.0 (no reduction)
-                    // At 2.0 zones (-1.0 clearance): factor ≈ 0.25 (75% reduction)
-                    // At 2.5 zones (-1.5 clearance): factor ≈ 0.06 (94% reduction)
-                    double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
-                    wavelengthCorrection *= reductionFactor;
-
-                    _logger.LogDebug(
-                        $"VHF advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
-                }
-            }
-            else
-            {
-                // UHF: Shorter wavelength, more LOS-dependent
-                wavelengthCorrection = UhfDiffractionPenalty_dB;
+                _logger.LogDebug(
+                    $"Wavelength advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
             }
 
             // Combine theoretical loss with wavelength correction
@@ -582,11 +646,11 @@ namespace OpenFreqAudio
                         multiZonePenalty = Math.Min(multiZonePenalty, 80.0);
                     }
 
-                    // VHF gets less relief for massive obstructions
-                    if (isVHF)
-                        multiZonePenalty *= 1;
-                    else
-                        multiZonePenalty *= 1.3; // UHF suffers more from multi-zone blockage
+                    // Wavelength-dependent multi-zone behavior
+                    if (bandConfig.DiffractionCorrection_dB > 0) // Better diffraction (longer wavelength)
+                        multiZonePenalty *= 1.0;
+                    else // Worse diffraction (shorter wavelength)
+                        multiZonePenalty *= 1.3;
 
                     totalTerrainLoss += multiZonePenalty;
 
@@ -598,9 +662,9 @@ namespace OpenFreqAudio
             // Apply terrain loss to base gain
             double finalGainDb = baseGainDb - totalTerrainLoss;
 
-            // UHF hard cutoff: severe obstructions should completely block UHF
+            // Shorter wavelength hard cutoff: severe obstructions should completely block signal
             // When 3+ Fresnel zones are blocked, signal is essentially gone
-            if (!isVHF && fresnelClearance < -2.0) // More than 3 zones blocked
+            if (bandConfig.DiffractionCorrection_dB < 0 && fresnelClearance < -2.0) // More than 3 zones blocked
             {
                 finalGainDb = Math.Min(finalGainDb, MinimumGainDb + 10.0); // Cap at -50 dB
             }
@@ -619,23 +683,35 @@ namespace OpenFreqAudio
             snrDb = effectiveSignalDbm - noiseFloorDbm;
 
             // Calculate noise and dropout from SNR (physics-based)
-            CalculateNoiseAndDropout(ap, snrDb, isVHF);
+            CalculateNoiseAndDropout(ap, snrDb, bandConfig);
 
             // Set bandwidth
-            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
+            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
         }
 
-
-        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, bool isVHF)
+        /// <summary>
+        /// Update noise, dropout, and bandwidth without recalculating gain
+        /// </summary>
+        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, RadioBandConfig bandConfig)
         {
             // Update noise/dropout without recalculating gain
             // (used when gain is already correctly set but we need to recalculate noise/dropout)
 
             // Calculate noise and dropout from SNR (physics-based)
-            CalculateNoiseAndDropout(ap, snrDb, isVHF);
+            CalculateNoiseAndDropout(ap, snrDb, bandConfig);
 
             // Set bandwidth
-            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
+            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
+        }
+
+        /// <summary>
+        /// Legacy method with bool isVHF parameter - maintained for backward compatibility
+        /// </summary>
+        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, bool isVHF)
+        {
+            // Convert bool to band config lookup based on typical frequencies
+            RadioBandConfig bandConfig = isVHF ? bandConfigs[0] : bandConfigs[1];
+            UpdateStaticParamsOnly(ap, snrDb, bandConfig);
         }
 
         public AudioParams CalculateAudioParams(
@@ -646,9 +722,12 @@ namespace OpenFreqAudio
             bool includeTerrainProfile = false,
             bool altitudeIsMSL = false)
         {
+            // Get band configuration for this frequency
+            RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
+            
             // Rent from pool instead of allocating
             var ap = paramsPool.Rent();
-            ap.RadioFrequencyMHz = (float) frequencyMHz;
+            ap.RadioFrequencyMHz = (float)frequencyMHz;
 
             // Stupid C# does not recognize null-safety with the early return;
             double txXVal = txX.Value;
@@ -665,10 +744,9 @@ namespace OpenFreqAudio
                 rxAltVal += SampleElevation(rxXVal, rxYVal);
             }
 
-            bool isVHF = frequencyMHz < VhfUhfBoundaryMHz;
-
-            // Use provided sensitivity or default values
-            double rxSensitivity = receiverSensitivityDbm ?? (isVHF ? -113.0 : -107.0);
+            // Use provided sensitivity or default values based on modulation
+            double rxSensitivity = receiverSensitivityDbm ?? 
+                (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
 
             // Distance between transmitter and receiver
             double dx = rxXVal - txXVal;
@@ -680,7 +758,7 @@ namespace OpenFreqAudio
             if (dist < 1.0)
             {
                 ap.Gain = 1.0f;
-                ap.LowpassHz = isVHF ? 3300f : 3500f;
+                ap.LowpassHz = bandConfig.VoiceBandwidth_Hz;
                 ap.NoiseLevel = 0.01f;
                 ap.DropoutRate = 0.0f;
                 ap.DeepFadeRate = 0.0f;
@@ -712,12 +790,12 @@ namespace OpenFreqAudio
             {
                 double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
-                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, isVHF);
+                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
 
                 // SNR = Received Power - Noise Floor
                 snrDb = prDbm - rxSensitivity;
 
-                CalculateNoiseAndDropout(ap, snrDb, isVHF);
+                CalculateNoiseAndDropout(ap, snrDb, bandConfig);
                 FinalizeAudioParams(ap, dist, snrDb, fspl + weatherLoss, profile, includeTerrainProfile);
                 return ap;
             }
@@ -731,7 +809,7 @@ namespace OpenFreqAudio
             // Cache frequently used calculations outside the loop
             double invDist2D = 1.0 / dist2D;
             double rxMinusTx = rxAltVal - txAltVal;
-            double invTwoEffectiveRadius = 1.0 / (2.0 * effectiveEarthRadius); // FIX: was dividing by half radius
+            double invTwoEffectiveRadius = 1.0 / (2.0 * effectiveEarthRadius);
             double lambdaInv = 1.0 / lambda;
 
             // Find worst obstruction along path
@@ -775,7 +853,7 @@ namespace OpenFreqAudio
             _logger.LogDebug($"  Profile points: {profile.Count}");
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
-            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, isVHF, rxSensitivity, worstExcess,
+            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, bandConfig, rxSensitivity, worstExcess,
                 F1_radius);
 
             // Calculate final path loss and SNR for output
@@ -844,10 +922,13 @@ namespace OpenFreqAudio
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
 
-        private float CalculateDynamicBandwidth(double snrDb, bool isVHF)
+        /// <summary>
+        /// Calculate dynamic bandwidth based on SNR and band configuration
+        /// </summary>
+        private float CalculateDynamicBandwidth(double snrDb, RadioBandConfig bandConfig)
         {
-            // Full bandwidth targets
-            float maxBandwidth = isVHF ? VhfBandwidthHz : UhfBandwidthHz;
+            // Full bandwidth target for this modulation type
+            float maxBandwidth = bandConfig.VoiceBandwidth_Hz;
 
             // Minimum intelligible bandwidth (telephone quality)
             const float minBandwidth = 1200f;
@@ -890,10 +971,12 @@ namespace OpenFreqAudio
 
         public AudioParams GetDefaultAudioParams(double frequencyMHz)
         {
+            RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
+            
             var ap = paramsPool.Rent();
-            ap.RadioFrequencyMHz = (float) frequencyMHz;
+            ap.RadioFrequencyMHz = (float)frequencyMHz;
             ap.Gain = 1.0f;
-            ap.LowpassHz = 3500;
+            ap.LowpassHz = bandConfig.VoiceBandwidth_Hz;
             ap.NoiseLevel = 0f;
             ap.DropoutRate = 0f;
             ap.DeepFadeRate = 0f;

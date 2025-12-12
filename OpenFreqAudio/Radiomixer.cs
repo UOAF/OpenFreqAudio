@@ -92,27 +92,33 @@ public class Radiomixer
         }
     }
 
-    /// <summary>
-    /// Calculate physics-based stepped-on parameters.
-    /// </summary>
-    public static SteppedOnParams CalculateSteppedOnParams(
-        AudioParams tx1,
-        AudioParams tx2,
-        float distance1_km,
-        float distance2_km,
-        float snr1_dB,
-        float snr2_dB)
+public enum ModulationType
+{
+    AM,
+    FM
+}
+
+public static SteppedOnParams CalculateSteppedOnParams(
+    AudioParams tx1,
+    AudioParams tx2,
+    float distance1_km,
+    float distance2_km,
+    float snr1_dB,
+    float snr2_dB,
+    ModulationType modType = ModulationType.AM)  // Add modulation type
+{
+    var result = new SteppedOnParams();
+
+    // === POWER RELATIONSHIP ===
+    float gain1_dB = 20 * MathF.Log10(Math.Max(tx1.Gain, 1e-6f));
+    float gain2_dB = 20 * MathF.Log10(Math.Max(tx2.Gain, 1e-6f));
+    result.PowerDiff_dBm = gain1_dB - gain2_dB;
+
+    float absDiff = MathF.Abs(result.PowerDiff_dBm);
+
+    if (modType == ModulationType.FM)
     {
-        var result = new SteppedOnParams();
-
-        // === POWER RELATIONSHIP ===
-        float gain1_dB = 20 * MathF.Log10(Math.Max(tx1.Gain, 1e-6f));
-        float gain2_dB = 20 * MathF.Log10(Math.Max(tx2.Gain, 1e-6f));
-        result.PowerDiff_dBm = gain1_dB - gain2_dB;
-
-        // === FM CAPTURE RATIO ===
-        float absDiff = MathF.Abs(result.PowerDiff_dBm);
-
+        // === FM CAPTURE RATIO (original logic) ===
         if (absDiff >= 8.0f)
         {
             result.CaptureRatio = result.PowerDiff_dBm > 0 ? 1.0f : 0.0f;
@@ -142,13 +148,64 @@ public class Radiomixer
             result.CaptureRatio = 0.5f + result.PowerDiff_dBm / 3.0f;
             result.InterferenceLevel = 0.75f + (1.5f - absDiff) / 1.5f * 0.20f;
         }
+    }
+    else // AM modulation
+    {
+        // === AM LINEAR MIXING ===
+        // AM doesn't have capture effect - signals mix more linearly
+        
+        if (absDiff >= 30.0f)
+        {
+            // Very large difference: almost complete dominance
+            result.CaptureRatio = result.PowerDiff_dBm > 0 ? 0.98f : 0.02f;
+            result.InterferenceLevel = 0.05f;
+        }
+        else if (absDiff >= 20.0f)
+        {
+            // Strong dominance but still audible interference
+            float t = (absDiff - 20.0f) / 10.0f;
+            result.CaptureRatio = result.PowerDiff_dBm > 0 ? 0.90f + t * 0.08f : 0.10f - t * 0.08f;
+            result.InterferenceLevel = 0.15f - t * 0.10f;
+        }
+        else if (absDiff >= 10.0f)
+        {
+            // Clear dominance with noticeable stepped-on effect
+            float t = (absDiff - 10.0f) / 10.0f;
+            result.CaptureRatio = result.PowerDiff_dBm > 0 ? 0.75f + t * 0.15f : 0.25f - t * 0.15f;
+            result.InterferenceLevel = 0.40f - t * 0.25f;
+        }
+        else if (absDiff >= 6.0f)
+        {
+            // Moderate dominance, strong interference
+            float t = (absDiff - 6.0f) / 4.0f;
+            result.CaptureRatio = result.PowerDiff_dBm > 0 ? 0.65f + t * 0.10f : 0.35f - t * 0.10f;
+            result.InterferenceLevel = 0.60f - t * 0.20f;
+        }
+        else if (absDiff >= 3.0f)
+        {
+            // Slight dominance, heavy garbling
+            float t = (absDiff - 3.0f) / 3.0f;
+            result.CaptureRatio = result.PowerDiff_dBm > 0 ? 0.58f + t * 0.07f : 0.42f - t * 0.07f;
+            result.InterferenceLevel = 0.75f - t * 0.15f;
+        }
+        else
+        {
+            // Nearly equal power: maximum garbling
+            result.CaptureRatio = 0.5f + result.PowerDiff_dBm / 6.0f;  // More gradual than FM
+            result.InterferenceLevel = 0.85f + (3.0f - absDiff) / 3.0f * 0.10f;  // Peak at 0.95
+        }
+    }
 
-        // === RADIO FREQUENCY ===
-        float avgFreqMHz = (tx1.RadioFrequencyMHz + tx2.RadioFrequencyMHz) / 2.0f;
-        result.IsVHF = avgFreqMHz < 200.0f;
+    // === RADIO FREQUENCY ===
+    float avgFreqMHz = (tx1.RadioFrequencyMHz + tx2.RadioFrequencyMHz) / 2.0f;
+    result.IsVHF = avgFreqMHz < 200.0f;
 
-        if (result.IsVHF)
-            result.InterferenceLevel *= 0.85f;
+    // For AM: VHF might have MORE interference due to atmospheric noise
+    // (opposite of FM assumption)
+    if (modType == ModulationType.AM && result.IsVHF)
+        result.InterferenceLevel *= 1.08f;  // Slight increase for VHF AM
+    else if (modType == ModulationType.FM && result.IsVHF)
+        result.InterferenceLevel *= 0.85f;  // Original FM behavior
 
         // === CALCULATE VARIATIONS FOR SAMPLE PLAYBACK ===
 
@@ -194,7 +251,7 @@ public class Radiomixer
     /// Process stepped-on interference by playing the reference sample with variations.
     /// 
     /// APPROACH:
-    /// 1. Play the pre-recorded stepped-on sample (your reference audio)
+    /// 1. Play the pre-recorded stepped-on sample
     /// 2. Vary playback speed based on radio frequency (pitch shift)
     /// 3. Vary amplitude based on signal strength and interference level
     /// 4. Add subtle pitch/amplitude modulation for variation

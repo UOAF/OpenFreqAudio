@@ -622,10 +622,6 @@ public class RadioPlayback
             if (freqConfig.NoiseGenerator == null)
             {
                 freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyMHz);
-                var radioType = frequencyMHz < 100
-                    ? BackgroundNoiseGenerator.RadioType.VHF_AM
-                    : BackgroundNoiseGenerator.RadioType.UHF_FM;
-                freqConfig.NoiseGenerator.SetRadioType(radioType);
                 freqConfig.MinimumGain = FastPathAudioSim.CalculateBackgroundNoiseAmplitude(frequencyMHz);
             }
 
