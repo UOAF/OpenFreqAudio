@@ -89,7 +89,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e);
         _radioPlayback.Initialize(0);
-        _radioPlayback.SetSquelchThreshold(_viewModel.FrequencyMhz, (float) SquelchSliderToDb(ViewModel.Squelch));
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyMhz, ViewModel.Squelch);
         _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Right);
         _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Left);
     }
@@ -452,7 +452,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         _signal2Params = audioParams.Copy();
         
         _radioPlayback.TuneFrequency((float) ViewModel.FrequencyMhz);
-        _radioPlayback.SetSquelchThreshold(ViewModel.FrequencyMhz, (float) SquelchSliderToDb(ViewModel.Squelch));
+        _radioPlayback.SetSquelchLevel(ViewModel.FrequencyMhz, ViewModel.Squelch);
         
         // Convert dB to linear multiplier: 10^(dB/20)
         float linearMultiplier = MathF.Pow(10, ViewModel.SteppedDiffDbm / 20.0f);
@@ -714,13 +714,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        var squelchValue = SquelchSliderToDb(e.NewValue);
-        _radioPlayback.SetSquelchThreshold(_viewModel.FrequencyMhz, (float)squelchValue);
-    }
-
-    private double SquelchSliderToDb(double sliderValue)
-    {
-        double dB = -40 + (sliderValue * 4.0);     // map 0–10 to -40 dB → 0 dB
-        return Math.Pow(10, dB / 20.0);   // convert dB to linear
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyMhz,(float)(e.NewValue / 10));
     }
 }

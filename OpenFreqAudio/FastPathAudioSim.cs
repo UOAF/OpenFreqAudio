@@ -342,7 +342,7 @@ namespace OpenFreqAudio
         public static float CalculateNoiseFloorAmplitude(double frequencyMhz, 
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => cfg.FrequencyMin_MHz >= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
+            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => cfg.FrequencyMin_MHz <= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
                 ?.VoiceBandwidth_Hz ?? 0;
             if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
             
@@ -703,17 +703,7 @@ namespace OpenFreqAudio
             // Set bandwidth
             ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
         }
-
-        /// <summary>
-        /// Legacy method with bool isVHF parameter - maintained for backward compatibility
-        /// </summary>
-        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, bool isVHF)
-        {
-            // Convert bool to band config lookup based on typical frequencies
-            RadioBandConfig bandConfig = isVHF ? bandConfigs[0] : bandConfigs[1];
-            UpdateStaticParamsOnly(ap, snrDb, bandConfig);
-        }
-
+        
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,

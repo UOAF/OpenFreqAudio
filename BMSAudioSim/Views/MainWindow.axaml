@@ -120,9 +120,9 @@
                         
                         <TextBlock Margin="5, 0" Text="Squelch" VerticalAlignment="Center"/>
                         <TextBlock Margin="5, 0" Text="{Binding Squelch}" VerticalAlignment="Center"/>
-                        <Slider Minimum="0" Maximum="10"
+                        <Slider Minimum="0" Maximum="20"
                                 TickPlacement="Outside"
-                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Squelch}"
+                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SquelchSliderValue}"
                                 ValueChanged="OnSquelchSliderChanged" MinWidth="80" VerticalAlignment="Center"/>
                     </StackPanel>
                     

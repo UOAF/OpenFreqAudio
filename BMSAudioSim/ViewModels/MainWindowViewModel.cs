@@ -15,13 +15,26 @@ public class MainWindowViewModel : ReactiveObject
     private int _steppedDiffDbm = 0;
     private bool _signal1Continuous = false;
     private bool _signal2Continuous = false;
-    private int _squelch = 0;
-    
-    public int Squelch
+    private int _squelchSliderValue = 10;
+    private float _squelch = 1.0f;
+
+    public float Squelch
     {
         get => _squelch;
-        set => this.RaiseAndSetIfChanged(ref _squelch, value);
+        private set => this.RaiseAndSetIfChanged(ref _squelch, value);
     }
+
+    public int SquelchSliderValue
+    {
+        get => _squelchSliderValue;
+        set
+        {
+            this.RaiseAndSetIfChanged(ref _squelchSliderValue, value);
+            Squelch = value / 10f;
+        }
+    }
+
+
     public int TXAltitude
     {
         get => _txAltitude;

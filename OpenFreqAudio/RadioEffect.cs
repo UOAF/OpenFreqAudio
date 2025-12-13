@@ -25,8 +25,10 @@ public class RadioEffect
     private readonly object _lock = new();
     private AudioParams _params;
     
-    // User-configurable squelch threshold
-    private float _squelchThreshold = 0.03f;
+    private float _squelchThreshold = 0.1f;
+    
+    // A stream can have good signal but no audio data flowing (i.e. WebRTC streams)
+    private bool _isStreamActive = false;
     
     // Pre-calculated filter coefficients (cached per sample rate)
     private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> _filterCache 
@@ -60,7 +62,12 @@ public class RadioEffect
     private float[] _muffleLP2Channels;
     
     /// <summary>
-    /// Check if squelch is currently open (allowing audio through)
+    /// Check if squelch is currently open (allowing audio through).
+    /// Squelch is open only when we have BOTH:
+    /// 1. Good RF signal strength (based on effectiveGain vs threshold)
+    /// 2. Active audio data flow (based on SetStreamActive calls from RadioPlayback)
+    /// 
+    /// This matches real radio behavior - you need carrier AND modulation.
     /// </summary>
     public bool IsSquelchOpen
     {
@@ -68,7 +75,131 @@ public class RadioEffect
         {
             lock (_lock)
             {
+                bool signalSquelchOpen = _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
+                
+                // True squelch requires BOTH good signal AND active stream
+                return signalSquelchOpen && _isStreamActive;
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Get whether RF signal squelch is open (independent of stream activity).
+    /// Useful for debugging or UI display.
+    /// </summary>
+    public bool IsSignalSquelchOpen
+    {
+        get
+        {
+            lock (_lock)
+            {
                 return _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Get current stream activity state
+    /// </summary>
+    public bool IsStreamActive
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _isStreamActive;
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Notify RadioEffect whether the stream is actively receiving audio data.
+    /// This is separate from RF signal strength - you can have good signal but no data flow.
+    /// Automatically triggers squelch bursts when stream activity changes.
+    /// 
+    /// Call this from RadioPlayback based on:
+    /// - HasReceivedAudio
+    /// - LastAudioReceived timestamp
+    /// - IsStopping flag
+    /// </summary>
+    public void SetStreamActive(bool isActive)
+    {
+        lock (_lock)
+        {
+            // Only trigger burst if state actually changed
+            if (isActive != _isStreamActive)
+            {
+                bool wasActive = _isStreamActive;
+                _isStreamActive = isActive;
+                
+                // Trigger burst for stream activity change
+                // But only if RF signal squelch is also open (avoids double-burst during fades)
+                bool signalSquelchOpen = _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
+                
+                if (signalSquelchOpen)
+                {
+                    _squelchBurstSamplesLeft = SquelchBurstDuration;
+                    Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                    _squelchBurstFilterIndex = 0;
+                    Console.WriteLine($"[RadioEffect] Stream activity: {(wasActive ? "ACTIVE" : "INACTIVE")} → {(isActive ? "ACTIVE" : "INACTIVE")} (burst triggered)");
+                }
+                else
+                {
+                    Console.WriteLine($"[RadioEffect] Stream activity: {(wasActive ? "ACTIVE" : "INACTIVE")} → {(isActive ? "ACTIVE" : "INACTIVE")} (no burst - signal squelch closed)");
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Get the current squelch threshold value
+    /// </summary>
+    public float GetSquelchThreshold()
+    {
+        lock (_lock)
+        {
+            return _squelchThreshold;
+        }
+    }
+    
+    /// <summary>
+    /// Set the squelch threshold. Values are clamped to 0.001-1.0 range.
+    /// </summary>
+    public void SetSquelchThreshold(float threshold)
+    {
+        lock (_lock)
+        {
+            float oldThreshold = _squelchThreshold;
+            _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
+            
+            // Re-evaluate squelch state with new threshold
+            bool wasWeak = _prevEffectiveGain < oldThreshold;
+            bool isWeak = _prevEffectiveGain < _squelchThreshold;
+            
+            // Handle all states - signal crossed threshold
+            if (wasWeak && !isWeak)
+            {
+                // Signal is now strong enough - open squelch regardless of current state
+                _squelchState = SquelchState.Opening;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchAttackSamples;
+                
+                // Trigger squelch burst
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
+            }
+            else if (!wasWeak && isWeak)
+            {
+                // Signal is now too weak - close squelch regardless of current state
+                _squelchState = SquelchState.Closing;
+                _squelchTransitionSamples = 0;
+                _squelchTransitionLength = SquelchReleaseSamples;
+                
+                // Trigger squelch burst
+                _squelchBurstSamplesLeft = SquelchBurstDuration;
+                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
+                _squelchBurstFilterIndex = 0;
             }
         }
     }
@@ -220,49 +351,9 @@ public class RadioEffect
     }
 
     /// <summary>
-    /// Set the squelch threshold for this RadioEffect
-    /// </summary>
-    public void SetSquelchThreshold(float threshold)
-    {
-        lock (_lock)
-        {
-            float oldThreshold = _squelchThreshold;
-            _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
-            
-            // Re-evaluate squelch state with new threshold
-            bool wasWeak = _prevEffectiveGain < oldThreshold;
-            bool isWeak = _prevEffectiveGain < _squelchThreshold;
-            
-            // Handle all states - signal crossed threshold
-            if (wasWeak && !isWeak)
-            {
-                // Signal is now strong enough - open squelch regardless of current state
-                _squelchState = SquelchState.Opening;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchAttackSamples;
-                
-                // Trigger squelch burst
-                _squelchBurstSamplesLeft = SquelchBurstDuration;
-                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
-                _squelchBurstFilterIndex = 0;
-            }
-            else if (!wasWeak && isWeak)
-            {
-                // Signal is now too weak - close squelch regardless of current state
-                _squelchState = SquelchState.Closing;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchReleaseSamples;
-                
-                // Trigger squelch burst
-                _squelchBurstSamplesLeft = SquelchBurstDuration;
-                Array.Clear(_squelchBurstFilterHistory, 0, _squelchBurstFilterHistory.Length);
-                _squelchBurstFilterIndex = 0;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Manually trigger a squelch burst (for transmission start/stop)
+    /// Manually trigger a squelch burst (for external events like frequency changes).
+    /// NOTE: Normal squelch transitions and stream activity changes trigger bursts automatically.
+    /// This should rarely be needed.
     /// </summary>
     public void TriggerSquelchBurst()
     {
