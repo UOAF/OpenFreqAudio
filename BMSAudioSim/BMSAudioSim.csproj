@@ -13,44 +13,60 @@
         <AvaloniaResource Include="Assets\**"/>
     </ItemGroup>
 
-    
     <ItemGroup>
-        <Content Include="Assets/common/*">
+        <Content Include="Assets/audio2.ogg">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>%(Filename)%(Extension)</TargetPath>
         </Content>
-        <Content Include="Assets/windows/*">
+        <Content Include="Assets/countdown.ogg">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        </Content>
-        <Content Include="Assets/linux/*">
-            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <TargetPath>%(Filename)%(Extension)</TargetPath>
         </Content>
     </ItemGroup>
-    
-    <ItemGroup>    
+
+    <ItemGroup>
         <PackageReference Include="Avalonia" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Desktop" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.8"/>
-        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
-        <PackageReference Include="PanAndZoom" Version="11.3.6" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0"/>
+        <PackageReference Include="PanAndZoom" Version="11.3.6"/>
         <PackageReference Include="ReactiveUI.Avalonia" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Diagnostics" Version="11.3.8">
-            
+
             <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
             <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
         </PackageReference>
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.1"/>
-        <PackageReference Include="NAudio.Core" Version="2.2.1" />
-        <PackageReference Include="Serilog" Version="4.3.0" />
-        <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
-        <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+        <PackageReference Include="NAudio.Core" Version="2.2.1"/>
+        <PackageReference Include="Serilog" Version="4.3.0"/>
+        <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0"/>
+        <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1"/>
         <!-- Explicit SkiaSharp 3.x to fix version conflict -->
-        <PackageReference Include="SkiaSharp" Version="3.119.0" />
-        <PackageReference Include="ScottPlot.Avalonia" Version="5.1.57" />
-        <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.1" />
+        <PackageReference Include="SkiaSharp" Version="3.119.0"/>
+        <PackageReference Include="ScottPlot.Avalonia" Version="5.1.57"/>
+        <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.1"/>
     </ItemGroup>
-    
+
     <ItemGroup>
-      <ProjectReference Include="..\OpenFreqAudio\OpenFreqAudio.csproj" />
+        <ProjectReference Include="..\OpenFreqAudio\OpenFreqAudio.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' OR '$(RuntimeIdentifier)' == 'win-x86' OR '$(RuntimeIdentifier)' == 'win-arm64'">
+        <Content Include="../OpenFreqAudio/Assets/windows/**/*">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+            <TargetPath>%(Filename)%(Extension)</TargetPath>
+            <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+        </Content>
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' OR '$(RuntimeIdentifier)' == 'linux-arm64'">
+        <Content Include="../OpenFreqAudio/Assets/linux/**/*">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+            <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+            <TargetPath>%(Filename)%(Extension)</TargetPath>
+            <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+        </Content>
     </ItemGroup>
 </Project>
