@@ -11,6 +11,7 @@
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using Microsoft.Extensions.Logging;
+// ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio
 {
@@ -57,7 +58,7 @@ namespace OpenFreqAudio
     public class AudioParamsPool
     {
         private readonly ConcurrentBag<AudioParams> _pool = new();
-        private int _count = 0;
+        private int _count;
         private readonly int _maxPoolSize;
 
         public AudioParamsPool(int maxPoolSize = 100)
@@ -77,8 +78,6 @@ namespace OpenFreqAudio
 
         public void Return(AudioParams obj)
         {
-            if (obj == null) return;
-
             // Reset the object
             obj.Gain = 0;
             obj.LowpassHz = 0;
@@ -95,7 +94,7 @@ namespace OpenFreqAudio
             if (_count < _maxPoolSize)
             {
                 _pool.Add(obj);
-                System.Threading.Interlocked.Increment(ref _count);
+                Interlocked.Increment(ref _count);
             }
         }
     }
@@ -165,8 +164,8 @@ namespace OpenFreqAudio
 
         public void Dispose()
         {
-            accessor?.Dispose();
-            mmf?.Dispose();
+            accessor.Dispose();
+            mmf.Dispose();
         }
     }
 
@@ -211,7 +210,7 @@ namespace OpenFreqAudio
         private readonly AudioParamsPool paramsPool;
 
         public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters,
-            ILogger<FastPathAudioSim> logger, AudioParamsPool paramsPool = null)
+            ILogger<FastPathAudioSim> logger, AudioParamsPool? paramsPool = null)
         {
             this.dem = dem;
             this.originX = originX;
@@ -503,7 +502,7 @@ namespace OpenFreqAudio
         /// No discrete branches - single continuous function for realistic "degradation window".
         /// </summary>
         private void ApplyTerrainDegradation(AudioParams ap, double fresnelClearance, double diffLoss,
-            double baseGainDb, RadioBandConfig bandConfig, double rxSensitivity, double worstExcess, double F1_radius)
+            double baseGainDb, RadioBandConfig bandConfig, double rxSensitivity)
         {
             _logger.LogDebug($"ApplyTerrainDegradation:");
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
@@ -615,8 +614,6 @@ namespace OpenFreqAudio
             if (fresnelClearance < 0.4 && diffLoss > 15.0)
             {
                 // Calculate how many Fresnel radii the terrain penetrates into obstruction zone
-                // fresnelClearance = 1.0 - (worstExcess / F1_radius)
-                // So: totalPenetration = worstExcess / F1_radius = 1.0 - fresnelClearance (when negative)
                 double totalPenetration = Math.Max(0.0, 1.0 - fresnelClearance);
 
                 // Knife-edge theory handles up to ~0.6 clearance (40% obstruction)
@@ -715,6 +712,11 @@ namespace OpenFreqAudio
             bool includeTerrainProfile = false,
             bool altitudeIsMSL = false)
         {
+            if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
+            {
+                return GetDefaultAudioParams(frequencyMHz);
+            }
+
             // Get band configuration for this frequency
             RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
 
@@ -846,8 +848,7 @@ namespace OpenFreqAudio
             _logger.LogDebug($"  Profile points: {profile.Count}");
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
-            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, bandConfig, rxSensitivity, worstExcess,
-                F1_radius);
+            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, bandConfig, rxSensitivity);
 
             // Calculate final path loss and SNR for output
             double pathLossDb = fspl + weatherLoss + (baseGainDb - 20.0 * Math.Log10(Math.Max(ap.Gain, 1e-6)));
@@ -876,7 +877,7 @@ namespace OpenFreqAudio
             // Atmospheric refractivity constants
             const double N_s = 324.8; // Average global surface refractivity (Altshuler)
             const double h_b = 12192; // Breakpoint altitude in meters (~40k ft)
-            const double N_b = 66.65; // Breakpoint refractivity
+            // const double N_b = 66.65; // Breakpoint refractivity
             const double LogNsOverNb = 1.5829767628777844; // Precomputed Math.Log(N_s / N_b)
 
             double H_b = (h_b - receiverAltitude) / LogNsOverNb;
@@ -931,13 +932,15 @@ namespace OpenFreqAudio
                 // Excellent signal - full bandwidth
                 return maxBandwidth;
             }
-            else if (snrDb > 10.0)
+
+            if (snrDb > 10.0)
             {
                 // Good signal - slight HF rolloff (3000 → 2600 Hz)
                 float reduction = (float)((20.0 - snrDb) / 10.0 * 0.15); // 0% → 15% reduction
                 return maxBandwidth * (1f - reduction);
             }
-            else if (snrDb > 5.0)
+
+            if (snrDb > 5.0)
             {
                 // Marginal signal - noticeable narrowing (2600 → 2000 Hz)
                 float startBw = maxBandwidth * 0.85f;
@@ -945,7 +948,8 @@ namespace OpenFreqAudio
                 float t = (float)((10.0 - snrDb) / 5.0);
                 return startBw + t * (endBw - startBw);
             }
-            else if (snrDb > 0.0)
+
+            if (snrDb > 0.0)
             {
                 // Poor signal - telephone quality (2000 → 1500 Hz)
                 float startBw = maxBandwidth * 0.60f;
@@ -958,7 +962,7 @@ namespace OpenFreqAudio
                 // Very poor - minimal intelligibility (1500 → 1200 Hz)
                 float startBw = maxBandwidth * 0.45f;
                 float reduction = (float)Math.Min(-snrDb / 10.0, 0.2); // Additional 20% max
-                return Math.Max(minBandwidth, startBw * (1f - (float)reduction));
+                return Math.Max(minBandwidth, startBw * (1f - reduction));
             }
         }
 

@@ -1,5 +1,7 @@
-using BMSAudioSim.Models;
+using System.Reflection;
 using ManagedBass;
+using OpenFreqAudio.Models;
+
 // ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio;
@@ -24,16 +26,41 @@ public class Radiomixer
     private double _pitchModPhase;
     private double _ampModPhase;
 
+    private static byte[] ReadStreamToByteArray(Stream stream)
+    {
+        using (MemoryStream memoryStream = new MemoryStream())
+        {
+            stream.CopyTo(memoryStream);
+            return memoryStream.ToArray();
+        }
+    }
+    
     /// <summary>
     /// Load the stepped-on interference sample from file using BASS.
     /// Call this once at startup. Supports any format BASS supports (WAV, OGG, MP3, etc).
     /// </summary>
-    public static void LoadSteppedOnSample(string filePath)
+    
+    public static void LoadSteppedOnSample()
     {
-        Console.WriteLine($"[RadioMixer] Loading stepped-on sample from: {filePath}");
+        var assembly = Assembly.GetExecutingAssembly();
+        const string resourceName = "OpenFreqAudio.Assets.stepped-on.ogg";
+        byte[] audioData;
 
+        // Access the embedded resource as a stream
+        using (var resourceStream = assembly.GetManifestResourceStream(resourceName))
+        {
+            if (resourceStream != null)
+            {
+                audioData = ReadStreamToByteArray(resourceStream);
+            }
+            else
+            {
+                throw new Exception("Resource not found: " + resourceName);
+            }
+        }
+        
         // Create a decode stream (no playback, just for reading data)
-        int stream = Bass.CreateStream(filePath, 0, 0, BassFlags.Decode | BassFlags.Float);
+        int stream = Bass.CreateStream(audioData, 0, audioData.Length, BassFlags.Decode | BassFlags.Float);
 
         if (stream == 0)
         {

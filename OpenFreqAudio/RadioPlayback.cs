@@ -192,6 +192,7 @@ public class RadioPlayback
 
     private class FrequencyConfig
     {
+        // ReSharper disable UnusedAutoPropertyAccessor.Local
         public float Volume { get; set; } = 1.0f;
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
         public Radiomixer Mixer { get; set; } = new();
@@ -203,9 +204,9 @@ public class RadioPlayback
         
         // Physics-based default - will be set to noise floor when frequency is tuned
         public float DefaultSquelchThreshold { get; set; } = 0.1f; // Fallback if not yet calculated
-
         public bool IsNoiseMuted { get; set; }
         public float SquelchLevel { get; set; }
+        // ReSharper restore UnusedAutoPropertyAccessor.Local
     }
 
     public enum AudioChannel
@@ -252,7 +253,7 @@ public class RadioPlayback
             }
         }
 
-        Radiomixer.LoadSteppedOnSample("stepped-on.ogg");
+        Radiomixer.LoadSteppedOnSample();
     }
 
     public void StartStream(string streamId, string filePath, AudioParams audioParams)
@@ -658,12 +659,10 @@ public class RadioPlayback
     {
         lock (_lock)
         {
-            if (_frequencies.ContainsKey(frequencyMHz))
-            {
-                _frequencies[frequencyMHz].IsTuned = false;
-                bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
-                if (!hasTuned && _streams.Count == 0 && _masterStream != 0) StopMasterStream();
-            }
+            if (!_frequencies.TryGetValue(frequencyMHz, out var frequency)) return;
+            frequency.IsTuned = false;
+            bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
+            if (!hasTuned && _streams.Count == 0 && _masterStream != 0) StopMasterStream();
         }
     }
     

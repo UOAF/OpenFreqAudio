@@ -1,6 +1,5 @@
-using System;
-
-namespace BMSAudioSim.Models;
+// ReSharper disable InconsistentNaming
+namespace OpenFreqAudio.Models;
 
 /// <summary>
 /// Parameters for physics-based stepped-on transmission simulation.
