@@ -1,3 +1,4 @@
+// ReSharper disable InconsistentNaming
 namespace OpenFreqAudio;
 
 /// <summary>
@@ -9,21 +10,15 @@ public class RadioPreFilter
     private readonly BiquadFilter _highPass;
     private readonly BiquadFilter _lowPass;
     private readonly BiquadFilter _noiseLowPass;
-    private readonly Random _rng = new Random();
+    private readonly Random _rng = new();
 
-    public readonly double BandwidthHz;
-    
     // AGC state
     private float _agcEnvelope = 0.1f; // Start with reasonable value
     
-    private volatile float _noiseLevel = 0f;
-    private readonly int _sampleRate;
+    private volatile float _noiseLevel;
 
     public RadioPreFilter(int sampleRate, double bandwidthHz = 3000.0)
     {
-        _sampleRate = sampleRate;
-        BandwidthHz = bandwidthHz;
-        
         // Standard voice band filters
         float lowCut = 300f;
         float highCut = (float)bandwidthHz;
@@ -38,7 +33,7 @@ public class RadioPreFilter
     /// <summary>
     /// Fast tanh approximation using rational function (Padé approximant)
     /// 
-    /// Accuracy: Max error < 0.001 in [-3, 3] (imperceptible in audio)
+    /// Accuracy: Max error lesser than 0.001 in [-3, 3] (imperceptible in audio)
     /// Speed: 3-5x faster than MathF.Tanh()
     /// 
     /// Based on Padé [3/2] approximation:
@@ -127,15 +122,9 @@ public class RadioPreFilter
         }
     }
 
-    private class BiquadFilter
+    private class BiquadFilter(float a0, float a1, float a2, float b1, float b2)
     {
-        private readonly float a0, a1, a2, b1, b2;
-        private float z1, z2;
-        
-        public BiquadFilter(float a0, float a1, float a2, float b1, float b2)
-        {
-            this.a0 = a0; this.a1 = a1; this.a2 = a2; this.b1 = b1; this.b2 = b2;
-        }
+        private float _z1, _z2;
 
         public static BiquadFilter LowPass(int sr, float freq, float q)
         {
@@ -163,9 +152,9 @@ public class RadioPreFilter
 
         public float Transform(float x)
         {
-            float y = a0 * x + z1;
-            z1 = a1 * x + z2 - b1 * y;
-            z2 = a2 * x - b2 * y;
+            float y = a0 * x + _z1;
+            _z1 = a1 * x + _z2 - b1 * y;
+            _z2 = a2 * x - b2 * y;
             return y;
         }
     }

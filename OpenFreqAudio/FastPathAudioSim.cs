@@ -17,15 +17,16 @@ namespace OpenFreqAudio
     // ================================================================
     // Radio modulation and band configuration
     // ================================================================
-    
+
     /// <summary>
     /// Radio modulation type - affects bandwidth, noise characteristics, and future capture/threshold modeling
     /// </summary>
     public enum ModulationType
     {
-        AM, FM
+        AM,
+        FM
     }
-    
+
     /// <summary>
     /// Configuration for a radio band's physical characteristics
     /// </summary>
@@ -37,8 +38,8 @@ namespace OpenFreqAudio
         public float VoiceBandwidth_Hz { get; init; }
         public double DiffractionCorrection_dB { get; init; }
         public ModulationType Modulation { get; init; }
-        
-        public RadioBandConfig(string bandName, double freqMin, double freqMax, 
+
+        public RadioBandConfig(string bandName, double freqMin, double freqMax,
             float bandwidth, double diffractionDb, ModulationType modulation)
         {
             BandName = bandName;
@@ -187,17 +188,17 @@ namespace OpenFreqAudio
                 bandName: "VHF",
                 freqMin: 30.0,
                 freqMax: 199.99,
-                bandwidth: 3000.0f,           
-                diffractionDb: 3.0,           // Better diffraction than UHF
+                bandwidth: 3000.0f,
+                diffractionDb: 3.0, // Better diffraction than UHF
                 modulation: ModulationType.AM
             ),
-            
+
             new RadioBandConfig(
                 bandName: "UHF",
                 freqMin: 200,
                 freqMax: 520.0,
-                bandwidth: 3000.0f,           
-                diffractionDb: -7.0,          // More LOS-dependent
+                bandwidth: 3000.0f,
+                diffractionDb: -7.0, // More LOS-dependent
                 modulation: ModulationType.FM
             )
         };
@@ -232,7 +233,7 @@ namespace OpenFreqAudio
                     return config;
                 }
             }
-            
+
             // Default fallback to VHF-like characteristics if frequency doesn't match any band
             return bandConfigs[0];
         }
@@ -304,10 +305,11 @@ namespace OpenFreqAudio
         public static float CalculateBackgroundNoiseAmplitude(double frequencyMhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => frequencyMhz >= cfg.FrequencyMin_MHz && frequencyMhz <= cfg.FrequencyMax_MHz)
+            var bandwidthHz = bandConfigs.FirstOrDefault(cfg =>
+                    frequencyMhz >= cfg.FrequencyMin_MHz && frequencyMhz <= cfg.FrequencyMax_MHz)
                 ?.VoiceBandwidth_Hz ?? 0;
             if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
-            
+
             // Default sensitivities based on modulation type
             double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
 
@@ -339,13 +341,14 @@ namespace OpenFreqAudio
         /// <param name="frequencyMhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
         /// <param name="modulation">Modulation type (affects default sensitivity)</param>
-        public static float CalculateNoiseFloorAmplitude(double frequencyMhz, 
+        public static float CalculateNoiseFloorAmplitude(double frequencyMhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = bandConfigs .FirstOrDefault(cfg => cfg.FrequencyMin_MHz <= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
+            var bandwidthHz = bandConfigs.FirstOrDefault(cfg =>
+                    cfg.FrequencyMin_MHz <= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
                 ?.VoiceBandwidth_Hz ?? 0;
             if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
-            
+
             // Default sensitivities based on modulation type
             double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
 
@@ -560,7 +563,7 @@ namespace OpenFreqAudio
 
             // Apply wavelength-dependent corrections from band config
             double wavelengthCorrection = bandConfig.DiffractionCorrection_dB;
-            
+
             // However, for obstructions beyond 1.5 Fresnel zones,
             // wavelength advantage diminishes - you can't diffract around a mountain!
             if (bandConfig.DiffractionCorrection_dB > 0 && fresnelClearance < -0.5)
@@ -703,7 +706,7 @@ namespace OpenFreqAudio
             // Set bandwidth
             ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
         }
-        
+
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
@@ -714,7 +717,7 @@ namespace OpenFreqAudio
         {
             // Get band configuration for this frequency
             RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
-            
+
             // Rent from pool instead of allocating
             var ap = paramsPool.Rent();
             ap.RadioFrequencyMHz = (float)frequencyMHz;
@@ -735,8 +738,8 @@ namespace OpenFreqAudio
             }
 
             // Use provided sensitivity or default values based on modulation
-            double rxSensitivity = receiverSensitivityDbm ?? 
-                (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
+            double rxSensitivity = receiverSensitivityDbm ??
+                                   (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
 
             // Distance between transmitter and receiver
             double dx = rxXVal - txXVal;
@@ -962,7 +965,7 @@ namespace OpenFreqAudio
         public AudioParams GetDefaultAudioParams(double frequencyMHz)
         {
             RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
-            
+
             var ap = paramsPool.Rent();
             ap.RadioFrequencyMHz = (float)frequencyMHz;
             ap.Gain = 1.0f;

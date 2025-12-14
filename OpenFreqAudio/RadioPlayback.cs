@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using ManagedBass;
+// ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio;
 
@@ -21,19 +22,19 @@ public class RadioPlayback
         public double FrequencyMHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
         public int Channels { get; set; } // 1=mono,2=stereo
-        public bool IsPush { get; set; } = false; // true for WebRTC / pushed audio
-        public RadioEffect RadioEffect { get; set; }
-        public RadioPreFilter RadioPreFilter { get; set; }
-        public AudioParams CurrentParams { get; set; }
+        public bool IsPush { get; set; } // true for WebRTC / pushed audio
+        public required RadioEffect RadioEffect { get; set; }
+        public required RadioPreFilter RadioPreFilter { get; set; }
+        public required AudioParams CurrentParams { get; set; }
 
         // For decoded or pulled audio we reuse Buffer as a temporary buffer
         public float[] Buffer { get; set; } = new float[8192];
 
         // Ring buffer used by both push streams and file-reader task
         public float[] RingBuffer { get; set; } = Array.Empty<float>();
-        private int _ringWritePos = 0;
-        private int _ringReadPos = 0;
-        private int _ringCount = 0; // number of floats in buffer
+        private int _ringWritePos;
+        private int _ringReadPos;
+        private int _ringCount; // number of floats in buffer
         private readonly object _ringLock = new();
 
         // For file-based streams we run a reader task that decodes and pushes into the ring
@@ -43,7 +44,7 @@ public class RadioPlayback
         public bool IsStopping { get; set; }
         public int StoppingBurstSamplesLeft { get; set; }
 
-        public bool HasReceivedAudio { get; set; } = false;
+        public bool HasReceivedAudio { get; set; }
         public DateTime LastAudioReceived { get; set; } = DateTime.MinValue;
         public int ValidSamples { get; set; }
 
@@ -179,6 +180,7 @@ public class RadioPlayback
             }
             catch
             {
+                // we don't care for any errors here
             }
             finally
             {
@@ -192,12 +194,12 @@ public class RadioPlayback
     {
         public float Volume { get; set; } = 1.0f;
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
-        public Radiomixer Mixer { get; set; } = new Radiomixer();
-        public bool IsTuned { get; set; } = false;
-        public BackgroundNoiseGenerator? NoiseGenerator { get; set; } = null;
-        public float NoiseFadeGain { get; set; } = 0f;
+        public Radiomixer Mixer { get; set; } = new();
+        public bool IsTuned { get; set; }
+        public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
+        public float NoiseFadeGain { get; set; }
         public double MinimumGain { get; set; }
-        public bool WasHearableLastFrame { get; set; } = false;
+        public bool WasHearableLastFrame { get; set; }
         
         // Physics-based default - will be set to noise floor when frequency is tuned
         public float DefaultSquelchThreshold { get; set; } = 0.1f; // Fallback if not yet calculated
@@ -219,7 +221,6 @@ public class RadioPlayback
 
     private int _masterStream;
     private DSPProcedure? _dspProc;
-    private bool _dspSetup = false;
 
     private const int MaxBufferSize = 24576;
     private float[] _dspScratch = new float[MaxBufferSize];
@@ -234,7 +235,7 @@ public class RadioPlayback
 
     private const int NoiseFadeSamples = 2400;
 
-    private static bool _bassInitialized = false;
+    private static bool _bassInitialized;
     private static readonly object _bassInitLock = new();
 
     public RadioPlayback(bool skipBassInitialization)
@@ -557,23 +558,26 @@ public class RadioPlayback
 
     public async Task StopStream(string streamId)
     {
-        lock (_lock)
+        await Task.Run(() =>
         {
-            if (!_streams.TryGetValue(streamId, out var stream)) return;
-            
-            float threshold = stream.RadioEffect.GetSquelchThreshold();
-            
-            if (stream.CurrentParams.Gain >= threshold && threshold > 0.01f)
+            lock (_lock)
             {
-                stream.IsStopping = true;
-                stream.StoppingBurstSamplesLeft = 720;
-                stream.RadioEffect.TriggerSquelchBurst();
+                if (!_streams.TryGetValue(streamId, out var stream)) return;
+
+                float threshold = stream.RadioEffect.GetSquelchThreshold();
+
+                if (stream.CurrentParams.Gain >= threshold && threshold > 0.01f)
+                {
+                    stream.IsStopping = true;
+                    stream.StoppingBurstSamplesLeft = 720;
+                    stream.RadioEffect.TriggerSquelchBurst();
+                }
+                else
+                {
+                    StopStreamInternal(streamId);
+                }
             }
-            else
-            {
-                StopStreamInternal(streamId);
-            }
-        }
+        });
     }
 
     private void StopStreamInternal(string streamId)
@@ -662,24 +666,6 @@ public class RadioPlayback
             }
         }
     }
-
-    private void SetSquelchThreshold(double frequencyMHz, float threshold)
-    {
-        lock (_lock)
-        {
-            // Apply to all existing streams on this frequency
-            foreach (var s in _streams.Values.Where(s => Math.Abs(s.FrequencyMHz - frequencyMHz) < 0.01))
-            {
-                s.RadioEffect.SetSquelchThreshold(threshold);
-            }
-            
-            // Store for new streams that will be created on this frequency
-            if (!_frequencies.ContainsKey(frequencyMHz))
-                _frequencies[frequencyMHz] = new FrequencyConfig();
-            
-            _frequencies[frequencyMHz].DefaultSquelchThreshold = threshold;
-        }
-    }
     
     public void SetSquelchLevel(double frequencyMHz, float squelchLevel)
     {
@@ -706,9 +692,6 @@ public class RadioPlayback
         
             // Store for new streams
             freqConfig.DefaultSquelchThreshold = effectiveThreshold;
-        
-            Console.WriteLine($"[SetSquelchLevel] {frequencyMHz} MHz: Level={squelchLevel:F2}, " +
-                              $"Noise={freqConfig.MinimumGain:F3}, Threshold={effectiveThreshold:F3}");
         }
     }
 
@@ -802,7 +785,7 @@ public class RadioPlayback
 
     private void StartMasterStream()
     {
-        StreamProcedure streamProc = (handle, buffer, length, user) =>
+        StreamProcedure streamProc = (_, buffer, length, _) =>
         {
             if (buffer != IntPtr.Zero)
             {
@@ -820,7 +803,6 @@ public class RadioPlayback
         _masterStream = Bass.CreateStream(_sampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
         if (_masterStream == 0) throw new Exception($"BASS error creating master stream: {Bass.LastError}");
         SetupDSPAndPlay();
-        _dspSetup = true;
     }
 
     private void StopMasterStream()
@@ -830,13 +812,12 @@ public class RadioPlayback
             Bass.ChannelStop(_masterStream);
             Bass.StreamFree(_masterStream);
             _masterStream = 0;
-            _dspSetup = false;
         }
     }
 
     private void SetupDSPAndPlay()
     {
-        _dspProc = (handle, channel, bufferPtr, length, user) =>
+        _dspProc = (_, _, bufferPtr, length, _) =>
         {
             int samples = length / sizeof(float);
 
@@ -1030,7 +1011,6 @@ public class RadioPlayback
                     if (stream.StoppingBurstSamplesLeft <= 0)
                     {
                         streamsToRemove.Add(stream.StreamId);
-                        continue;
                     }
                 }
             }
@@ -1115,7 +1095,7 @@ public class RadioPlayback
             }
         };
 
-        Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero, 0);
+        Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
         Bass.ChannelPlay(_masterStream);
     }
 
@@ -1139,7 +1119,7 @@ public class RadioPlayback
 
     public List<string> GetStreamsOnFrequency(double f)
     {
-        lock (_lock) return _streams.Values.Where(s => s.FrequencyMHz == f).Select(s => s.StreamId).ToList();
+        lock (_lock) return _streams.Values.Where(s => Math.Abs(s.FrequencyMHz - f) < 0.001).Select(s => s.StreamId).ToList();
     }
 
     public bool IsStreamActive(string id)
@@ -1179,7 +1159,6 @@ public class RadioPlayback
                 Bass.ChannelStop(_masterStream);
                 Bass.StreamFree(_masterStream);
                 _masterStream = 0;
-                _dspSetup = false;
             }
 
             Bass.CurrentDevice = newDeviceIndex;

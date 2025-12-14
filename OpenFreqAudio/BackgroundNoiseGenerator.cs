@@ -1,3 +1,5 @@
+// ReSharper disable InconsistentNaming
+
 namespace OpenFreqAudio;
 
 /// <summary>
@@ -15,48 +17,17 @@ public class BackgroundNoiseGenerator
 
     // Pink noise using Voss-McCartney dice-rolling algorithm
     // Instead of 7 multiplies + 7 adds per sample, averages ~2 operations
-    private int _pinkNoiseCounter = 0;
-    private float _pinkNoiseSum = 0f;
+    private int _pinkNoiseCounter;
+    private float _pinkNoiseSum;
     private readonly float[] _pinkNoiseDice = new float[5]; // 5 dice for good spectral balance
 
     // VHF crackle generator state
-    private int _vhfCrackleSamplesLeft = 0;
-    private float _vhfCrackleAmplitude = 0f;
+    private int _vhfCrackleSamplesLeft;
+    private float _vhfCrackleAmplitude;
 
     // Low-frequency modulation for more organic feel
-    private double _modulationPhase = 0;
+    private double _modulationPhase;
     private const double ModulationFrequency = 3.0; // Hz
-
-    // Sine lookup table for modulation
-    private static class SineLookup
-    {
-        private const int TableSize = 2048;
-        private static readonly float[] _table;
-        private const float IndexScale = TableSize / (2f * MathF.PI);
-        private const int IndexMask = TableSize - 1;
-
-        static SineLookup()
-        {
-            _table = new float[TableSize];
-            for (int i = 0; i < TableSize; i++)
-            {
-                _table[i] = MathF.Sin(i * 2f * MathF.PI / TableSize);
-            }
-        }
-
-        public static float Sin(double x)
-        {
-            float xf = (float)(x % (2.0 * Math.PI));
-            if (xf < 0) xf += 2f * MathF.PI;
-
-            float indexF = xf * IndexScale;
-            int index = (int)indexF & IndexMask;
-            float frac = indexF - index;
-
-            int nextIndex = (index + 1) & IndexMask;
-            return _table[index] * (1f - frac) + _table[nextIndex] * frac;
-        }
-    }
 
     public enum RadioType
     {
@@ -65,7 +36,7 @@ public class BackgroundNoiseGenerator
         UHF_FM
     }
 
-    private RadioType _radioType = RadioType.UHF_FM;
+    private RadioType _radioType;
 
     public BackgroundNoiseGenerator(int sampleRate, int channels, double frequencyMhz)
     {
@@ -122,7 +93,7 @@ public class BackgroundNoiseGenerator
                 if (_modulationPhase > 2.0 * Math.PI)
                     _modulationPhase -= 2.0 * Math.PI;
 
-                float modulation = 0.85f + 0.15f * SineLookup.Sin(_modulationPhase);
+                float modulation = (float)(0.85f + 0.15f * Math.Sin(_modulationPhase));
                 noiseSample *= modulation;
             }
 
@@ -161,7 +132,7 @@ public class BackgroundNoiseGenerator
         if (_vhfCrackleSamplesLeft > 0)
         {
             // Decaying crackle envelope
-            float envelope = (float)_vhfCrackleSamplesLeft / 200f;
+            float envelope = _vhfCrackleSamplesLeft / 200f;
             envelope = MathF.Pow(envelope, 2.0f); // Exponential decay
 
             // Sharp, noisy crackle
@@ -182,7 +153,7 @@ public class BackgroundNoiseGenerator
     {
         // Pink noise base
         float pinkNoise = GeneratePinkNoiseFast();
-    
+
         // Lighter, less frequent crackles than VHF
         if (_vhfCrackleSamplesLeft <= 0)
         {
@@ -193,21 +164,21 @@ public class BackgroundNoiseGenerator
                 _vhfCrackleAmplitude = 0.2f + (float)_rng.NextDouble() * 0.3f; // Medium intensity
             }
         }
-    
+
         float crackle = 0f;
         if (_vhfCrackleSamplesLeft > 0)
         {
-            float envelope = (float)_vhfCrackleSamplesLeft / 150f;
+            float envelope = _vhfCrackleSamplesLeft / 150f;
             envelope = MathF.Pow(envelope, 2.0f);
-        
+
             float crackleNoise = (float)(_rng.NextDouble() * 2.0 - 1.0);
             crackle = crackleNoise * _vhfCrackleAmplitude * envelope;
-        
+
             _vhfCrackleSamplesLeft--;
         }
-    
+
         // Mix pink noise with lighter crackles - INCREASED base level
-        return pinkNoise * 0.18f + crackle;  // Was 0.12f, now 0.18f
+        return pinkNoise * 0.18f + crackle; // Was 0.12f, now 0.18f
     }
 
     /// <summary>
