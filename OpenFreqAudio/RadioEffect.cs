@@ -677,7 +677,9 @@ public class RadioEffect
                     float radioNoise = (noise1 + noise2 + noise3 + noise4) / 4.0f;
     
                     // Map physics noise level to audible amplitude
-                    float noiseGain = MathF.Sqrt(p.NoiseLevel) * 0.3f;
+                    float noiseGain = p.NoiseLevel < 0.1f 
+                        ? p.NoiseLevel * 1.0f        // Linear for clean signals: 0.02 → 2% amplitude
+                        : MathF.Sqrt(p.NoiseLevel) * 0.3f;  // Perceptual for degraded signals
     
                     val += radioNoise * noiseGain;
                 }
