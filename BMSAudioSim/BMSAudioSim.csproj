@@ -33,7 +33,6 @@
         <PackageReference Include="PanAndZoom" Version="11.3.6"/>
         <PackageReference Include="ReactiveUI.Avalonia" Version="11.3.8"/>
         <PackageReference Include="Avalonia.Diagnostics" Version="11.3.8">
-
             <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
             <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
         </PackageReference>
@@ -50,23 +49,5 @@
 
     <ItemGroup>
         <ProjectReference Include="..\OpenFreqAudio\OpenFreqAudio.csproj"/>
-    </ItemGroup>
-
-    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' OR '$(RuntimeIdentifier)' == 'win-x86' OR '$(RuntimeIdentifier)' == 'win-arm64'">
-        <Content Include="../OpenFreqAudio/Assets/windows/**/*">
-            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-            <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-            <TargetPath>%(Filename)%(Extension)</TargetPath>
-            <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
-        </Content>
-    </ItemGroup>
-
-    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' OR '$(RuntimeIdentifier)' == 'linux-arm64'">
-        <Content Include="../OpenFreqAudio/Assets/linux/**/*">
-            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-            <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-            <TargetPath>%(Filename)%(Extension)</TargetPath>
-            <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
-        </Content>
     </ItemGroup>
 </Project>
