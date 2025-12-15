@@ -246,9 +246,12 @@ namespace OpenFreqAudio
         /// Return an AudioParams object to the pool for reuse.
         /// Call this when you're done using an AudioParams object to reduce allocations.
         /// </summary>
-        public void ReturnAudioParams(AudioParams ap)
+        public void ReturnAudioParams(AudioParams? ap)
         {
-            paramsPool.Return(ap);
+            if (ap != null)
+            {
+                paramsPool.Return(ap);
+            }
         }
 
         // Bilinear elevation sampling

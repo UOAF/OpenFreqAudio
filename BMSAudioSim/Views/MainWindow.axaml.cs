@@ -39,8 +39,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     static volatile bool _stream1Playing = false;
     static volatile bool _stream2Playing = false;
     private DEMReader? _demReader;
-    private AudioParams _signal1Params;
-    private AudioParams _signal2Params;
+    private AudioParams? _signal1Params;
+    private AudioParams? _signal2Params;
     private RadioPlayback _radioPlayback = new(false);
     private ILoggerFactory _loggerFactory;
     private MainWindowViewModel _viewModel;
@@ -426,7 +426,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-        
         _fastPathAudioSim.ReturnAudioParams(_signal1Params);
         
         var audioParams = _fastPathAudioSim.CalculateAudioParams(
