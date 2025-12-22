@@ -1014,14 +1014,14 @@ public class RadioPlayback
                 }
             }
 
-            // Mix by frequency (unchanged semantics)
+            // Mix by frequency
             foreach (var kvp in frequencySnapshot)
             {
                 double freq = kvp.Key;
                 var freqConfig = kvp.Value;
                 if (!freqConfig.IsTuned) continue;
 
-                var freqStreams = activeStreams.Where(s => Math.Abs(s.FrequencyMHz - freq) < 0.01d).ToList();
+                var freqStreams = activeStreams.Where(s => (Math.Abs(s.FrequencyMHz - freq) < 0.01d) && s.HasReceivedAudio).ToList();
                 if (freqStreams.Count == 0) continue;
 
                 Array.Clear(_frequencyMixBuffer, 0, samples);
