@@ -184,6 +184,14 @@ namespace OpenFreqAudio
         public static List<RadioBandConfig> bandConfigs = new()
         {
             new RadioBandConfig(
+                bandName: "BMS Lobby",
+                freqMin: 1.234,
+                freqMax: 1.234,
+                bandwidth: 4000.0f,
+                diffractionDb: 3.0,
+                modulation: ModulationType.AM),
+            
+            new RadioBandConfig(
                 bandName: "VHF",
                 freqMin: 30.0,
                 freqMax: 199.99,
@@ -223,7 +231,7 @@ namespace OpenFreqAudio
         /// <summary>
         /// Determine which radio band configuration to use for a given frequency
         /// </summary>
-        private RadioBandConfig GetBandConfig(double frequencyMHz)
+        private static RadioBandConfig GetBandConfig(double frequencyMHz)
         {
             foreach (var config in bandConfigs)
             {
@@ -969,17 +977,18 @@ namespace OpenFreqAudio
             }
         }
 
-        public AudioParams GetDefaultAudioParams(double frequencyMHz)
+        public static AudioParams GetDefaultAudioParams(double frequencyMHz)
         {
-            RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
-
-            var ap = paramsPool.Rent();
-            ap.RadioFrequencyMHz = (float)frequencyMHz;
-            ap.Gain = 1.0f;
-            ap.LowpassHz = bandConfig.VoiceBandwidth_Hz;
-            ap.NoiseLevel = 0f;
-            ap.DropoutRate = 0f;
-            ap.DeepFadeRate = 0f;
+            var bandConfig = GetBandConfig(frequencyMHz);
+            var ap = new AudioParams
+            {
+                RadioFrequencyMHz = (float)frequencyMHz,
+                Gain = 1.0f,
+                LowpassHz = bandConfig.VoiceBandwidth_Hz,
+                NoiseLevel = 0f,
+                DropoutRate = 0f,
+                DeepFadeRate = 0f
+            };
             return ap;
         }
     }

@@ -47,6 +47,10 @@ public class RadioPlayback
         public bool HasReceivedAudio { get; set; }
         public DateTime LastAudioReceived { get; set; } = DateTime.MinValue;
         public int ValidSamples { get; set; }
+        
+        // Prebuffering state
+        public bool IsBuffering { get; set; } = true;
+        public int MinBufferFrames { get; set; } // Minimum frames before playback starts
 
         public void EnsureRingBufferCapacity(int floats)
         {
@@ -129,6 +133,13 @@ public class RadioPlayback
 
                 HasReceivedAudio = true;
                 LastAudioReceived = DateTime.UtcNow;
+                
+                // Check if we've buffered enough to start playback
+                if (IsBuffering && _ringCount >= MinBufferFrames * Channels)
+                {
+                    IsBuffering = false;
+                    Console.WriteLine($"[PushToRing:{StreamId}] Buffering complete! {_ringCount / Channels} frames buffered ({(float)_ringCount / RingBuffer.Length * 100f:F1}% full)");
+                }
             }
         }
 
@@ -142,12 +153,58 @@ public class RadioPlayback
                 int availableFrames = _ringCount / Channels;
                 float fillPercent = (float)_ringCount / RingBuffer.Length * 100f;
 
-                // Only log underruns if we've already started playback (buffer should be reasonably full)
-                // and the underrun is significant
-                if (availableFrames < frameCount && HasReceivedAudio && fillPercent < 20f)
+                // If still buffering, check if we should exit buffering mode
+                if (IsBuffering)
                 {
-                    Console.WriteLine(
-                        $"[ReadFromRing:{StreamId}] UNDERRUN! Requested {frameCount} frames, only {availableFrames} available ({fillPercent:F1}% full, {_ringCount}/{RingBuffer.Length})");
+                    // Primary exit condition: reached target buffer level
+                    if (availableFrames >= MinBufferFrames)
+                    {
+                        IsBuffering = false;
+                        Console.WriteLine($"[ReadFromRing:{StreamId}] Buffering complete! {availableFrames} frames buffered ({fillPercent:F1}% full)");
+                    }
+                    // Fallback exit condition: stream stopped but we have substantial data (>60% of target)
+                    // Wait 200ms after last packet to ensure stream truly stopped
+                    else if (HasReceivedAudio && 
+                             availableFrames >= (MinBufferFrames * 60) / 100 &&
+                             (DateTime.UtcNow - LastAudioReceived).TotalMilliseconds > 200)
+                    {
+                        IsBuffering = false;
+                        Console.WriteLine($"[ReadFromRing:{StreamId}] Buffering timeout! Stream inactive, using {availableFrames} frames ({fillPercent:F1}% full)");
+                    }
+                    // Still buffering - log progress and return silence
+                    else
+                    {
+                        // Log buffering progress periodically (not every call to avoid spam)
+                        if (availableFrames % 480 == 0 || availableFrames == 0)
+                        {
+                            Console.WriteLine($"[DSP:{StreamId}] Buffering... {availableFrames}/{MinBufferFrames} frames ({fillPercent:F1}%)");
+                        }
+                        
+                        // Return silence while buffering
+                        int destSamples = frameCount * Channels;
+                        Array.Clear(dest, 0, destSamples);
+                        return 0;
+                    }
+                }
+
+                // Check buffer health and enter rebuffering if critically low
+                // With 85% target and ~80% DSP consumption, steady state is 75-85%
+                // After one DSP call: 85% + packets - 80% = ~5-15% depending on timing
+                // Rebuffer only at < 5% to avoid false triggers during normal operation
+                if (availableFrames < frameCount && HasReceivedAudio)
+                {
+                    if (fillPercent < 25f)
+                    {
+                        Console.WriteLine(
+                            $"[ReadFromRing:{StreamId}] UNDERRUN! Requested {frameCount} frames, only {availableFrames} available ({fillPercent:F1}% full, {_ringCount}/{RingBuffer.Length})");
+                    }
+                    
+                    // Enter rebuffering mode if buffer critically low (< 5%)
+                    if (fillPercent < 5f && !IsBuffering)
+                    {
+                        IsBuffering = true;
+                        Console.WriteLine($"[ReadFromRing:{StreamId}] Buffer critically low ({fillPercent:F1}%) - entering rebuffering mode");
+                    }
                 }
 
                 int toReadFrames = Math.Min(availableFrames, frameCount);
@@ -163,9 +220,9 @@ public class RadioPlayback
                 _ringCount -= samplesToRead;
 
                 // Clear remainder
-                int destSamples = frameCount * Channels;
-                if (samplesToRead < destSamples)
-                    Array.Clear(dest, samplesToRead, destSamples - samplesToRead);
+                int destSamples2 = frameCount * Channels;
+                if (samplesToRead < destSamples2)
+                    Array.Clear(dest, samplesToRead, destSamples2 - samplesToRead);
 
                 return toReadFrames;
             }
@@ -487,9 +544,12 @@ public class RadioPlayback
             };
 
             // Ring buffer capacity: 3 seconds (same as file streams) to handle jitter + processing overhead
-            int ringFrames = sampleRate / 4;
+            int ringFrames = (sampleRate * 150) / 1000;      // 150ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
             stream.EnsureRingBufferCapacity(ringCapacity);
+            int minBufferFrames = (sampleRate * 105) / 1000; // 105ms
+            stream.MinBufferFrames = minBufferFrames;
+            stream.IsBuffering = true;
 
             if (_frequencies.TryGetValue(audioParams.RadioFrequencyMHz, out var freqConfig))
             {
@@ -844,7 +904,7 @@ public class RadioPlayback
 
             int outputFrames = samples / _channels;
             Array.Clear(_dspScratch, 0, samples);
-
+            
             // Update stream activity BEFORE processing anything else
             // RadioEffect will automatically trigger squelch bursts when activity changes
             foreach (var stream in activeStreams)
@@ -942,39 +1002,13 @@ public class RadioPlayback
                 // Fill stream.Buffer with native-channel-interleaved samples
                 if (stream.IsPush)
                 {
-                    // For push streams (WebRTC), implement jitter buffer:
-                    // Only start playing once we have enough data buffered
-                    var (fillCount, capacity) = stream.GetRingBufferFillLevel();
-                    float fillPercent = (float)fillCount / capacity;
-                    int fillFrames = fillCount / stream.Channels;
-
-                    // Minimum threshold: either 50% of requested frames, or 100ms worth of audio, whichever is larger
-                    int minThresholdFrames = _sampleRate / 100; // 25ms
-
-                    // If we don't have enough data yet, skip this stream (let buffer fill up)
-                    if (fillFrames < minThresholdFrames)
-                    {
-                        // If we cannot supply a full DSP block, output silence
-                        stream.ValidSamples = 0;
-                        Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-
-                        // Log only once when transitioning to low-buffer state
-                        Console.WriteLine(
-                            $"[DSP:{stream.StreamId}] Buffering... {fillFrames}/{minThresholdFrames} frames ({fillPercent:F1}%)");
-
-                        // We still continue, but now silence will be mixed
-                        continue;
-                    }
-
-                    // Read from ring buffer in native channel format
+                    // For push streams (WebRTC), ReadFromRing handles all buffering logic
                     int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
                     if (framesRead == 0)
                     {
-                        // Clear the old audio — prevent endless repetition
+                        // Still buffering or no data - output silence
                         stream.ValidSamples = 0;
                         Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-                        Console.WriteLine("CLEARING OLD BUFFER");
-
                         // We still continue, but now silence will be mixed
                         continue;
                     }
