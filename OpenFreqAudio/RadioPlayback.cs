@@ -177,7 +177,7 @@ public class RadioPlayback
                         // Log buffering progress periodically (not every call to avoid spam)
                         if (availableFrames % 480 == 0 || availableFrames == 0)
                         {
-                            Console.WriteLine($"[DSP:{StreamId}] Buffering... {availableFrames}/{MinBufferFrames} frames ({fillPercent:F1}%)");
+                            // Console.WriteLine($"[DSP:{StreamId}] Buffering... {availableFrames}/{MinBufferFrames} frames ({fillPercent:F1}%)");
                         }
                         
                         // Return silence while buffering
@@ -308,6 +308,11 @@ public class RadioPlayback
                     throw new Exception("Failed to initialize BASS.");
                 _bassInitialized = true;
             }
+            // Configure BASS for low-latency operation
+            Bass.Configure(Configuration.UpdatePeriod, 5);  
+            Bass.Configure(Configuration.PlaybackBufferLength, 40);   
+            Bass.Configure(Configuration.DeviceBufferLength, 10);    
+            Bass.Configure(Configuration.UpdateThreads, 2);
         }
 
         Radiomixer.LoadSteppedOnSample();
@@ -368,7 +373,7 @@ public class RadioPlayback
             
 
             // Allocate a ring buffer (3 seconds worth of audio)
-            int ringFrames = info.Frequency * 3;
+            int ringFrames = info.Frequency * 5;
             stream.EnsureRingBufferCapacity(ringFrames * Math.Max(1, stream.Channels));
 
             // Start a background task that pulls decoded floats from the BASS decode stream and pushes them into the ring buffer.
@@ -543,11 +548,10 @@ public class RadioPlayback
                 IsStopping = false
             };
 
-            // Ring buffer capacity: 3 seconds (same as file streams) to handle jitter + processing overhead
-            int ringFrames = (sampleRate * 150) / 1000;      // 150ms
+            int ringFrames = (sampleRate * 60) / 1000;       // 60ms
+            int minBufferFrames = (sampleRate * 20) / 1000;  // 20ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
             stream.EnsureRingBufferCapacity(ringCapacity);
-            int minBufferFrames = (sampleRate * 105) / 1000; // 105ms
             stream.MinBufferFrames = minBufferFrames;
             stream.IsBuffering = true;
 
@@ -609,9 +613,11 @@ public class RadioPlayback
 
             // Get buffer status after push
             var (fillCount, capacity) = stream.GetRingBufferFillLevel();
+            #if DEBUG
             float fillPercent = (float)fillCount / capacity * 100f;
             Console.WriteLine(
                 $"[PushAudioData:{streamId}] Pushed {frames} frames ({audioData.Length} bytes, {bytesPerSample * 8}-bit), buffer now {fillPercent:F1}% full ({fillCount}/{capacity})");
+            #endif
 
             return true;
         }
