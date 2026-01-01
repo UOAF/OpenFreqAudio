@@ -40,10 +40,7 @@ public class RadioPlayback
         // For file-based streams we run a reader task that decodes and pushes into the ring
         public CancellationTokenSource? FileReaderCts { get; set; }
         public Task? FileReaderTask { get; set; }
-
-        public bool IsStopping { get; set; }
-        public int StoppingBurstSamplesLeft { get; set; }
-
+        
         public bool HasReceivedAudio { get; set; }
         public DateTime LastAudioReceived { get; set; } = DateTime.MinValue;
         public int ValidSamples { get; set; }
@@ -264,6 +261,9 @@ public class RadioPlayback
         public bool IsNoiseMuted { get; set; }
         public float SquelchLevel { get; set; }
         // ReSharper restore UnusedAutoPropertyAccessor.Local
+        
+        public SquelchBurstGenerator? SquelchBurst { get; set; }
+        public bool WasSquelchOpen { get; set; }
     }
 
     public enum AudioChannel
@@ -368,7 +368,6 @@ public class RadioPlayback
                 RadioPreFilter = new RadioPreFilter(info.Frequency),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
-                IsStopping = false
             };
             
 
@@ -545,7 +544,6 @@ public class RadioPlayback
                 RadioPreFilter = new RadioPreFilter(sampleRate),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
-                IsStopping = false
             };
 
             int ringFrames = (sampleRate * 60) / 1000;       // 60ms
@@ -629,20 +627,7 @@ public class RadioPlayback
         {
             lock (_lock)
             {
-                if (!_streams.TryGetValue(streamId, out var stream)) return;
-
-                float threshold = stream.RadioEffect.GetSquelchThreshold();
-
-                if (stream.CurrentParams.Gain >= threshold && threshold > 0.01f)
-                {
-                    stream.IsStopping = true;
-                    stream.StoppingBurstSamplesLeft = 720;
-                    stream.RadioEffect.TriggerSquelchBurst();
-                }
-                else
-                {
-                    StopStreamInternal(streamId);
-                }
+                StopStreamInternal(streamId);
             }
         });
     }
@@ -694,8 +679,12 @@ public class RadioPlayback
                 _frequencies[frequencyMHz] = new FrequencyConfig();
         
             var freqConfig = _frequencies[frequencyMHz];
+            if (freqConfig.SquelchBurst == null)
+            {
+                freqConfig.SquelchBurst = new SquelchBurstGenerator(_sampleRate, _channels);
+            }
+
             freqConfig.IsTuned = true;
-        
             if (freqConfig.NoiseGenerator == null)
             {
                 freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyMHz);
@@ -880,263 +869,249 @@ public class RadioPlayback
         }
     }
 
-    private void SetupDSPAndPlay()
+private void SetupDSPAndPlay()
+{
+    _dspProc = (_, _, bufferPtr, length, _) =>
     {
-        _dspProc = (_, _, bufferPtr, length, _) =>
+        int samples = length / sizeof(float);
+
+        if (samples > MaxBufferSize)
         {
-            int samples = length / sizeof(float);
-
-            if (samples > MaxBufferSize)
-            {
-                lock (_lock)
-                {
-                    _dspScratch = new float[samples];
-                    _mixBuffer1 = new float[samples];
-                    _mixBuffer2 = new float[samples];
-                    _frequencyMixBuffer = new float[samples];
-                    _noiseBuffer = new float[samples];
-                }
-            }
-
-            List<RadioStream> activeStreams;
-            Dictionary<double, FrequencyConfig> frequencySnapshot;
             lock (_lock)
             {
-                activeStreams = _streams.Values.Where(s =>
-                    (!s.IsStopping || s.StoppingBurstSamplesLeft > 0) && s.CurrentParams.Gain > 0 &&
-                    s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
-                frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
+                _dspScratch = new float[samples];
+                _mixBuffer1 = new float[samples];
+                _mixBuffer2 = new float[samples];
+                _frequencyMixBuffer = new float[samples];
+                _noiseBuffer = new float[samples];
             }
+        }
 
-            int outputFrames = samples / _channels;
-            Array.Clear(_dspScratch, 0, samples);
+        List<RadioStream> activeStreams;
+        Dictionary<double, FrequencyConfig> frequencySnapshot;
+        lock (_lock)
+        {
+            activeStreams = _streams.Values.Where(s =>
+                s.CurrentParams.Gain > 0 &&
+                s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
+            frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
+        }
+
+        int outputFrames = samples / _channels;
+        Array.Clear(_dspScratch, 0, samples);
+        
+        // Generate background noise per frequency
+        foreach (var kvp in frequencySnapshot)
+        {
+            double freq = kvp.Key;
+            var freqConfig = kvp.Value;
+            if (!freqConfig.IsTuned || freqConfig.NoiseGenerator == null) continue;
+
+            var freqStreams = activeStreams.Where(s => Math.Abs(s.FrequencyMHz - freq) < 0.01d).ToList();
+            bool freqHasHearableStreams = freqStreams.Any(s => s.RadioEffect.IsSquelchOpen);
             
-            // Update stream activity BEFORE processing anything else
-            // RadioEffect will automatically trigger squelch bursts when activity changes
-            foreach (var stream in activeStreams)
+            float squelchThreshold = freqStreams.FirstOrDefault()?.RadioEffect.GetSquelchThreshold() 
+                                     ?? freqConfig.DefaultSquelchThreshold;
+
+            bool noiseIsSquelched = (float)freqConfig.MinimumGain <= squelchThreshold || 
+                                   freqHasHearableStreams || 
+                                   freqConfig.IsNoiseMuted;
+
+            lock (_lock)
             {
-                bool isActive = stream.HasReceivedAudio && 
-                               (DateTime.UtcNow - stream.LastAudioReceived).TotalMilliseconds < 500 &&
-                               !stream.IsStopping;
-                
-                // This will trigger squelch bursts automatically if activity state changed
-                stream.RadioEffect.SetStreamActive(isActive);
-            }
-            
-            // Generate frequency noise where applicable
-            foreach (var kvp in frequencySnapshot)
-            {
-                double freq = kvp.Key;
-                var freqConfig = kvp.Value;
-                if (!freqConfig.IsTuned || freqConfig.NoiseGenerator == null) continue;
-    
-                var freqStreams = activeStreams.Where(s => Math.Abs(s.FrequencyMHz - freq) < 0.01d).ToList();
-
-                // Check if any stream on this frequency has squelch open
-                bool freqHasHearableStreams = freqStreams.Any(s => s.RadioEffect.IsSquelchOpen);
-    
-                // Get squelch threshold from any stream on this frequency (or use default)
-                float squelchThreshold = freqStreams.FirstOrDefault()?.RadioEffect.GetSquelchThreshold() 
-                                         ?? freqConfig.DefaultSquelchThreshold;
-    
-                // Background noise is squelched if:
-                // 1. Its amplitude is below the squelch threshold, OR
-                // 2. There are active transmissions
-                bool noiseIsSquelched = (float)freqConfig.MinimumGain <= squelchThreshold || freqHasHearableStreams || freqConfig.IsNoiseMuted;
-    
-                lock (_lock)
-                {
-                    if (_frequencies.TryGetValue(freq, out var fc))
-                        fc.WasHearableLastFrame = freqHasHearableStreams;
-                }
-
-                // Generate background noise only if not squelched
-                if (!noiseIsSquelched && (float)freqConfig.MinimumGain > 0.001f)
-                {
-
-                    float targetGain = (float)freqConfig.MinimumGain * freqConfig.Volume;
-                    float fadeStep = targetGain / NoiseFadeSamples;
-                    freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
-
-                    if (_channels == 2)
-                    {
-                        for (int frame = 0; frame < outputFrames; frame++)
-                        {
-                            if (freqConfig.NoiseFadeGain < targetGain)
-                                freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
-                            int leftIdx = frame * 2;
-                            int rightIdx = leftIdx + 1;
-                            float noiseSample = _noiseBuffer[leftIdx] * freqConfig.NoiseFadeGain;
-                            switch (freqConfig.AudioChannel)
-                            {
-                                case AudioChannel.Left: _dspScratch[leftIdx] += noiseSample; break;
-                                case AudioChannel.Right: _dspScratch[rightIdx] += noiseSample; break;
-                                case AudioChannel.Both:
-                                    _dspScratch[leftIdx] += noiseSample;
-                                    _dspScratch[rightIdx] += noiseSample;
-                                    break;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        for (int i = 0; i < samples; i++)
-                        {
-                            if (freqConfig.NoiseFadeGain < targetGain)
-                                freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
-                            _dspScratch[i] += _noiseBuffer[i] * freqConfig.NoiseFadeGain;
-                        }
-                    }
-                }
-
-                else
-                {
-                    // Fade out noise
-                    float fadeStep = (float)freqConfig.MinimumGain / NoiseFadeSamples;
-                    if (freqConfig.NoiseFadeGain > 0f)
-                        freqConfig.NoiseFadeGain = Math.Max(freqConfig.NoiseFadeGain - fadeStep, 0f);
-                }
-
+                if (_frequencies.TryGetValue(freq, out var fc))
+                    fc.WasHearableLastFrame = freqHasHearableStreams;
             }
 
-            // Read/process streams in their native channel format.
-            // Channel conversion to output format happens during mixing.
-            List<string> streamsToRemove = new();
-
-            foreach (var stream in activeStreams)
+            if (!noiseIsSquelched && (float)freqConfig.MinimumGain > 0.001f)
             {
-                // Fill stream.Buffer with native-channel-interleaved samples
-                if (stream.IsPush)
-                {
-                    // For push streams (WebRTC), ReadFromRing handles all buffering logic
-                    int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
-                    if (framesRead == 0)
-                    {
-                        // Still buffering or no data - output silence
-                        stream.ValidSamples = 0;
-                        Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-                        // We still continue, but now silence will be mixed
-                        continue;
-                    }
-
-                    int samplesRead = framesRead * stream.Channels; // Native channel count
-                    stream.ValidSamples = samplesRead;
-                    stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
-                    stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
-                }
-                else
-                {
-                    // File streams: read in native channel format, process, then convert during mixing
-                    int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
-                    if (framesRead == 0)
-                    {
-                        // Clear the old audio — prevent endless repetition
-                        stream.ValidSamples = 0;
-                        Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-
-                        // We still continue, but now silence will be mixed
-                        continue;
-                    }
-
-                    int samplesRead = framesRead * stream.Channels; // Native channel count
-                    stream.ValidSamples = samplesRead;
-                    stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
-                    stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
-                }
-
-                if (stream.IsStopping)
-                {
-                    stream.StoppingBurstSamplesLeft -= outputFrames;
-                    if (stream.StoppingBurstSamplesLeft <= 0)
-                    {
-                        streamsToRemove.Add(stream.StreamId);
-                    }
-                }
-            }
-
-            // Mix by frequency
-            foreach (var kvp in frequencySnapshot)
-            {
-                double freq = kvp.Key;
-                var freqConfig = kvp.Value;
-                if (!freqConfig.IsTuned) continue;
-
-                var freqStreams = activeStreams.Where(s => (Math.Abs(s.FrequencyMHz - freq) < 0.01d) && s.HasReceivedAudio).ToList();
-                if (freqStreams.Count == 0) continue;
-
-                Array.Clear(_frequencyMixBuffer, 0, samples);
-
-                if (freqStreams.Count == 1)
-                {
-                    // Single stream - convert from native format to output format
-                    var s = freqStreams[0];
-                    ConvertToOutputFormat(s, _frequencyMixBuffer, samples);
-                }
-                else
-                {
-                    // Multiple streams - stepped-on interference
-                    var sorted = freqStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
-                    var primary = sorted[0];
-                    var secondary = sorted[1];
-
-                    // Convert both streams to output format
-                    ConvertToOutputFormat(primary, _mixBuffer1, samples);
-                    ConvertToOutputFormat(secondary, _mixBuffer2, samples);
-
-                    var steppedParams = Radiomixer.CalculateSteppedOnParams(primary.CurrentParams,
-                        secondary.CurrentParams, primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
-                        primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB);
-                    
-                    freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, steppedParams,
-                        _sampleRate, primary.RadioEffect.GetSquelchThreshold(), primary.CurrentParams.Gain,
-                        secondary.CurrentParams.Gain);
-                }
-
-                float volume = freqConfig.Volume;
-                var audioChannel = freqConfig.AudioChannel;
+                float targetGain = (float)freqConfig.MinimumGain * freqConfig.Volume;
+                float fadeStep = targetGain / NoiseFadeSamples;
+                freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
 
                 if (_channels == 2)
                 {
-                    int frames = samples / 2;
-                    for (int frame = 0; frame < frames; frame++)
+                    for (int frame = 0; frame < outputFrames; frame++)
                     {
-                        int li = frame * 2;
-                        int ri = li + 1;
-                        float l = _frequencyMixBuffer[li] * volume;
-                        float r = _frequencyMixBuffer[ri] * volume;
-                        switch (audioChannel)
+                        if (freqConfig.NoiseFadeGain < targetGain)
+                            freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
+                        int leftIdx = frame * 2;
+                        int rightIdx = leftIdx + 1;
+                        float noiseSample = _noiseBuffer[leftIdx] * freqConfig.NoiseFadeGain;
+                        switch (freqConfig.AudioChannel)
                         {
-                            case AudioChannel.Left: _dspScratch[li] += l + r; break;
-                            case AudioChannel.Right: _dspScratch[ri] += l + r; break;
+                            case AudioChannel.Left: _dspScratch[leftIdx] += noiseSample; break;
+                            case AudioChannel.Right: _dspScratch[rightIdx] += noiseSample; break;
                             case AudioChannel.Both:
-                                _dspScratch[li] += l;
-                                _dspScratch[ri] += r;
+                                _dspScratch[leftIdx] += noiseSample;
+                                _dspScratch[rightIdx] += noiseSample;
                                 break;
                         }
                     }
                 }
                 else
                 {
-                    for (int i = 0; i < samples; i++) _dspScratch[i] += _frequencyMixBuffer[i] * volume;
+                    for (int i = 0; i < samples; i++)
+                    {
+                        if (freqConfig.NoiseFadeGain < targetGain)
+                            freqConfig.NoiseFadeGain = Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
+                        _dspScratch[i] += _noiseBuffer[i] * freqConfig.NoiseFadeGain;
+                    }
                 }
             }
-
-            for (int i = 0; i < samples; i++) _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
-
-            Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
-
-            if (streamsToRemove.Count > 0)
+            else
             {
-                lock (_lock)
+                float fadeStep = (float)freqConfig.MinimumGain / NoiseFadeSamples;
+                if (freqConfig.NoiseFadeGain > 0f)
+                    freqConfig.NoiseFadeGain = Math.Max(freqConfig.NoiseFadeGain - fadeStep, 0f);
+            }
+        }
+
+        // Process streams
+        foreach (var stream in activeStreams)
+        {
+            if (stream.IsPush)
+            {
+                int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
+                if (framesRead == 0)
                 {
-                    foreach (var id in streamsToRemove) StopStreamInternal(id);
+                    stream.ValidSamples = 0;
+                    Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
+                    continue;
+                }
+
+                int samplesRead = framesRead * stream.Channels;
+                stream.ValidSamples = samplesRead;
+                stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
+                stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
+            }
+            else
+            {
+                int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
+                if (framesRead == 0)
+                {
+                    stream.ValidSamples = 0;
+                    Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
+                    continue;
+                }
+
+                int samplesRead = framesRead * stream.Channels;
+                stream.ValidSamples = samplesRead;
+                stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
+                stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
+            }
+        }
+
+        // Mix frequencies and process squelch bursts
+        foreach (var kvp in frequencySnapshot)
+        {
+            double freq = kvp.Key;
+            var freqConfig = kvp.Value;
+            if (!freqConfig.IsTuned) continue;
+
+            var freqStreams = activeStreams.Where(s => Math.Abs(s.FrequencyMHz - freq) < 0.01d && s.HasReceivedAudio).ToList();
+
+            // Determine squelch state and trigger bursts
+            if (freqConfig.SquelchBurst != null)
+            {
+                bool hasActiveTransmission = freqStreams.Any(s => 
+                    (DateTime.UtcNow - s.LastAudioReceived).TotalMilliseconds < 500);
+                
+                float squelchThreshold = freqStreams.FirstOrDefault()?.RadioEffect.GetSquelchThreshold() 
+                                         ?? freqConfig.DefaultSquelchThreshold;
+                
+                bool noiseAboveSquelch = (float)freqConfig.MinimumGain > squelchThreshold;
+                bool isSquelchOpen = hasActiveTransmission || noiseAboveSquelch;
+                
+                if (isSquelchOpen != freqConfig.WasSquelchOpen)
+                {
+                    if (isSquelchOpen)
+                        freqConfig.SquelchBurst.TriggerOpening();
+                    else
+                        freqConfig.SquelchBurst.TriggerClosing();
+                    
+                    freqConfig.WasSquelchOpen = isSquelchOpen;
                 }
             }
-        };
 
-        Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
-        Bass.ChannelPlay(_masterStream);
-    }
+            // Skip if no streams and no burst playing
+            bool hasBurstPlaying = freqConfig.SquelchBurst?.IsPlaying ?? false;
+            if (freqStreams.Count == 0 && !hasBurstPlaying) continue;
+
+            Array.Clear(_frequencyMixBuffer, 0, samples);
+
+            // Mix streams if present
+            if (freqStreams.Count > 0)
+            {
+                if (freqStreams.Count == 1)
+                {
+                    ConvertToOutputFormat(freqStreams[0], _frequencyMixBuffer, samples);
+                }
+                else
+                {
+                    var sorted = freqStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
+                    var primary = sorted[0];
+                    var secondary = sorted[1];
+
+                    ConvertToOutputFormat(primary, _mixBuffer1, samples);
+                    ConvertToOutputFormat(secondary, _mixBuffer2, samples);
+
+                    var steppedParams = Radiomixer.CalculateSteppedOnParams(
+                        primary.CurrentParams, secondary.CurrentParams, 
+                        primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
+                        primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB);
+
+                    freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, 
+                        steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(), 
+                        primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
+                }
+            }
+
+            // Process squelch burst
+            if (freqConfig.SquelchBurst != null)
+                freqConfig.SquelchBurst.Process(_frequencyMixBuffer, 0, samples);
+
+            // Mix to output
+            float volume = freqConfig.Volume;
+            var audioChannel = freqConfig.AudioChannel;
+
+            if (_channels == 2)
+            {
+                int frames = samples / 2;
+                for (int frame = 0; frame < frames; frame++)
+                {
+                    int li = frame * 2;
+                    int ri = li + 1;
+                    float l = _frequencyMixBuffer[li] * volume;
+                    float r = _frequencyMixBuffer[ri] * volume;
+                    switch (audioChannel)
+                    {
+                        case AudioChannel.Left: _dspScratch[li] += l + r; break;
+                        case AudioChannel.Right: _dspScratch[ri] += l + r; break;
+                        case AudioChannel.Both:
+                            _dspScratch[li] += l;
+                            _dspScratch[ri] += r;
+                            break;
+                    }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < samples; i++) 
+                    _dspScratch[i] += _frequencyMixBuffer[i] * volume;
+            }
+        }
+
+        for (int i = 0; i < samples; i++) 
+            _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
+
+        Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
+    };
+
+    Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
+    Bass.ChannelPlay(_masterStream);
+}
+
 
     public async Task StopAll()
     {
@@ -1163,7 +1138,7 @@ public class RadioPlayback
 
     public bool IsStreamActive(string id)
     {
-        lock (_lock) return _streams.TryGetValue(id, out var s) && !s.IsStopping;
+        lock (_lock) return _streams.TryGetValue(id, out _);
     }
 
     public List<double> GetActiveFrequencies()
