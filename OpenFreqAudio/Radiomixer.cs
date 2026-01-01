@@ -34,12 +34,11 @@ public class Radiomixer
             return memoryStream.ToArray();
         }
     }
-    
+
     /// <summary>
     /// Load the stepped-on interference sample from file using BASS.
     /// Call this once at startup. Supports any format BASS supports (WAV, OGG, MP3, etc).
     /// </summary>
-    
     public static void LoadSteppedOnSample()
     {
         var assembly = Assembly.GetExecutingAssembly();
@@ -58,7 +57,7 @@ public class Radiomixer
                 throw new Exception("Resource not found: " + resourceName);
             }
         }
-        
+
         // Create a decode stream (no playback, just for reading data)
         int stream = Bass.CreateStream(audioData, 0, audioData.Length, BassFlags.Decode | BassFlags.Float);
 
@@ -285,16 +284,8 @@ public class Radiomixer
     /// 4. Add subtle pitch/amplitude modulation for variation
     /// 5. Mix with suppressed audio from both transmitters
     /// </summary>
-    public void ProcessSteppedOn(
-        float[] buffer1,
-        float[] buffer2,
-        float[] output,
-        SteppedOnParams stepped,
-        int sampleRate,
-        float squelchThreshold,
-        float gain1 = 1.0f,
-        float gain2 = 1.0f
-    )
+    public void ProcessSteppedOn(float[] buffer1, float[] buffer2, float[] output, int length, SteppedOnParams stepped,
+        int sampleRate, float squelchThreshold, float gain1, float gain2)
     {
         // No signals → silence
         if (gain1 < squelchThreshold && gain2 < squelchThreshold)
@@ -432,7 +423,7 @@ public class Radiomixer
         // Use floating-point position for smooth playback
         float playbackPos = _playbackPosition;
 
-        for (int i = 0; i < output.Length; i++)
+        for (int i = 0; i < length; i++)
         {
             // === SUPPRESSED AUDIO ===
             // Mix stronger and weaker signals according to capture effect

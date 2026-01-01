@@ -1052,16 +1052,13 @@ private void SetupDSPAndPlay()
                     var sorted = freqStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
                     var primary = sorted[0];
                     var secondary = sorted[1];
-
-                    ConvertToOutputFormat(primary, _mixBuffer1, samples);
-                    ConvertToOutputFormat(secondary, _mixBuffer2, samples);
-
+                    
                     var steppedParams = Radiomixer.CalculateSteppedOnParams(
                         primary.CurrentParams, secondary.CurrentParams, 
                         primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
                         primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB);
 
-                    freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, 
+                    freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, samples,
                         steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(), 
                         primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
                 }
