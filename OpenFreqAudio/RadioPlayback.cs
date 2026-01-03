@@ -315,6 +315,7 @@ public class RadioPlayback
     private static bool _bassInitialized;
     private static readonly object _bassInitLock = new();
     private bool _timeoutMonitoringStarted;
+    private int _masterDspProcHandle;
 
     public RadioPlayback(bool skipBassInitialization)
     {
@@ -920,6 +921,13 @@ public class RadioPlayback
         if (_masterStream != 0)
         {
             Bass.ChannelStop(_masterStream);
+        
+            // Remove DSP callback before freeing the stream
+            if (_dspProc != null)
+            {
+                Bass.ChannelRemoveDSP(_masterStream, _masterDspProcHandle);
+            }
+        
             Bass.StreamFree(_masterStream);
             _masterStream = 0;
         }
@@ -1188,7 +1196,7 @@ public class RadioPlayback
             Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
         };
 
-        Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
+        _masterDspProcHandle = Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
         Bass.ChannelPlay(_masterStream);
     }
 
@@ -1198,12 +1206,7 @@ public class RadioPlayback
         List<string> ids;
         lock (_lock) ids = _streams.Keys.ToList();
         foreach (var id in ids) await StopStream(id);
-        if (_masterStream != 0)
-        {
-            Bass.ChannelStop(_masterStream);
-            Bass.StreamFree(_masterStream);
-            _masterStream = 0;
-        }
+        StopMasterStream();
     }
 
     public List<string> GetActiveStreams()

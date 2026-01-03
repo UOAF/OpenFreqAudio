@@ -61,6 +61,15 @@ public class RadioEffect
     private const float WhineFreq = 520f; // typical avionics inverter whine (400–800 Hz)
     private const float WhineLevel = 0.003f; // extremely subtle, like cockpit background
 
+    // Deep rumble state
+    private double _rumblePhase;
+    private const float RumbleFreq = 80f;    // Low rumble
+    private const float RumbleLevel = 0.03f; // Subtle but noticeable
+    
+    // Noise
+    const float BaseNoiseFloor = 0.04f;
+    const float NoiseBoost = 1.1f;
+    
     // Oxygen-mask style muffling
     private const float MuffleCutoff = 900f; // muffled low-pass
     private float _muffleA; // filter coefficient
@@ -427,6 +436,12 @@ public class RadioEffect
             float whineSample = (float)Math.Sin(_whinePhase) * WhineLevel;
             _whinePhase += whineIncrement;
             if (_whinePhase > Math.PI * 2) _whinePhase -= Math.PI * 2;
+            
+            // Generate subtle deep rumble
+            double rumbleIncrement = 2.0 * Math.PI * RumbleFreq / _sampleRate;
+            float rumbleSample = (float)Math.Sin(_rumblePhase) * RumbleLevel;
+            _rumblePhase += rumbleIncrement;
+            if (_rumblePhase > Math.PI * 2) _rumblePhase -= Math.PI * 2;
 
             for (int c = 0; c < _channels; c++)
             {
@@ -509,26 +524,26 @@ public class RadioEffect
                 // Apply gain (using original p.Gain, not effectiveGain - fades already applied)
                 float val = y * p.Gain;
 
-                // === Noise ===
-                // Apply physics-calculated noise when signal is transmitting
-                // Noise is based on RF propagation conditions (SNR, distance, terrain)
                 if (p.NoiseLevel > 0.001f && squelchGain > 0f)
                 {
-                    // Use pink-ish noise (more natural than pure white)
-                    // Average multiple samples for spectral shaping
+                    // Base pink noise (your current approach)
                     float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
                     float noise2 = (float)(rng.NextDouble() * 2.0 - 1.0);
                     float noise3 = (float)(rng.NextDouble() * 2.0 - 1.0);
                     float noise4 = (float)(rng.NextDouble() * 2.0 - 1.0);
-
-                    // 4-sample average creates ~6dB/octave rolloff (pink-ish)
-                    float radioNoise = (noise1 + noise2 + noise3 + noise4) / 4.0f;
-
-                    // Map physics noise level to audible amplitude
+                    float pinkNoise = (noise1 + noise2 + noise3 + noise4) / 4.0f;
+    
+                    // Add raw white noise for "grit" (unaveraged)
+                    float whiteNoise = (float)(rng.NextDouble() * 2.0 - 1.0);
+    
+                    // Blend: mostly pink (smooth) with some white (texture)
+                    float radioNoise = (pinkNoise * 0.75f) + (whiteNoise * 0.25f);
+    
+                    // Boosted base level for noticeable background
                     float noiseGain = p.NoiseLevel < 0.1f
-                        ? p.NoiseLevel * 1.0f // Linear for clean signals: 0.02 → 2% amplitude
-                        : MathF.Sqrt(p.NoiseLevel) * 0.3f; // Perceptual for degraded signals
-
+                        ? BaseNoiseFloor + (p.NoiseLevel * NoiseBoost)
+                        : BaseNoiseFloor + (MathF.Sqrt(p.NoiseLevel) * 1.2f);
+    
                     val += radioNoise * noiseGain;
                 }
 
@@ -537,7 +552,7 @@ public class RadioEffect
 
                 if (!inDrop && _squelchState != SquelchState.Closed)
                 {
-                    val += whineSample;
+                    val += whineSample + rumbleSample;
                 }
 
                 buffer[idx] = Math.Clamp(val, -1f, 1f);

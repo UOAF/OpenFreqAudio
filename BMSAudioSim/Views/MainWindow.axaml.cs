@@ -659,8 +659,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-
-        _radioPlayback.StopAll().Wait(500);
         
         _radioPlayback.UntuneFrequency((float) ViewModel.FrequencyMhz);
         if (RadioButtonUhf.IsChecked == true)
