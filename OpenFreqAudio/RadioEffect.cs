@@ -67,8 +67,8 @@ public class RadioEffect
     private const float RumbleLevel = 0.03f; // Subtle but noticeable
     
     // Noise
-    const float BaseNoiseFloor = 0.04f;
-    const float NoiseBoost = 1.1f;
+    const float BaseNoiseFloor = 0.02f;
+    const float NoiseBoost = 1.04f;
     
     // Oxygen-mask style muffling
     private const float MuffleCutoff = 900f; // muffled low-pass

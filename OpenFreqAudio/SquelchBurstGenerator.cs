@@ -10,11 +10,11 @@ public class SquelchBurstGenerator
     
     // TUNING PARAMETERS - adjust these to change squelch burst characteristics
     // Opening burst (the "click" sound when squelch opens - carrier detected)
-    private const int OpenBurstDuration = 480;
+    private const int OpenBurstDuration = 1440;
     private const float OpenBurstAmplitude = 0.3f;
     
     // Closing burst (the "ksssh" sound when squelch closes - carrier lost)  
-    private const int CloseBurstDuration = 3600;
+    private const int CloseBurstDuration = 9000;
     private const float CloseBurstAmplitude = 0.10f;
     
     // Pre-calculated burst envelopes
