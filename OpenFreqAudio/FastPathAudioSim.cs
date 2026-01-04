@@ -315,9 +315,7 @@ namespace OpenFreqAudio
         public static float CalculateBackgroundNoiseAmplitude(double frequencyMhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = bandConfigs.FirstOrDefault(cfg =>
-                    frequencyMhz >= cfg.FrequencyMin_MHz && frequencyMhz <= cfg.FrequencyMax_MHz)
-                ?.VoiceBandwidth_Hz ?? 0;
+            var bandwidthHz = GetBandConfig(frequencyMhz).VoiceBandwidth_Hz;
             if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
 
             // Default sensitivities based on modulation type
@@ -354,9 +352,7 @@ namespace OpenFreqAudio
         public static float CalculateNoiseFloorAmplitude(double frequencyMhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = bandConfigs.FirstOrDefault(cfg =>
-                    cfg.FrequencyMin_MHz <= frequencyMhz && frequencyMhz <= cfg.FrequencyMax_MHz)
-                ?.VoiceBandwidth_Hz ?? 0;
+            var bandwidthHz = GetBandConfig(frequencyMhz).VoiceBandwidth_Hz;
             if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
 
             // Default sensitivities based on modulation type
