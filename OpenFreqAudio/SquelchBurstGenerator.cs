@@ -10,7 +10,7 @@ public class SquelchBurstGenerator
     
     // TUNING PARAMETERS - adjust these to change squelch burst characteristics
     // Opening burst (the "click" sound when squelch opens - carrier detected)
-    private const int OpenBurstDuration = 1440;
+    private const int OpenBurstDuration = 5760;
     private const float OpenBurstAmplitude = 0.3f;
     
     // Closing burst (the "ksssh" sound when squelch closes - carrier lost)  
@@ -145,7 +145,7 @@ public class SquelchBurstGenerator
             for (int c = 0; c < _channels; c++)
             {
                 int idx = offset + frame * _channels + c;
-                buffer[idx] += burstSample;
+                buffer[idx] = burstSample;
                 buffer[idx] = Math.Clamp(buffer[idx], -1f, 1f);
             }
             
@@ -159,18 +159,20 @@ public class SquelchBurstGenerator
     private static float[] GenerateOpenBurstEnvelope()
     {
         float[] envelope = new float[OpenBurstDuration];
+    
+        // Make attack duration proportional to total duration
+        int attackSamples = Math.Max(24, OpenBurstDuration / 10); // At least 24 samples, or 10% of duration
 
         for (int age = 0; age < OpenBurstDuration; age++)
         {
-            if (age < 48) // ~1ms attack at 48kHz - very fast
+            if (age < attackSamples)
             {
-                float attackProgress = age / 24f;
+                float attackProgress = (float)age / attackSamples;
                 envelope[age] = attackProgress;
             }
             else
             {
-                // Fast exponential decay for percussive character
-                float decayProgress = (float)(age - 24) / (OpenBurstDuration - 24);
+                float decayProgress = (float)(age - attackSamples) / (OpenBurstDuration - attackSamples);
                 envelope[age] = MathF.Exp(-6.0f * decayProgress);
             }
         }
