@@ -714,7 +714,7 @@ namespace OpenFreqAudio
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
-            double frequencyMHz, double txPowerDbm = 40,
+            double frequencyMHz, double txPowerWatts = 10.0,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool altitudeIsMSL = false)
@@ -738,6 +738,10 @@ namespace OpenFreqAudio
             double rxXVal = rxX.Value;
             double rxYVal = rxY.Value;
             double rxAltVal = rxAlt.Value;
+            
+            // Convert transmit power from watts to dBm
+            // Formula: dBm = 10 * log10(powerWatts * 1000)
+            double txPowerDbm = 10.0 * Math.Log10(txPowerWatts * 1000.0);
 
             // Convert AGL to MSL
             if (!altitudeIsMSL)
