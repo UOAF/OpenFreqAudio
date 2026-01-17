@@ -7,7 +7,7 @@ public class MainWindowViewModel : ReactiveObject
     private int _txAltitude = 0;
     private int _rxAltitude = 0;
 
-    private int _txDbm = 40;
+    private int _txWatts = 40;
     private int _rxDbm = -105;
 
     private double _frequencyMhz = 513.75; // default UHF
@@ -17,6 +17,7 @@ public class MainWindowViewModel : ReactiveObject
     private bool _signal2Continuous = false;
     private int _squelchSliderValue = 10;
     private float _squelch = 1.0f;
+    private bool _enable3dEffects = true;
 
     public float Squelch
     {
@@ -47,10 +48,10 @@ public class MainWindowViewModel : ReactiveObject
         set => this.RaiseAndSetIfChanged(ref _rxAltitude, value);
     }
 
-    public int TxDbm
+    public int TxWatts
     {
-        get => _txDbm;
-        set => this.RaiseAndSetIfChanged(ref _txDbm, value);
+        get => _txWatts;
+        set => this.RaiseAndSetIfChanged(ref _txWatts, value);
     }
     
     public int SteppedDiffDbm
@@ -81,5 +82,11 @@ public class MainWindowViewModel : ReactiveObject
     {
         get => _signal2Continuous;
         set => this.RaiseAndSetIfChanged(ref _signal2Continuous, value);
+    }
+
+    public bool Enable3dEffects
+    {
+        get => _enable3dEffects;
+        set => this.RaiseAndSetIfChanged(ref _enable3dEffects, value);
     }
 }

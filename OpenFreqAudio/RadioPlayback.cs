@@ -317,6 +317,8 @@ public class RadioPlayback
     private bool _timeoutMonitoringStarted;
     private int _masterDspProcHandle;
 
+    public bool Apply3dEffects { get; set; }
+
     public RadioPlayback(bool skipBassInitialization)
     {
         lock (_bassInitLock)
@@ -345,6 +347,11 @@ public class RadioPlayback
 
     public void StartStream(string streamId, string filePath, AudioParams audioParams)
     {
+        int bassStream;
+        ChannelInfo info;
+        bool needsRecreate = false;
+        int newSampleRate = 0;
+        
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
@@ -352,10 +359,10 @@ public class RadioPlayback
                 _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
 
             // Create BASS decode stream (float)
-            int bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
+            bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
             if (bassStream == 0) throw new Exception($"BASS error creating stream '{streamId}': {Bass.LastError}");
 
-            var info = Bass.ChannelGetInfo(bassStream);
+            info = Bass.ChannelGetInfo(bassStream);
 
             Console.WriteLine($"[StartStream] File info: SampleRate={info.Frequency}, Channels={info.Channels}");
 
@@ -364,22 +371,44 @@ public class RadioPlayback
                 _sampleRate = info.Frequency;
                 Console.WriteLine(
                     $"[StartStream] Creating master stream: SampleRate={_sampleRate}, Channels={_channels}");
-                StartMasterStream();
             }
             else if (_sampleRate != info.Frequency)
             {
                 Console.WriteLine(
                     $"[StartStream] Sample rate mismatch! File={info.Frequency}, Master={_sampleRate}. Recreating master stream.");
-                StopMasterStream();
-                _sampleRate = info.Frequency;
-                StartMasterStream();
+                needsRecreate = true;
+                newSampleRate = info.Frequency;
             }
             else
             {
                 Console.WriteLine(
                     $"[StartStream] Using existing master stream: SampleRate={_sampleRate}, Channels={_channels}");
             }
-
+        }
+        
+        if (needsRecreate)
+        {
+            StopMasterStream();
+            lock (_lock)
+            {
+                _sampleRate = newSampleRate;
+            }
+        }
+        
+        // Check if we need to start master stream and do it outside the lock
+        bool needsStartMaster;
+        lock (_lock)
+        {
+            needsStartMaster = _masterStream == 0;
+        }
+        
+        if (needsStartMaster)
+        {
+            StartMasterStream();
+        }
+        
+        lock (_lock)
+        {
             var stream = new RadioStream
             {
                 StreamId = streamId,
@@ -537,6 +566,9 @@ public class RadioPlayback
 
     public void StartPushStream(string streamId, int sampleRate, int channels, AudioParams audioParams)
     {
+        bool needsRecreate = false;
+        int newSampleRate = 0;
+        
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) return;
@@ -546,15 +578,37 @@ public class RadioPlayback
             if (_masterStream == 0)
             {
                 _sampleRate = sampleRate;
-                StartMasterStream();
             }
             else if (_sampleRate != sampleRate)
             {
-                StopMasterStream();
-                _sampleRate = sampleRate;
-                StartMasterStream();
+                needsRecreate = true;
+                newSampleRate = sampleRate;
             }
-
+        }
+        
+        if (needsRecreate)
+        {
+            StopMasterStream();
+            lock (_lock)
+            {
+                _sampleRate = newSampleRate;
+            }
+        }
+        
+        // Check if we need to start master stream and do it outside the lock
+        bool needsStartMaster = false;
+        lock (_lock)
+        {
+            needsStartMaster = _masterStream == 0;
+        }
+        
+        if (needsStartMaster)
+        {
+            StartMasterStream();
+        }
+        
+        lock (_lock)
+        {
             var stream = new RadioStream
             {
                 StreamId = streamId,
@@ -674,13 +728,22 @@ public class RadioPlayback
 
     public async Task StopStream(string streamId)
     {
+        bool shouldStopMaster = false;
+        
         await Task.Run(() =>
         {
             lock (_lock)
             {
                 StopStreamInternal(streamId);
+                shouldStopMaster = ShouldStopMasterStream();
             }
         });
+        
+        // Must release lock before calling StopMasterStream!
+        if (shouldStopMaster)
+        {
+            StopMasterStream();
+        }
     }
 
     private void StopStreamInternal(string streamId)
@@ -700,8 +763,14 @@ public class RadioPlayback
 
         _streams.Remove(streamId);
 
+        // Note: Don't call StopMasterStream here - let the caller handle it
+        // since this method is called from within locks
+    }
+    
+    private bool ShouldStopMasterStream()
+    {
         bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
-        if (_streams.Count == 0 && !hasTuned && _masterStream != 0) StopMasterStream();
+        return _streams.Count == 0 && !hasTuned && _masterStream != 0;
     }
 
     public void UpdateStreamParams(string streamId, AudioParams newParams)
@@ -716,14 +785,23 @@ public class RadioPlayback
 
     public void Initialize(int deviceIndex)
     {
+        bool needsStart = false;
+        
         lock (_lock)
         {
-            if (_masterStream == 0) StartMasterStream();
+            needsStart = _masterStream == 0;
+        }
+        
+        if (needsStart)
+        {
+            StartMasterStream();
         }
     }
 
     public void TuneFrequency(double frequencyMHz)
     {
+        bool needsStart = false;
+        
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyMHz))
@@ -758,18 +836,29 @@ public class RadioPlayback
                     $"[TuneFrequency] {frequencyMHz} MHz: MinimumGain={freqConfig.MinimumGain:F3}, NoiseFloor={noiseFloor:F3}");
             }
 
-            if (_masterStream == 0) StartMasterStream();
+            needsStart = _masterStream == 0;
+        }
+        
+        if (needsStart)
+        {
+            StartMasterStream();
         }
     }
 
     public void UntuneFrequency(double frequencyMHz)
     {
+        bool shouldStopMaster;
+        
         lock (_lock)
         {
             if (!_frequencies.TryGetValue(frequencyMHz, out var frequency)) return;
             frequency.IsTuned = false;
-            bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
-            if (!hasTuned && _streams.Count == 0 && _masterStream != 0) StopMasterStream();
+            shouldStopMaster = ShouldStopMasterStream();
+        }
+        
+        if (shouldStopMaster)
+        {
+            StopMasterStream();
         }
     }
 
@@ -914,18 +1003,35 @@ public class RadioPlayback
 
     private void StopMasterStream()
     {
-        if (_masterStream != 0)
+        // CRITICAL: Bass.ChannelRemoveDSP() blocks waiting for the DSP callback to complete,
+        // and the DSP callback needs to acquire _lock. We must NOT hold _lock during BASS calls.
+        
+        int streamToStop = 0;
+        int dspHandleToRemove = 0;
+        DSPProcedure? procToRemove = null;
+        
+        // Capture what we need to do while holding the lock
+        lock (_lock)
         {
-            Bass.ChannelStop(_masterStream);
-
-            // Remove DSP callback before freeing the stream
-            if (_dspProc != null)
-            {
-                Bass.ChannelRemoveDSP(_masterStream, _masterDspProcHandle);
-            }
-
-            Bass.StreamFree(_masterStream);
+            streamToStop = _masterStream;
+            dspHandleToRemove = _masterDspProcHandle;
+            procToRemove = _dspProc;
+            
+            // Clear state immediately so other threads know we're stopping
             _masterStream = 0;
+            _dspProc = null;
+            _masterDspProcHandle = 0;
+        }
+        
+        
+        if (streamToStop != 0)
+        {
+            if (procToRemove != null)
+            {
+                Bass.ChannelRemoveDSP(streamToStop, dspHandleToRemove);
+            }
+            Bass.ChannelStop(streamToStop);
+            Bass.StreamFree(streamToStop);
         }
     }
 
@@ -953,11 +1059,21 @@ public class RadioPlayback
             Dictionary<double, FrequencyConfig> frequencySnapshot;
             lock (_lock)
             {
-                activeStreams = _streams.Values.Where(s =>
-                    s.CurrentParams.Gain > 0 &&
-                    s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
+                if (Apply3dEffects)
+                {
+                    activeStreams = _streams.Values.Where(s =>
+                        s.CurrentParams.Gain > 0 &&
+                        s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
+                }
+
+                else
+                {
+                    activeStreams = _streams.Values.ToList();
+                }
                 frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
             }
+
+            
 
             int outputFrames = samples / _channels;
             Array.Clear(_dspScratch, 0, samples);
@@ -989,8 +1105,12 @@ public class RadioPlayback
 
                 int samplesRead = framesRead * stream.Channels;
                 stream.ValidSamples = samplesRead;
-                stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
-                stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
+
+                if (Apply3dEffects)
+                {
+                    stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
+                    stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
+                }
             }
 
             // 2: Process each frequency (noise + squelch + mixing)
@@ -1010,7 +1130,7 @@ public class RadioPlayback
                                          ?? freqConfig.DefaultSquelchThreshold;
 
                 // --- NOISE GENERATION ---
-                if (freqConfig.NoiseGenerator != null)
+                if (Apply3dEffects && freqConfig.NoiseGenerator != null)
                 {
                     bool freqHasHearableStreams = freqStreams.Any(s => s.RadioEffect.IsSquelchOpen);
                     bool noiseIsSquelched = (float)freqConfig.MinimumGain <= squelchThreshold ||
@@ -1058,7 +1178,7 @@ public class RadioPlayback
                 }
 
                 // --- SQUELCH BURST HANDLING ---
-                if (freqConfig.SquelchBurst != null)
+                if (Apply3dEffects && freqConfig.SquelchBurst != null)
                 {
                     // Use explicit transmission state from RTP markers
                     bool hasActiveTransmission = freqStreams.Any(s => s.IsTransmitting);
@@ -1112,7 +1232,7 @@ public class RadioPlayback
                     {
                         ConvertToOutputFormat(transmittingStreams[0], _frequencyMixBuffer, samples);
                     }
-                    else // 2+ transmitting streams = stepped-on
+                    else if (Apply3dEffects) // 2+ transmitting streams = stepped-on
                     {
                         var sorted = transmittingStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
                         var primary = sorted[0];
@@ -1130,10 +1250,22 @@ public class RadioPlayback
                             steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(),
                             primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
                     }
+                    
+                    else // 2+ streams without effects, simple additive mix
+                    {
+                        // Simple additive mixing with normalization
+                        float mixGain = 1.0f / MathF.Sqrt(transmittingStreams.Count); // Preserve energy
+                        foreach (var stream in transmittingStreams)
+                        {
+                            ConvertToOutputFormat(stream, _mixBuffer1, samples);
+                            for (int i = 0; i < samples; i++)
+                                _frequencyMixBuffer[i] += _mixBuffer1[i] * mixGain;
+                        }
+                    }
                 }
 
                 // Process squelch burst (happens even if no transmitting streams)
-                if (freqConfig.SquelchBurst != null)
+                if (Apply3dEffects && freqConfig.SquelchBurst != null)
                     freqConfig.SquelchBurst.Process(_frequencyMixBuffer, 0, samples);
 
                 // Upmix to stereo output
@@ -1220,16 +1352,25 @@ public class RadioPlayback
 
     public void ChangeOutputDevice(int newDeviceIndex)
     {
+        bool hadMasterStream = false;
+        
         lock (_lock)
         {
-            if (_masterStream != 0)
-            {
-                Bass.ChannelStop(_masterStream);
-                Bass.StreamFree(_masterStream);
-                _masterStream = 0;
-            }
-
+            hadMasterStream = _masterStream != 0;
+        }
+        
+        if (hadMasterStream)
+        {
+            StopMasterStream();
+        }
+        
+        lock (_lock)
+        {
             Bass.CurrentDevice = newDeviceIndex;
+        }
+        
+        if (hadMasterStream)
+        {
             StartMasterStream();
         }
     }

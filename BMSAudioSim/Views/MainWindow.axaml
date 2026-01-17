@@ -15,6 +15,7 @@
         <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="20" VerticalAlignment="Center">
             <Button Click="OnLoadClicked">Load Heightmap</Button>
             <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center" Grid.Column="1">No heightmap loaded</TextBlock>
+            <CheckBox Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
         </StackPanel>
 
         <!-- Main Content: Heightmap and Graph side by side -->
@@ -109,8 +110,8 @@
                 <TextBlock Text="Sender:" FontWeight="Bold" />
                 <TextBlock Name="SenderPosText" Text="Not set" />
                 <StackPanel>
-                    <TextBlock Text="{Binding TxDbm, StringFormat='{}{0} dBm'}"></TextBlock>
-                    <Slider Minimum="10" Maximum="50" Value="{Binding TxDbm}" ValueChanged="OnAltSliderChanged"></Slider>
+                    <TextBlock Text="{Binding TxWatts, StringFormat='{}{0} W'}"></TextBlock>
+                    <Slider Minimum="10" Maximum="50" Value="{Binding TxWatts}" ValueChanged="OnAltSliderChanged"></Slider>
                     <StackPanel Orientation="Horizontal">
                         <RadioButton Name="RadioButtonUhf" IsChecked="True"
                                      IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF (left)" />
