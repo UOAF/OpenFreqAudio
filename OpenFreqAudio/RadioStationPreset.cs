@@ -12,15 +12,8 @@ using System.Linq;
 /// </summary>
 public class RadioStationPreset
 {
-    public enum RadioStationPresetType
-    {
-        BMS,
-        ACMI,
-        STATIONARY
-    }
-    
-    public string Name { get; set; }
-    public string Category { get; set; }
+    public string? Name { get; set; }
+    public string? Category { get; set; }
     public double AntennaElevation_m { get; set; }
 
     // VHF-specific parameters
@@ -31,16 +24,17 @@ public class RadioStationPreset
     public double TxPower_UHF_W { get; set; }
     public double RxSensitivity_UHF_dBm { get; set; }
 
-    public string Description { get; set; }
+    public string? Description { get; set; }
     
-    public RadioStationPresetType Type { get; set; }
     
-    public Position? FixedPosition { get; set; }
+    
+    public RadioStationPreset()
+    { }
 
     public RadioStationPreset(string name, string category, double antennaElevation,
         double txPowerVhf, double rxSensitivityVhf,
         double txPowerUhf, double rxSensitivityUhf,
-        string description, RadioStationPresetType type = RadioStationPresetType.STATIONARY)
+        string description)
     {
         Name = name;
         Category = category;
@@ -50,7 +44,6 @@ public class RadioStationPreset
         TxPower_UHF_W = txPowerUhf;
         RxSensitivity_UHF_dBm = rxSensitivityUhf;
         Description = description;
-        Type = type;
     }
 
     /// <summary>
@@ -299,6 +292,7 @@ public static class RadioStationPresets
         };
     }
 
+    // For UI bindings
     public static readonly IEnumerable<RadioStationPreset> AllPresets =
     [
         // Airborne

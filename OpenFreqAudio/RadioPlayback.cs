@@ -351,7 +351,7 @@ public class RadioPlayback
         ChannelInfo info;
         bool needsRecreate = false;
         int newSampleRate = 0;
-        
+
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
@@ -385,7 +385,7 @@ public class RadioPlayback
                     $"[StartStream] Using existing master stream: SampleRate={_sampleRate}, Channels={_channels}");
             }
         }
-        
+
         if (needsRecreate)
         {
             StopMasterStream();
@@ -394,19 +394,19 @@ public class RadioPlayback
                 _sampleRate = newSampleRate;
             }
         }
-        
+
         // Check if we need to start master stream and do it outside the lock
         bool needsStartMaster;
         lock (_lock)
         {
             needsStartMaster = _masterStream == 0;
         }
-        
+
         if (needsStartMaster)
         {
             StartMasterStream();
         }
-        
+
         lock (_lock)
         {
             var stream = new RadioStream
@@ -568,7 +568,7 @@ public class RadioPlayback
     {
         bool needsRecreate = false;
         int newSampleRate = 0;
-        
+
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) return;
@@ -585,7 +585,7 @@ public class RadioPlayback
                 newSampleRate = sampleRate;
             }
         }
-        
+
         if (needsRecreate)
         {
             StopMasterStream();
@@ -594,19 +594,19 @@ public class RadioPlayback
                 _sampleRate = newSampleRate;
             }
         }
-        
+
         // Check if we need to start master stream and do it outside the lock
         bool needsStartMaster = false;
         lock (_lock)
         {
             needsStartMaster = _masterStream == 0;
         }
-        
+
         if (needsStartMaster)
         {
             StartMasterStream();
         }
-        
+
         lock (_lock)
         {
             var stream = new RadioStream
@@ -729,7 +729,7 @@ public class RadioPlayback
     public async Task StopStream(string streamId)
     {
         bool shouldStopMaster = false;
-        
+
         await Task.Run(() =>
         {
             lock (_lock)
@@ -738,7 +738,7 @@ public class RadioPlayback
                 shouldStopMaster = ShouldStopMasterStream();
             }
         });
-        
+
         // Must release lock before calling StopMasterStream!
         if (shouldStopMaster)
         {
@@ -766,7 +766,7 @@ public class RadioPlayback
         // Note: Don't call StopMasterStream here - let the caller handle it
         // since this method is called from within locks
     }
-    
+
     private bool ShouldStopMasterStream()
     {
         bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
@@ -786,12 +786,12 @@ public class RadioPlayback
     public void Initialize(int deviceIndex)
     {
         bool needsStart = false;
-        
+
         lock (_lock)
         {
             needsStart = _masterStream == 0;
         }
-        
+
         if (needsStart)
         {
             StartMasterStream();
@@ -801,7 +801,7 @@ public class RadioPlayback
     public void TuneFrequency(double frequencyMHz)
     {
         bool needsStart = false;
-        
+
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyMHz))
@@ -838,7 +838,7 @@ public class RadioPlayback
 
             needsStart = _masterStream == 0;
         }
-        
+
         if (needsStart)
         {
             StartMasterStream();
@@ -848,14 +848,14 @@ public class RadioPlayback
     public void UntuneFrequency(double frequencyMHz)
     {
         bool shouldStopMaster;
-        
+
         lock (_lock)
         {
             if (!_frequencies.TryGetValue(frequencyMHz, out var frequency)) return;
             frequency.IsTuned = false;
             shouldStopMaster = ShouldStopMasterStream();
         }
-        
+
         if (shouldStopMaster)
         {
             StopMasterStream();
@@ -1005,31 +1005,32 @@ public class RadioPlayback
     {
         // CRITICAL: Bass.ChannelRemoveDSP() blocks waiting for the DSP callback to complete,
         // and the DSP callback needs to acquire _lock. We must NOT hold _lock during BASS calls.
-        
+
         int streamToStop = 0;
         int dspHandleToRemove = 0;
         DSPProcedure? procToRemove = null;
-        
+
         // Capture what we need to do while holding the lock
         lock (_lock)
         {
             streamToStop = _masterStream;
             dspHandleToRemove = _masterDspProcHandle;
             procToRemove = _dspProc;
-            
+
             // Clear state immediately so other threads know we're stopping
             _masterStream = 0;
             _dspProc = null;
             _masterDspProcHandle = 0;
         }
-        
-        
+
+
         if (streamToStop != 0)
         {
             if (procToRemove != null)
             {
                 Bass.ChannelRemoveDSP(streamToStop, dspHandleToRemove);
             }
+
             Bass.ChannelStop(streamToStop);
             Bass.StreamFree(streamToStop);
         }
@@ -1070,10 +1071,10 @@ public class RadioPlayback
                 {
                     activeStreams = _streams.Values.ToList();
                 }
+
                 frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
             }
 
-            
 
             int outputFrames = samples / _channels;
             Array.Clear(_dspScratch, 0, samples);
@@ -1200,18 +1201,38 @@ public class RadioPlayback
                     }
 
                     bool isActiveTransmission = hasActiveTransmission && hasRecentPackets;
-                    bool noiseAboveSquelch = (float)freqConfig.MinimumGain > squelchThreshold;
-                    bool isSquelchOpen = isActiveTransmission || noiseAboveSquelch;
 
-                    if (isSquelchOpen != freqConfig.WasSquelchOpen)
+                    // Check if background noise is above squelch threshold (keeps gate open)
+                    bool backgroundNoiseAboveSquelch = (float)freqConfig.MinimumGain > squelchThreshold;
+
+                    // Check if any transmitting stream has signal strength above squelch threshold
+                    bool hasAudibleSignal = isActiveTransmission &&
+                                            freqStreams.Any(s =>
+                                                s.IsTransmitting && s.CurrentParams.Gain > squelchThreshold);
+
+                    // Gate is open if either background noise OR audible signal is present
+                    bool isSquelchOpen = backgroundNoiseAboveSquelch || hasAudibleSignal;
+
+                    // Squelch bursts only happen if threshold > 0 (otherwise gate always open, no point in bursts)
+                    bool squelchIsActive = squelchThreshold > 0.0f;
+
+                    if (squelchIsActive && isSquelchOpen != freqConfig.WasSquelchOpen)
                     {
-                        Console.WriteLine($"[DSP:{freq}] SQUELCH {(isSquelchOpen ? "OPEN" : "CLOSED")}");
+                        Console.WriteLine($"[DSP:{freq}] SQUELCH {(isSquelchOpen ? "OPEN" : "CLOSED")} " +
+                                          $"(threshold={squelchThreshold:F3}, noise={freqConfig.MinimumGain:F3}, " +
+                                          $"hasSignal={hasAudibleSignal}, noiseAbove={backgroundNoiseAboveSquelch})");
+
                         if (isSquelchOpen)
                             freqConfig.SquelchBurst.TriggerOpening();
                         else
                             freqConfig.SquelchBurst.TriggerClosing();
 
                         freqConfig.WasSquelchOpen = isSquelchOpen;
+                    }
+                    else if (!squelchIsActive)
+                    {
+                        // Squelch at 0 - ensure we track gate as open
+                        freqConfig.WasSquelchOpen = true;
                     }
                 }
 
@@ -1250,7 +1271,7 @@ public class RadioPlayback
                             steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(),
                             primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
                     }
-                    
+
                     else // 2+ streams without effects, simple additive mix
                     {
                         // Simple additive mixing with normalization
@@ -1271,7 +1292,7 @@ public class RadioPlayback
                 // Upmix to stereo output
                 float volume = freqConfig.Volume;
                 var audioChannel = freqConfig.AudioChannel;
-                
+
                 int frames = samples / 2;
                 for (int frame = 0; frame < frames; frame++)
                 {
@@ -1353,22 +1374,22 @@ public class RadioPlayback
     public void ChangeOutputDevice(int newDeviceIndex)
     {
         bool hadMasterStream = false;
-        
+
         lock (_lock)
         {
             hadMasterStream = _masterStream != 0;
         }
-        
+
         if (hadMasterStream)
         {
             StopMasterStream();
         }
-        
+
         lock (_lock)
         {
             Bass.CurrentDevice = newDeviceIndex;
         }
-        
+
         if (hadMasterStream)
         {
             StartMasterStream();

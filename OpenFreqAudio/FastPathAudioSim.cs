@@ -150,8 +150,8 @@ namespace OpenFreqAudio
             this.bytesPerSample = bytesPerSample;
             this.headerBytes = headerBytes;
 
-            mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null);
-            accessor = mmf.CreateViewAccessor();
+            mmf = MemoryMappedFile.CreateFromFile(path,FileMode.Open,null,0, MemoryMappedFileAccess.Read);
+            accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
         public float Sample(int row, int col)
@@ -190,7 +190,7 @@ namespace OpenFreqAudio
                 bandwidth: 4000.0f,
                 diffractionDb: 3.0,
                 modulation: ModulationType.AM),
-            
+
             new RadioBandConfig(
                 bandName: "VHF",
                 freqMin: 30.0,
@@ -711,13 +711,17 @@ namespace OpenFreqAudio
             ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
         }
 
+        /// <summary>
+        /// Calculates the Audio Parameters for a receiver
+        /// </summary>
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
             double frequencyMHz, double txPowerWatts = 10.0,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
-            bool altitudeIsMSL = false)
+            bool txAltitudeIsMSL = false,
+            bool rxAltitudeIsMSL = false)
         {
             if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
             {
@@ -738,16 +742,20 @@ namespace OpenFreqAudio
             double rxXVal = rxX.Value;
             double rxYVal = rxY.Value;
             double rxAltVal = rxAlt.Value;
-            
+
             // Convert transmit power from watts to dBm
             // Formula: dBm = 10 * log10(powerWatts * 1000)
             double txPowerDbm = 10.0 * Math.Log10(txPowerWatts * 1000.0);
 
             // Convert AGL to MSL
-            if (!altitudeIsMSL)
+            if (!rxAltitudeIsMSL)
+            {
+                rxAltVal += SampleElevation(rxXVal, rxYVal);
+            }
+
+            if (!txAltitudeIsMSL)
             {
                 txAltVal += SampleElevation(txXVal, txYVal);
-                rxAltVal += SampleElevation(rxXVal, rxYVal);
             }
 
             // Use provided sensitivity or default values based on modulation
