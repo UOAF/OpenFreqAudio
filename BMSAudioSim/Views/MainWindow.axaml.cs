@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
@@ -14,6 +15,7 @@ using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using BMSAudioSim.ViewModels;
 using Microsoft.Extensions.Logging;
 using OpenFreqAudio;
@@ -87,7 +89,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     protected override void OnLoaded(RoutedEventArgs e)
     {
-        base.OnLoaded(e);
+        base.OnLoaded(e); 
         _radioPlayback.Initialize(0);
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyMhz, ViewModel.Squelch);
         _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Right);
@@ -663,8 +665,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
-        Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-
         _radioPlayback.UntuneFrequency((float)ViewModel.FrequencyMhz);
         if (RadioButtonUhf.IsChecked == true)
         {

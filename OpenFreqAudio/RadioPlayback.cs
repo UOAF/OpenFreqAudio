@@ -313,7 +313,7 @@ public class RadioPlayback
     private const int NoiseFadeSamples = 2400;
 
     private static bool _bassInitialized;
-    private static readonly object _bassInitLock = new();
+    private static readonly Lock _bassInitLock = new();
     private bool _timeoutMonitoringStarted;
     private int _masterDspProcHandle;
 
@@ -366,13 +366,8 @@ public class RadioPlayback
 
             Console.WriteLine($"[StartStream] File info: SampleRate={info.Frequency}, Channels={info.Channels}");
 
-            if (_masterStream == 0)
-            {
-                _sampleRate = info.Frequency;
-                Console.WriteLine(
-                    $"[StartStream] Creating master stream: SampleRate={_sampleRate}, Channels={_channels}");
-            }
-            else if (_sampleRate != info.Frequency)
+            // Check if sample rate changed - recreate master stream if needed
+            if (_sampleRate != info.Frequency)
             {
                 Console.WriteLine(
                     $"[StartStream] Sample rate mismatch! File={info.Frequency}, Master={_sampleRate}. Recreating master stream.");
@@ -393,17 +388,6 @@ public class RadioPlayback
             {
                 _sampleRate = newSampleRate;
             }
-        }
-
-        // Check if we need to start master stream and do it outside the lock
-        bool needsStartMaster;
-        lock (_lock)
-        {
-            needsStartMaster = _masterStream == 0;
-        }
-
-        if (needsStartMaster)
-        {
             StartMasterStream();
         }
 
@@ -575,11 +559,8 @@ public class RadioPlayback
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyMHz))
                 _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
 
-            if (_masterStream == 0)
-            {
-                _sampleRate = sampleRate;
-            }
-            else if (_sampleRate != sampleRate)
+            // Check if sample rate changed - recreate master stream if needed
+            if (_sampleRate != sampleRate)
             {
                 needsRecreate = true;
                 newSampleRate = sampleRate;
@@ -593,17 +574,6 @@ public class RadioPlayback
             {
                 _sampleRate = newSampleRate;
             }
-        }
-
-        // Check if we need to start master stream and do it outside the lock
-        bool needsStartMaster = false;
-        lock (_lock)
-        {
-            needsStartMaster = _masterStream == 0;
-        }
-
-        if (needsStartMaster)
-        {
             StartMasterStream();
         }
 
@@ -785,17 +755,21 @@ public class RadioPlayback
 
     public void Initialize(int deviceIndex)
     {
-        bool needsStart = false;
-
         lock (_lock)
         {
-            needsStart = _masterStream == 0;
+            // Set default sample rate if not already set
+            if (_sampleRate == 0)
+            {
+                _sampleRate = 48000; // Default to 48kHz (matches OpenFreqRtcClient.SAMPLE_RATE)
+            }
+            
+            // Bass.CurrentDevice = deviceIndex;
         }
 
-        if (needsStart)
-        {
-            StartMasterStream();
-        }
+        // Always start master stream during initialization
+        // This eliminates race conditions when adding streams later
+        // The stream will just output silence until streams are added
+        StartMasterStream();
     }
 
     public void TuneFrequency(double frequencyMHz)
@@ -835,13 +809,6 @@ public class RadioPlayback
                 Console.WriteLine(
                     $"[TuneFrequency] {frequencyMHz} MHz: MinimumGain={freqConfig.MinimumGain:F3}, NoiseFloor={noiseFloor:F3}");
             }
-
-            needsStart = _masterStream == 0;
-        }
-
-        if (needsStart)
-        {
-            StartMasterStream();
         }
     }
 
@@ -918,7 +885,7 @@ public class RadioPlayback
         return null;
     }
 
-    public void SetFrequencyVolume(float frequencyMHz, float volume)
+    public void SetFrequencyVolume(double frequencyMHz, float volume)
     {
         lock (_lock)
         {
@@ -927,7 +894,7 @@ public class RadioPlayback
         }
     }
 
-    public void SetFrequencyAudioChannel(float frequencyMHz, AudioChannel channel)
+    public void SetFrequencyAudioChannel(double frequencyMHz, AudioChannel channel)
     {
         lock (_lock)
         {
@@ -1003,9 +970,6 @@ public class RadioPlayback
 
     private void StopMasterStream()
     {
-        // CRITICAL: Bass.ChannelRemoveDSP() blocks waiting for the DSP callback to complete,
-        // and the DSP callback needs to acquire _lock. We must NOT hold _lock during BASS calls.
-
         int streamToStop = 0;
         int dspHandleToRemove = 0;
         DSPProcedure? procToRemove = null;
