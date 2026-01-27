@@ -10,7 +10,7 @@ public class MainWindowViewModel : ReactiveObject
     private int _txWatts = 40;
     private int _rxDbm = -105;
 
-    private double _frequencyMhz = 513.75; // default UHF
+    private int _frequencyKhz = 513750; // default UHF
 
     private int _steppedDiffDbm = 0;
     private bool _signal1Continuous = false;
@@ -66,10 +66,10 @@ public class MainWindowViewModel : ReactiveObject
         set => this.RaiseAndSetIfChanged(ref _rxDbm, value);
     }
 
-    public double FrequencyMhz
+    public int FrequencyKhz
     {
-        get => _frequencyMhz;
-        set => this.RaiseAndSetIfChanged(ref _frequencyMhz, value);
+        get => _frequencyKhz;
+        set => this.RaiseAndSetIfChanged(ref _frequencyKhz, value);
     }
 
     public bool Signal1Continuous
@@ -89,4 +89,6 @@ public class MainWindowViewModel : ReactiveObject
         get => _enable3dEffects;
         set => this.RaiseAndSetIfChanged(ref _enable3dEffects, value);
     }
+
+    public double FrequencyMhz => FrequencyKhz / 1000d;
 }

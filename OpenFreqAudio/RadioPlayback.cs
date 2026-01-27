@@ -16,7 +16,7 @@ public class RadioPlayback
     private class RadioStream
     {
         public string StreamId { get; set; } = "";
-        public double FrequencyMHz { get; set; }
+        public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
         public int Channels { get; set; } // 1=mono,2=stereo
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
@@ -293,7 +293,7 @@ public class RadioPlayback
     }
 
     private readonly Dictionary<string, RadioStream> _streams = new();
-    private readonly Dictionary<double, FrequencyConfig> _frequencies = new();
+    private readonly Dictionary<int, FrequencyConfig> _frequencies = new();
     private readonly object _lock = new();
 
     private int _masterStream;
@@ -355,8 +355,8 @@ public class RadioPlayback
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
-            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyMHz))
-                _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
+            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
+                _frequencies[audioParams.RadioFrequencyKHz] = new FrequencyConfig();
 
             // Create BASS decode stream (float)
             bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
@@ -396,7 +396,7 @@ public class RadioPlayback
             var stream = new RadioStream
             {
                 StreamId = streamId,
-                FrequencyMHz = audioParams.RadioFrequencyMHz,
+                FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = bassStream,
                 Channels = info.Channels,
                 IsPush = false,
@@ -524,21 +524,21 @@ public class RadioPlayback
             }, token);
 
             // Apply frequency's default squelch threshold to the new stream
-            if (_frequencies.TryGetValue(audioParams.RadioFrequencyMHz, out var freqConfig))
+            if (_frequencies.TryGetValue(audioParams.RadioFrequencyKHz, out var freqConfig))
             {
                 stream.RadioEffect.SetSquelchThreshold(freqConfig.DefaultSquelchThreshold);
             }
             else
             {
                 // Frequency not tuned yet - calculate physics-based default
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyMHz);
+                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyKHz);
                 stream.RadioEffect.SetSquelchThreshold(noiseFloor);
             }
 
             _streams.Add(streamId, stream);
 
             Console.WriteLine(
-                $"[StartStream] Added file stream {streamId}: Freq={audioParams.RadioFrequencyMHz}, Gain={audioParams.Gain}, Channels={info.Channels}, FileRate={info.Frequency}Hz, MasterRate={_sampleRate}Hz, RingBuffer={stream.RingBuffer.Length} floats");
+                $"[StartStream] Added file stream {streamId}: Freq={audioParams.RadioFrequencyKHz / 1000.0:F3}MHz, Gain={audioParams.Gain}, Channels={info.Channels}, FileRate={info.Frequency}Hz, MasterRate={_sampleRate}Hz, RingBuffer={stream.RingBuffer.Length} floats");
 
             if (info.Frequency != _sampleRate)
             {
@@ -556,8 +556,8 @@ public class RadioPlayback
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) return;
-            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyMHz))
-                _frequencies[audioParams.RadioFrequencyMHz] = new FrequencyConfig();
+            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
+                _frequencies[audioParams.RadioFrequencyKHz] = new FrequencyConfig();
 
             // Check if sample rate changed - recreate master stream if needed
             if (_sampleRate != sampleRate)
@@ -582,7 +582,7 @@ public class RadioPlayback
             var stream = new RadioStream
             {
                 StreamId = streamId,
-                FrequencyMHz = audioParams.RadioFrequencyMHz,
+                FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = 0,
                 Channels = channels,
                 IsPush = true,
@@ -599,18 +599,18 @@ public class RadioPlayback
             stream.MinBufferFrames = minBufferFrames;
             stream.IsBuffering = true;
 
-            if (_frequencies.TryGetValue(audioParams.RadioFrequencyMHz, out var freqConfig))
+            if (_frequencies.TryGetValue(audioParams.RadioFrequencyKHz, out var freqConfig))
             {
                 stream.RadioEffect.SetSquelchThreshold(freqConfig.DefaultSquelchThreshold);
             }
             else
             {
                 // Frequency not tuned yet - calculate physics-based default
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyMHz);
+                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyKHz);
                 stream.RadioEffect.SetSquelchThreshold(noiseFloor);
             }
 
-            Console.WriteLine($"[StartPushStream] Stream '{streamId}' on {audioParams.RadioFrequencyMHz} MHz");
+            Console.WriteLine($"[StartPushStream] Stream '{streamId}' on {audioParams.RadioFrequencyKHz / 1000.0:F3} MHz");
             Console.WriteLine($"[StartPushStream]   SampleRate={sampleRate}, Channels={channels}");
             Console.WriteLine(
                 $"[StartPushStream]   RingBuffer: {ringFrames} frames × {Math.Max(1, channels)} ch = {ringCapacity} samples ({(float)ringFrames / sampleRate:F1}s)");
@@ -772,16 +772,16 @@ public class RadioPlayback
         StartMasterStream();
     }
 
-    public void TuneFrequency(double frequencyMHz)
+    public void TuneFrequency(int frequencyKHz)
     {
         bool needsStart = false;
 
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyMHz))
-                _frequencies[frequencyMHz] = new FrequencyConfig();
+            if (!_frequencies.ContainsKey(frequencyKHz))
+                _frequencies[frequencyKHz] = new FrequencyConfig();
 
-            var freqConfig = _frequencies[frequencyMHz];
+            var freqConfig = _frequencies[frequencyKHz];
             if (freqConfig.SquelchBurst == null)
             {
                 freqConfig.SquelchBurst = new SquelchBurstGenerator(_sampleRate, _channels);
@@ -790,35 +790,35 @@ public class RadioPlayback
             freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
             {
-                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyMHz);
+                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyKHz);
 
                 // Background noise amplitude when no one is transmitting
-                freqConfig.MinimumGain = FastPathAudioSim.CalculateBackgroundNoiseAmplitude(frequencyMHz);
+                freqConfig.MinimumGain = FastPathAudioSim.CalculateBackgroundNoiseAmplitude(frequencyKHz);
 
                 // Set physics-based default squelch threshold based on noise floor
                 // This is the minimum detectable signal level - signals below this are unintelligible
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(frequencyMHz);
+                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(frequencyKHz);
                 freqConfig.DefaultSquelchThreshold = noiseFloor;
 
                 // Apply to any existing streams on this frequency
-                foreach (var stream in _streams.Values.Where(s => Math.Abs(s.FrequencyMHz - frequencyMHz) < 0.01))
+                foreach (var stream in _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz))
                 {
                     stream.RadioEffect.SetSquelchThreshold(noiseFloor);
                 }
 
                 Console.WriteLine(
-                    $"[TuneFrequency] {frequencyMHz} MHz: MinimumGain={freqConfig.MinimumGain:F3}, NoiseFloor={noiseFloor:F3}");
+                    $"[TuneFrequency] {frequencyKHz / 1000.0:F3} MHz: MinimumGain={freqConfig.MinimumGain:F3}, NoiseFloor={noiseFloor:F3}");
             }
         }
     }
 
-    public void UntuneFrequency(double frequencyMHz)
+    public void UntuneFrequency(int frequencyKHz)
     {
         bool shouldStopMaster;
 
         lock (_lock)
         {
-            if (!_frequencies.TryGetValue(frequencyMHz, out var frequency)) return;
+            if (!_frequencies.TryGetValue(frequencyKHz, out var frequency)) return;
             frequency.IsTuned = false;
             shouldStopMaster = ShouldStopMasterStream();
         }
@@ -829,14 +829,14 @@ public class RadioPlayback
         }
     }
 
-    public void SetSquelchLevel(double frequencyMHz, float squelchLevel)
+    public void SetSquelchLevel(int frequencyKHz, float squelchLevel)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyMHz))
-                _frequencies[frequencyMHz] = new FrequencyConfig();
+            if (!_frequencies.ContainsKey(frequencyKHz))
+                _frequencies[frequencyKHz] = new FrequencyConfig();
 
-            var freqConfig = _frequencies[frequencyMHz];
+            var freqConfig = _frequencies[frequencyKHz];
 
             // Calculate effective threshold based on background noise amplitude
             // squelchLevel = 1.0 means threshold equals background noise (cuts it out)
@@ -847,7 +847,7 @@ public class RadioPlayback
             freqConfig.SquelchLevel = squelchLevel;
 
             // Apply absolute threshold to all streams on this frequency
-            foreach (var s in _streams.Values.Where(s => Math.Abs(s.FrequencyMHz - frequencyMHz) < 0.01))
+            foreach (var s in _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz))
             {
                 s.RadioEffect.SetSquelchThreshold(effectiveThreshold);
             }
@@ -857,50 +857,50 @@ public class RadioPlayback
         }
     }
 
-    public float GetSquelchLevel(double frequencyMHz)
+    public float GetSquelchLevel(int frequencyKHz)
     {
         lock (_lock)
         {
-            if (_frequencies.TryGetValue(frequencyMHz, out var config))
+            if (_frequencies.TryGetValue(frequencyKHz, out var config))
                 return config.SquelchLevel;
         }
 
         return 1.0f; // Default
     }
 
-    public float? GetSquelchThreshold(double frequencyMHz)
+    public float? GetSquelchThreshold(int frequencyKHz)
     {
         lock (_lock)
         {
             // Get threshold from any stream on this frequency
-            var stream = _streams.Values.FirstOrDefault(s => Math.Abs(s.FrequencyMHz - frequencyMHz) < 0.01);
+            var stream = _streams.Values.FirstOrDefault(s => s.FrequencyKHz == frequencyKHz);
             if (stream != null)
                 return stream.RadioEffect.GetSquelchThreshold();
 
             // If no active streams, return the default for this frequency
-            if (_frequencies.TryGetValue(frequencyMHz, out var config))
+            if (_frequencies.TryGetValue(frequencyKHz, out var config))
                 return config.DefaultSquelchThreshold;
         }
 
         return null;
     }
 
-    public void SetFrequencyVolume(double frequencyMHz, float volume)
+    public void SetFrequencyVolume(int frequencyKHz, float volume)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyMHz)) _frequencies[frequencyMHz] = new FrequencyConfig();
-            _frequencies[frequencyMHz].Volume = Math.Clamp(volume, 0f, 1f);
+            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
+            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 1f);
         }
     }
 
-    public void SetFrequencyAudioChannel(double frequencyMHz, AudioChannel channel)
+    public void SetFrequencyAudioChannel(int frequencyKHz, AudioChannel channel)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyMHz))
-                _frequencies[frequencyMHz] = new FrequencyConfig();
-            _frequencies[frequencyMHz].AudioChannel = channel;
+            if (!_frequencies.ContainsKey(frequencyKHz))
+                _frequencies[frequencyKHz] = new FrequencyConfig();
+            _frequencies[frequencyKHz].AudioChannel = channel;
         }
     }
 
@@ -1021,14 +1021,14 @@ public class RadioPlayback
 
             // Snapshot state once
             List<RadioStream> activeStreams;
-            Dictionary<double, FrequencyConfig> frequencySnapshot;
+            Dictionary<int, FrequencyConfig> frequencySnapshot;
             lock (_lock)
             {
                 if (Apply3dEffects)
                 {
                     activeStreams = _streams.Values.Where(s =>
                         s.CurrentParams.Gain > 0 &&
-                        s.CurrentParams.Gain >= _frequencies[s.FrequencyMHz].MinimumGain).ToList();
+                        s.CurrentParams.Gain >= _frequencies[s.FrequencyKHz].MinimumGain).ToList();
                 }
 
                 else
@@ -1036,7 +1036,7 @@ public class RadioPlayback
                     activeStreams = _streams.Values.ToList();
                 }
 
-                frequencySnapshot = new Dictionary<double, FrequencyConfig>(_frequencies);
+                frequencySnapshot = new Dictionary<int, FrequencyConfig>(_frequencies);
             }
 
 
@@ -1044,10 +1044,10 @@ public class RadioPlayback
             Array.Clear(_dspScratch, 0, samples);
 
             // Pre-group streams by frequency
-            var streamsByFrequency = new Dictionary<double, List<RadioStream>>();
+            var streamsByFrequency = new Dictionary<int, List<RadioStream>>();
             foreach (var stream in activeStreams)
             {
-                double freq = stream.FrequencyMHz;
+                int freq = stream.FrequencyKHz;
                 if (!streamsByFrequency.TryGetValue(freq, out var list))
                 {
                     list = new List<RadioStream>();
@@ -1081,7 +1081,7 @@ public class RadioPlayback
             // 2: Process each frequency (noise + squelch + mixing)
             foreach (var kvp in frequencySnapshot)
             {
-                double freq = kvp.Key;
+                int freq = kvp.Key;
                 var freqConfig = kvp.Value;
                 if (!freqConfig.IsTuned) continue;
 
@@ -1301,10 +1301,10 @@ public class RadioPlayback
         lock (_lock) return _streams.Keys.ToList();
     }
 
-    public List<string> GetStreamsOnFrequency(double f)
+    public List<string> GetStreamsOnFrequency(int frequencyKHz)
     {
         lock (_lock)
-            return _streams.Values.Where(s => Math.Abs(s.FrequencyMHz - f) < 0.001).Select(s => s.StreamId).ToList();
+            return _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz).Select(s => s.StreamId).ToList();
     }
 
     public bool IsStreamActive(string id)
@@ -1312,9 +1312,9 @@ public class RadioPlayback
         lock (_lock) return _streams.TryGetValue(id, out _);
     }
 
-    public List<double> GetActiveFrequencies()
+    public List<int> GetActiveFrequencies()
     {
-        lock (_lock) return _streams.Values.Select(s => s.FrequencyMHz).Distinct().OrderBy(x => x).ToList();
+        lock (_lock) return _streams.Values.Select(s => s.FrequencyKHz).Distinct().OrderBy(x => x).ToList();
     }
 
     public AudioParams? GetStreamParams(string id)
@@ -1326,11 +1326,11 @@ public class RadioPlayback
         }
     }
 
-    public double? GetStreamFrequency(string id)
+    public int? GetStreamFrequency(string id)
     {
         lock (_lock)
         {
-            if (_streams.TryGetValue(id, out var s)) return s.FrequencyMHz;
+            if (_streams.TryGetValue(id, out var s)) return s.FrequencyKHz;
             return null;
         }
     }
