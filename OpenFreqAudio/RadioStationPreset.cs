@@ -40,6 +40,11 @@ public class RadioStationPreset
         RxSensitivity_UHF_dBm = rxSensitivityUhf;
         Description = description;
     }
+    
+    public override bool Equals(object? obj)
+    {
+        return obj is RadioStationPreset other && Name == other.Name;
+    }
 
     /// <summary>
     /// Get TX power for the specified radio type
