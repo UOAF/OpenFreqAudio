@@ -308,7 +308,7 @@ namespace OpenFreqAudio
         /// Calculate the thermal noise floor amplitude for background noise playback.
         /// This is the noise level heard through speakers when squelch is open but no signal present.
         /// </summary>
-        /// <param name="frequencyMhz"></param>
+        /// <param name="frequencyKhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
         /// <param name="modulation">Modulation type (affects noise characteristics)</param>
         /// <returns>Background noise amplitude (0.0 to 1.0 scale where 1.0 = 0 dBm)</returns>
