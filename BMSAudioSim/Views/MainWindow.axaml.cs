@@ -1,9 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
@@ -15,7 +13,6 @@ using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
-using Avalonia.Threading;
 using BMSAudioSim.ViewModels;
 using Microsoft.Extensions.Logging;
 using OpenFreqAudio;
@@ -67,23 +64,23 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             /* Handle view activation etc. */
         });
         InitializeComponent();
-        ButtonSignal1Ptt.AddHandler(Button.PointerPressedEvent, (sender, e) =>
+        ButtonSignal1Ptt.AddHandler(PointerPressedEvent, (sender, e) =>
         {
             Console.Out.WriteLine("PointerPressedEvent");
             _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
         }, handledEventsToo: true);
 
-        ButtonSignal1Ptt.AddHandler(Button.PointerReleasedEvent, (sender, e) =>
+        ButtonSignal1Ptt.AddHandler(PointerReleasedEvent, (sender, e) =>
         {
             Console.Out.WriteLine("PointerReleasedEvent");
             _radioPlayback.StopStream(_stream1Id).Wait(300);
         }, handledEventsToo: true);
 
-        ButtonSignal2Ptt.AddHandler(Button.PointerPressedEvent,
+        ButtonSignal2Ptt.AddHandler(PointerPressedEvent,
             (sender, e) => { _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params); },
             handledEventsToo: true);
 
-        ButtonSignal2Ptt.AddHandler(Button.PointerReleasedEvent,
+        ButtonSignal2Ptt.AddHandler(PointerReleasedEvent,
             (sender, e) => { _radioPlayback.StopStream(_stream2Id).Wait(300); }, handledEventsToo: true);
     }
 
