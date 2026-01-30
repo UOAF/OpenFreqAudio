@@ -1,8 +1,5 @@
 namespace OpenFreqAudio;
 
-using System.Collections.Generic;
-using System.Linq;
-
 /// <summary>
 /// Preset configuration for different types of radio stations with realistic parameters
 /// Platform altitude (MSL) is handled separately.
@@ -43,6 +40,11 @@ public class RadioStationPreset
         RxSensitivity_UHF_dBm = rxSensitivityUhf;
         Description = description;
     }
+    
+    public override bool Equals(object? obj)
+    {
+        return obj is RadioStationPreset other && Name == other.Name;
+    }
 
     /// <summary>
     /// Get TX power for the specified radio type
@@ -72,9 +74,10 @@ public class RadioStationPreset
         };
     }
     
-    public static bool IsVHF(double frequency)
+    public static bool IsVHF(int frequencyKhz)
     {
-        return frequency < 200;
+        return frequencyKhz < 200000;
+  // 200 MHz = 200000 kHz
     }
 }
 

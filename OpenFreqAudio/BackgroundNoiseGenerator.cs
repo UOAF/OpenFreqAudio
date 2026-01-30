@@ -38,7 +38,7 @@ public class BackgroundNoiseGenerator
 
     private RadioType _radioType;
 
-    public BackgroundNoiseGenerator(int sampleRate, int channels, double frequencyMhz)
+    public BackgroundNoiseGenerator(int sampleRate, int channels, int frequencyKhz)
     {
         _sampleRate = sampleRate;
         _channels = channels;
@@ -51,7 +51,7 @@ public class BackgroundNoiseGenerator
             _pinkNoiseSum += _pinkNoiseDice[i];
         }
 
-        _radioType = frequencyMhz < 200.0 ? RadioType.VHF_AM : RadioType.UHF_AM;
+        _radioType = frequencyKhz < 200000 ? RadioType.VHF_AM : RadioType.UHF_AM; // 200 MHz = 200000 kHz
     }
 
     /// <summary>

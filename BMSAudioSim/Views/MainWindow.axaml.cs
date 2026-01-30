@@ -88,9 +88,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e); 
         _radioPlayback.Initialize(0);
-        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyMhz, ViewModel.Squelch);
-        _radioPlayback.SetFrequencyAudioChannel(85.0f, RadioPlayback.AudioChannel.Right);
-        _radioPlayback.SetFrequencyAudioChannel(513.75f, RadioPlayback.AudioChannel.Left);
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
+        _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Right);
+        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Left);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -434,7 +434,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TXAltitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyMhz, ViewModel.TxWatts, ViewModel.FrequencyMhz <= 200 ? -113 : -107,
+            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.FrequencyKhz <= 200000 ? -113 : -107,
             true);
 
         if (audioParams == null) throw new Exception("audioParams is null");
@@ -451,8 +451,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         _signal1Params = audioParams.Copy();
         _signal2Params = audioParams.Copy();
 
-        _radioPlayback.TuneFrequency((float)ViewModel.FrequencyMhz);
-        _radioPlayback.SetSquelchLevel(ViewModel.FrequencyMhz, ViewModel.Squelch);
+        _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
+        _radioPlayback.SetSquelchLevel(ViewModel.FrequencyKhz, ViewModel.Squelch);
 
         // Convert dB to linear multiplier: 10^(dB/20)
         float linearMultiplier = MathF.Pow(10, ViewModel.SteppedDiffDbm / 20.0f);
@@ -553,7 +553,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         double[] fresnelLower = new double[losPoints];
 
         // Wavelength for Fresnel zone
-        double lambda = 299792458.0 / (audioParams.RadioFrequencyMHz * 1e6);
+        double lambda = 299792458.0 / (audioParams.RadioFrequencyKHz * 1e3);
 
         for (int i = 0; i < losPoints; i++)
         {
@@ -662,17 +662,17 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
     {
-        _radioPlayback.UntuneFrequency((float)ViewModel.FrequencyMhz);
+        _radioPlayback.UntuneFrequency(ViewModel.FrequencyKhz);
         if (RadioButtonUhf.IsChecked == true)
         {
-            ViewModel.FrequencyMhz = 513.75;
+            ViewModel.FrequencyKhz = 513750;
         }
         else // VHF
         {
-            ViewModel.FrequencyMhz = 85.0;
+            ViewModel.FrequencyKhz = 85000;
         }
 
-        _radioPlayback.TuneFrequency((float)ViewModel.FrequencyMhz);
+        _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
         UpdateParameters();
         if (ViewModel.Signal1Continuous)
         {
@@ -713,7 +713,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyMhz, (float)(e.NewValue / 10));
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, (float)(e.NewValue / 10));
     }
 
     private void OnEnable3dEffectsChanged(object? sender, RoutedEventArgs e)

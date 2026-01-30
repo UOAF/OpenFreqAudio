@@ -224,8 +224,8 @@ public class Radiomixer
         }
 
         // === RADIO FREQUENCY ===
-        float avgFreqMHz = (tx1.RadioFrequencyMHz + tx2.RadioFrequencyMHz) / 2.0f;
-        result.IsVHF = avgFreqMHz < 200.0f;
+        int avgFreqKHz = (tx1.RadioFrequencyKHz + tx2.RadioFrequencyKHz) / 2;
+        result.IsVHF = avgFreqKHz < 200000; // 200 MHz = 200000 kHz
 
         // For AM: VHF might have MORE interference due to atmospheric noise
         // (opposite of FM assumption)
@@ -248,7 +248,7 @@ public class Radiomixer
 
         // Scale beat frequency proportionally to radio frequency
         // This creates natural pitch variation across the frequency spectrum
-        float beatHz = referenceBeatHz * (avgFreqMHz / referenceFreqMHz) * 0.6f;
+        float beatHz = referenceBeatHz * ((avgFreqKHz / 1000.0f) / referenceFreqMHz) * 0.6f; // Convert kHz to MHz
 
         // Clamp to realistic ranges
         if (result.IsVHF)

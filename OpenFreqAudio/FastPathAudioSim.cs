@@ -34,18 +34,18 @@ namespace OpenFreqAudio
     public class RadioBandConfig
     {
         public string BandName { get; init; }
-        public double FrequencyMin_MHz { get; init; }
-        public double FrequencyMax_MHz { get; init; }
+        public int FrequencyMin_KHz { get; init; }
+        public int FrequencyMax_KHz { get; init; }
         public float VoiceBandwidth_Hz { get; init; }
         public double DiffractionCorrection_dB { get; init; }
         public ModulationType Modulation { get; init; }
 
-        public RadioBandConfig(string bandName, double freqMin, double freqMax,
+        public RadioBandConfig(string bandName, int freqMinKhz, int freqMaxKhz,
             float bandwidth, double diffractionDb, ModulationType modulation)
         {
             BandName = bandName;
-            FrequencyMin_MHz = freqMin;
-            FrequencyMax_MHz = freqMax;
+            FrequencyMin_KHz = freqMinKhz;
+            FrequencyMax_KHz = freqMaxKhz;
             VoiceBandwidth_Hz = bandwidth;
             DiffractionCorrection_dB = diffractionDb;
             Modulation = modulation;
@@ -84,7 +84,7 @@ namespace OpenFreqAudio
             obj.NoiseLevel = 0;
             obj.DropoutRate = 0;
             obj.DeepFadeRate = 0;
-            obj.RadioFrequencyMHz = 0;
+            obj.RadioFrequencyKHz = 0;
             obj.Distance_km = 0;
             obj.SNR_dB = 0;
             obj.PathLoss_dB = 0;
@@ -107,7 +107,7 @@ namespace OpenFreqAudio
         public float NoiseLevel; // 0..1 (analog static/hiss level)
         public float DropoutRate; // fast multipath flutter (events per second, can exceed 1.0)
         public float DeepFadeRate; // slow deep fades (events per second, typically 0-0.5)
-        public float RadioFrequencyMHz;
+        public int RadioFrequencyKHz;
 
         // RF propagation parameters (for physics-based stepped-on interference)
         public float Distance_km; // Distance from transmitter to receiver
@@ -123,7 +123,7 @@ namespace OpenFreqAudio
             {
                 Distance_km = Distance_km, DropoutRate = DropoutRate, DeepFadeRate = DeepFadeRate,
                 LowpassHz = LowpassHz, NoiseLevel = NoiseLevel,
-                Gain = Gain, PathLoss_dB = PathLoss_dB, RadioFrequencyMHz = RadioFrequencyMHz, SNR_dB = SNR_dB,
+                Gain = Gain, PathLoss_dB = PathLoss_dB, RadioFrequencyKHz = RadioFrequencyKHz, SNR_dB = SNR_dB,
                 TerrainProfile = TerrainProfile
             };
         }
@@ -185,16 +185,16 @@ namespace OpenFreqAudio
         {
             new RadioBandConfig(
                 bandName: "BMS Lobby",
-                freqMin: 1.234,
-                freqMax: 1.234,
+                freqMinKhz: 1234,
+                freqMaxKhz: 1234,
                 bandwidth: 4000.0f,
                 diffractionDb: 3.0,
                 modulation: ModulationType.AM),
 
             new RadioBandConfig(
                 bandName: "VHF",
-                freqMin: 30.0,
-                freqMax: 199.99,
+                freqMinKhz: 30000,
+                freqMaxKhz: 199999,
                 bandwidth: 3000.0f,
                 diffractionDb: 3.0, // Better diffraction than UHF
                 modulation: ModulationType.AM
@@ -202,8 +202,8 @@ namespace OpenFreqAudio
 
             new RadioBandConfig(
                 bandName: "UHF",
-                freqMin: 200,
-                freqMax: 520.0,
+                freqMinKhz: 200000,
+                freqMaxKhz: 520000,
                 bandwidth: 3000.0f,
                 diffractionDb: -7.0, // More LOS-dependent
                 modulation: ModulationType.FM
@@ -231,11 +231,11 @@ namespace OpenFreqAudio
         /// <summary>
         /// Determine which radio band configuration to use for a given frequency
         /// </summary>
-        private static RadioBandConfig GetBandConfig(double frequencyMHz)
+        private static RadioBandConfig GetBandConfig(int frequencyKhz)
         {
             foreach (var config in bandConfigs)
             {
-                if (frequencyMHz >= config.FrequencyMin_MHz && frequencyMHz <= config.FrequencyMax_MHz)
+                if (frequencyKhz >= config.FrequencyMin_KHz && frequencyKhz <= config.FrequencyMax_KHz)
                 {
                     return config;
                 }
@@ -308,15 +308,15 @@ namespace OpenFreqAudio
         /// Calculate the thermal noise floor amplitude for background noise playback.
         /// This is the noise level heard through speakers when squelch is open but no signal present.
         /// </summary>
-        /// <param name="frequencyMhz"></param>
+        /// <param name="frequencyKhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
         /// <param name="modulation">Modulation type (affects noise characteristics)</param>
         /// <returns>Background noise amplitude (0.0 to 1.0 scale where 1.0 = 0 dBm)</returns>
-        public static float CalculateBackgroundNoiseAmplitude(double frequencyMhz,
+        public static float CalculateBackgroundNoiseAmplitude(int frequencyKhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = GetBandConfig(frequencyMhz).VoiceBandwidth_Hz;
-            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
+            var bandwidthHz = GetBandConfig(frequencyKhz).VoiceBandwidth_Hz;
+            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyKhz / 1000.0:F3} MHz not found in Band Config");
 
             // Default sensitivities based on modulation type
             double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
@@ -346,14 +346,14 @@ namespace OpenFreqAudio
         /// Calculate minimum gain threshold for signal detection.
         /// Signals below this are considered drowned by thermal noise.
         /// </summary>
-        /// <param name="frequencyMhz"></param>
+        /// <param name="frequencyKhz"></param>
         /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
         /// <param name="modulation">Modulation type (affects default sensitivity)</param>
-        public static float CalculateNoiseFloorAmplitude(double frequencyMhz,
+        public static float CalculateNoiseFloorAmplitude(int frequencyKhz,
             double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
         {
-            var bandwidthHz = GetBandConfig(frequencyMhz).VoiceBandwidth_Hz;
-            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyMhz} not found in Band Config");
+            var bandwidthHz = GetBandConfig(frequencyKhz).VoiceBandwidth_Hz;
+            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyKhz / 1000.0:F3} MHz not found in Band Config");
 
             // Default sensitivities based on modulation type
             double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
@@ -717,7 +717,7 @@ namespace OpenFreqAudio
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
-            double frequencyMHz, double txPowerWatts = 10.0,
+            int frequencyKhz, double txPowerWatts = 10.0,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool txAltitudeIsMSL = false,
@@ -725,15 +725,15 @@ namespace OpenFreqAudio
         {
             if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
             {
-                return GetDefaultAudioParams(frequencyMHz);
+                return GetDefaultAudioParams(frequencyKhz);
             }
 
             // Get band configuration for this frequency
-            RadioBandConfig bandConfig = GetBandConfig(frequencyMHz);
+            RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
 
             // Rent from pool instead of allocating
             var ap = paramsPool.Rent();
-            ap.RadioFrequencyMHz = (float)frequencyMHz;
+            ap.RadioFrequencyKHz = frequencyKhz;
 
             // Stupid C# does not recognize null-safety with the early return;
             double txXVal = txX.Value;
@@ -781,7 +781,7 @@ namespace OpenFreqAudio
             }
 
             // Free-space path loss
-            double freqHz = frequencyMHz * 1e6;
+            double freqHz = frequencyKhz * 1e3; // kHz to Hz
             double fspl = FSPL_dB(dist, freqHz);
 
             // Weather attenuation (light rain/fog)
@@ -985,12 +985,12 @@ namespace OpenFreqAudio
             }
         }
 
-        public static AudioParams GetDefaultAudioParams(double frequencyMHz)
+        public static AudioParams GetDefaultAudioParams(int frequencyKhz)
         {
-            var bandConfig = GetBandConfig(frequencyMHz);
+            var bandConfig = GetBandConfig(frequencyKhz);
             var ap = new AudioParams
             {
-                RadioFrequencyMHz = (float)frequencyMHz,
+                RadioFrequencyKHz = frequencyKhz,
                 Gain = 1.0f,
                 LowpassHz = bandConfig.VoiceBandwidth_Hz,
                 NoiseLevel = 0f,
