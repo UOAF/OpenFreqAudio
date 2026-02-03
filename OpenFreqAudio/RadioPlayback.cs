@@ -639,13 +639,24 @@ public class RadioPlayback
             // Update packet receipt timestamp for timeout detection
             stream.LastPacketReceived = DateTime.UtcNow;
 
-            // Handle transmission start marker
-            if (startMarker && !stream.IsTransmitting)
+            // Detect implicit transmission start:
+            // 1. First audio ever (stream just created)
+            // 2. Transmission gap (>500ms since last audio and not currently transmitting)
+            bool isFirstAudio = !stream.HasReceivedAudio;
+            bool hasGapAfterEnd = stream.HasReceivedAudio && 
+                                  !stream.IsTransmitting && 
+                                  (DateTime.UtcNow - stream.LastAudioReceived).TotalMilliseconds > 500;
+            bool implicitStart = isFirstAudio || hasGapAfterEnd;
+        
+            // Handle transmission start marker (explicit or implicit)
+            if ((startMarker || implicitStart) && !stream.IsTransmitting)
             {
                 stream.IsTransmitting = true;
                 stream.TransmissionStartTime = DateTime.UtcNow;
-                stream.IsBuffering = true; // Start buffering for this transmission
-                Console.WriteLine($"[PushAudioData:{streamId}] Transmission START (marker)");
+                stream.IsBuffering = true;
+            
+                string reason = startMarker ? "marker" : (isFirstAudio ? "first-audio" : "gap-restart");
+                Console.WriteLine($"[PushAudioData:{streamId}] Transmission START ({reason})");
             }
 
             // Sanity check: both markers set (shouldn't happen but handle gracefully)
