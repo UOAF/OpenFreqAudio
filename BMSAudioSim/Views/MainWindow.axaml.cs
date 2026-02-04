@@ -40,7 +40,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private DEMReader? _demReader;
     private AudioParams? _signal1Params;
     private AudioParams? _signal2Params;
-    private RadioPlayback _radioPlayback = new(false);
+    private RadioPlayback _radioPlayback = new();
     private ILoggerFactory _loggerFactory;
     private MainWindowViewModel _viewModel;
 
@@ -87,7 +87,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     protected override void OnLoaded(RoutedEventArgs e)
     {
         base.OnLoaded(e); 
-        _radioPlayback.Initialize(0);
+        _radioPlayback.Initialize();
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
         _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Right);
         _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Left);

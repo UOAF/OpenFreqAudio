@@ -11,7 +11,7 @@ namespace OpenFreqAudio;
 /// - File-based streams are decoded by a background reader task that fills the same ring buffer,
 /// - PushAudioData converts incoming bytes (16-bit PCM or 32-bit float) into floats and writes into the ring buffer.
 /// </summary>
-public class RadioPlayback
+public class RadioPlayback : IDisposable
 {
     private class RadioStream
     {
@@ -312,26 +312,38 @@ public class RadioPlayback
 
     private const int NoiseFadeSamples = 2400;
 
-    private static bool _bassInitialized;
     private static readonly Lock _bassInitLock = new();
     private bool _timeoutMonitoringStarted;
+    private CancellationTokenSource? _timeoutMonitorCts;
+    private Task? _timeoutMonitorTask;
+
     private int _masterDspProcHandle;
 
     public bool Apply3dEffects { get; set; }
 
-    public RadioPlayback(bool skipBassInitialization)
+    public RadioPlayback(int playbackDeviceIndex = -1)
     {
         lock (_bassInitLock)
         {
-            if (skipBassInitialization)
-                _bassInitialized = true;
-            else if (!_bassInitialized)
+            // Just use the default device - BASS doesnt like any checks on that
+            if (playbackDeviceIndex == -1)
             {
-                if (!Bass.Init())
-                    throw new Exception("Failed to initialize BASS.");
-                _bassInitialized = true;
+                Bass.Init(playbackDeviceIndex);
             }
-
+            else
+            {
+                var deviceInfo = Bass.GetDeviceInfo(playbackDeviceIndex);
+                if (!deviceInfo.IsInitialized)
+                {
+                    // Initialize the new device
+                    if (!Bass.Init(playbackDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+                    {
+                        Console.WriteLine($"Failed to initialize device {playbackDeviceIndex}: {Bass.LastError}");
+                        return;
+                    }
+                }
+                Bass.CurrentDevice = playbackDeviceIndex;
+            }
             // Configure BASS for low-latency operation
             Bass.Configure(Configuration.UpdatePeriod, 5);
             Bass.Configure(Configuration.PlaybackBufferLength, 40);
@@ -388,6 +400,7 @@ public class RadioPlayback
             {
                 _sampleRate = newSampleRate;
             }
+
             StartMasterStream();
         }
 
@@ -574,6 +587,7 @@ public class RadioPlayback
             {
                 _sampleRate = newSampleRate;
             }
+
             StartMasterStream();
         }
 
@@ -610,7 +624,8 @@ public class RadioPlayback
                 stream.RadioEffect.SetSquelchThreshold(noiseFloor);
             }
 
-            Console.WriteLine($"[StartPushStream] Stream '{streamId}' on {audioParams.RadioFrequencyKHz / 1000.0:F3} MHz");
+            Console.WriteLine(
+                $"[StartPushStream] Stream '{streamId}' on {audioParams.RadioFrequencyKHz / 1000.0:F3} MHz");
             Console.WriteLine($"[StartPushStream]   SampleRate={sampleRate}, Channels={channels}");
             Console.WriteLine(
                 $"[StartPushStream]   RingBuffer: {ringFrames} frames × {Math.Max(1, channels)} ch = {ringCapacity} samples ({(float)ringFrames / sampleRate:F1}s)");
@@ -643,18 +658,18 @@ public class RadioPlayback
             // 1. First audio ever (stream just created)
             // 2. Transmission gap (>500ms since last audio and not currently transmitting)
             bool isFirstAudio = !stream.HasReceivedAudio;
-            bool hasGapAfterEnd = stream.HasReceivedAudio && 
-                                  !stream.IsTransmitting && 
+            bool hasGapAfterEnd = stream.HasReceivedAudio &&
+                                  !stream.IsTransmitting &&
                                   (DateTime.UtcNow - stream.LastAudioReceived).TotalMilliseconds > 500;
             bool implicitStart = isFirstAudio || hasGapAfterEnd;
-        
+
             // Handle transmission start marker (explicit or implicit)
             if ((startMarker || implicitStart) && !stream.IsTransmitting)
             {
                 stream.IsTransmitting = true;
                 stream.TransmissionStartTime = DateTime.UtcNow;
                 stream.IsBuffering = true;
-            
+
                 string reason = startMarker ? "marker" : (isFirstAudio ? "first-audio" : "gap-restart");
                 Console.WriteLine($"[PushAudioData:{streamId}] Transmission START ({reason})");
             }
@@ -764,19 +779,8 @@ public class RadioPlayback
         }
     }
 
-    public void Initialize(int deviceIndex)
+    public void Initialize()
     {
-        lock (_lock)
-        {
-            // Set default sample rate if not already set
-            if (_sampleRate == 0)
-            {
-                _sampleRate = 48000; // Default to 48kHz (matches OpenFreqRtcClient.SAMPLE_RATE)
-            }
-            
-            // Bass.CurrentDevice = deviceIndex;
-        }
-
         // Always start master stream during initialization
         // This eliminates race conditions when adding streams later
         // The stream will just output silence until streams are added
@@ -1301,10 +1305,70 @@ public class RadioPlayback
 
     public async Task StopAll()
     {
+        Console.WriteLine("[RadioPlayback] Stopping all streams and cleaning up resources...");
+
+        // 1. Stop timeout monitor first
+        try
+        {
+            _timeoutMonitorCts?.Cancel();
+            if (_timeoutMonitorTask != null)
+            {
+                await _timeoutMonitorTask.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RadioPlayback] Error stopping timeout monitor: {ex.Message}");
+        }
+        finally
+        {
+            _timeoutMonitorCts?.Dispose();
+            _timeoutMonitorCts = null;
+            _timeoutMonitorTask = null;
+
+            lock (_lock)
+            {
+                _timeoutMonitoringStarted = false;
+            }
+        }
+
+        // 2. Stop all streams
         List<string> ids;
-        lock (_lock) ids = _streams.Keys.ToList();
-        foreach (var id in ids) await StopStream(id);
+        lock (_lock)
+        {
+            ids = _streams.Keys.ToList();
+        }
+
+        foreach (var id in ids)
+        {
+            await StopStream(id);
+        }
+
+        // 3. Stop master stream
         StopMasterStream();
+
+        // 4. Clear frequency configs
+        lock (_lock)
+        {
+            _frequencies.Clear();
+        }
+
+        // 5. Free BASS device
+        try
+        {
+            var currentDevice = Bass.CurrentDevice;
+            if (currentDevice != -1)
+            {
+                Bass.Free();
+                Console.WriteLine("[RadioPlayback] BASS device freed");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RadioPlayback] Error freeing BASS device: {ex.Message}");
+        }
+
+        Console.WriteLine("[RadioPlayback] Cleanup complete");
     }
 
     public List<string> GetActiveStreams()
@@ -1348,6 +1412,7 @@ public class RadioPlayback
 
     public void ChangeOutputDevice(int newDeviceIndex)
     {
+        Console.WriteLine($"Changing output device to index {newDeviceIndex}");
         bool hadMasterStream = false;
 
         lock (_lock)
@@ -1360,10 +1425,21 @@ public class RadioPlayback
             StopMasterStream();
         }
 
-        lock (_lock)
+        // Initialize the new device if not already initialized
+        // Check if device is already initialized
+        var deviceInfo = Bass.GetDeviceInfo(newDeviceIndex);
+        if (!deviceInfo.IsInitialized)
         {
-            Bass.CurrentDevice = newDeviceIndex;
+            // Initialize the new device
+            if (!Bass.Init(newDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+            {
+                Console.WriteLine($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
+                return;
+            }
         }
+
+        // Set current device for this thread
+        Bass.CurrentDevice = newDeviceIndex;
 
         if (hadMasterStream)
         {
@@ -1422,7 +1498,6 @@ public class RadioPlayback
 
     /// <summary>
     /// Monitors push streams for peer timeouts during active transmissions
-    /// Should be called once during initialization
     /// </summary>
     public void StartPeerTimeoutMonitoring()
     {
@@ -1435,39 +1510,50 @@ public class RadioPlayback
             }
 
             _timeoutMonitoringStarted = true;
+            _timeoutMonitorCts = new CancellationTokenSource();
         }
 
-        Task.Run(async () =>
+        _timeoutMonitorTask = Task.Run(async () =>
         {
             Console.WriteLine("[TimeoutMonitor] Starting peer timeout monitoring");
 
-            while (true)
+            try
             {
-                await Task.Delay(1000); // Check every second
-
-                lock (_lock)
+                while (!_timeoutMonitorCts.Token.IsCancellationRequested)
                 {
-                    var now = DateTime.UtcNow;
-                    var timedOutStreams = _streams.Values
-                        .Where(s => s.IsPush &&
-                                    s.IsTransmitting &&
-                                    (now - s.LastPacketReceived) > s.PeerTimeoutThreshold)
-                        .ToList();
+                    await Task.Delay(500, _timeoutMonitorCts.Token);
 
-                    foreach (var stream in timedOutStreams)
+                    lock (_lock)
                     {
-                        var stallTime = now - stream.LastPacketReceived;
-                        Console.WriteLine(
-                            $"[TimeoutMonitor:{stream.StreamId}] Peer timeout during transmission (no packets for {stallTime.TotalSeconds:F1}s)");
+                        var now = DateTime.UtcNow;
+                        var timedOutStreams = _streams.Values
+                            .Where(s => s.IsPush &&
+                                        s.IsTransmitting &&
+                                        (now - s.LastPacketReceived) > s.PeerTimeoutThreshold)
+                            .ToList();
 
-                        stream.IsTransmitting = false;
-                        stream.TransmissionEndTime = now;
+                        foreach (var stream in timedOutStreams)
+                        {
+                            var stallTime = now - stream.LastPacketReceived;
+                            Console.WriteLine(
+                                $"[TimeoutMonitor:{stream.StreamId}] Peer timeout during transmission (no packets for {stallTime.TotalSeconds:F1}s)");
 
-                        // Clear ring buffer for crashed peer to avoid stale audio
-                        stream.ClearRingBuffer();
+                            stream.IsTransmitting = false;
+                            stream.TransmissionEndTime = now;
+                            stream.ClearRingBuffer();
+                        }
                     }
                 }
             }
-        });
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("[TimeoutMonitor] Stopped");
+            }
+        }, _timeoutMonitorCts.Token);
+    }
+
+    public void Dispose()
+    {
+        StopAll().Wait(500);
     }
 }
