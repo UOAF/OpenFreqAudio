@@ -905,7 +905,7 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
-            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 1f);
+            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 2f); // allow for some boost
         }
     }
 
