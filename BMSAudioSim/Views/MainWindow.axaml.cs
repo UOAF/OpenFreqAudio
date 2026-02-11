@@ -32,7 +32,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private const int PREVIEW_SIZE = 2048;
     private string? _previewImagePath;
     private int clickCount = 0;
-    private (int x, int y)? _senderPos;
+    private (int x, int y)? _sender1Pos;
+    private (int x, int y)? _sender2Pos;
     private (int x, int y)? _receiverPos;
     private FastPathAudioSim? _fastPathAudioSim;
     static volatile bool _stream1Playing = false;
@@ -51,7 +52,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
 
     // Marker display
-    private Ellipse? _senderMarker;
+    private Ellipse? _sender1Marker;
+    private Ellipse? _sender2Marker;
     private Ellipse? _receiverMarker;
 
     public MainWindow(MainWindowViewModel viewModel, ILoggerFactory loggerFactory)
@@ -145,7 +147,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             StatusText.Text = $"Heightmap loaded: {HEIGHTMAP_SIZE}x{HEIGHTMAP_SIZE}";
 
             clickCount = 0;
-            _senderPos = null;
+            _sender1Pos = null;
+            _sender2Pos = null;
             _receiverPos = null;
 
             UpdatePositionDisplay();
@@ -315,10 +318,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         mapX = Math.Clamp(mapX, 0, HEIGHTMAP_SIZE - 1);
         mapY = Math.Clamp(mapY, 0, HEIGHTMAP_SIZE - 1);
 
-        // Alternate between sender and receiver
-        if (clickCount % 2 == 0)
+        // Cycle through sender1, sender2, receiver
+        if (clickCount % 3 == 0)
         {
-            _senderPos = (mapX, mapY);
+            _sender1Pos = (mapX, mapY);
+        }
+        else if (clickCount % 3 == 1)
+        {
+            _sender2Pos = (mapX, mapY);
         }
         else
         {
@@ -328,7 +335,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         clickCount++;
         UpdatePositionDisplay();
         UpdateMarkers();
-        ConfigPanel.IsEnabled = _senderPos.HasValue && _receiverPos.HasValue;
+        ConfigPanel.IsEnabled = _sender1Pos.HasValue && _sender2Pos.HasValue && _receiverPos.HasValue;
     }
 
     // ===== MARKER DISPLAY =====
@@ -338,14 +345,22 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         if (MarkerCanvas == null) return;
 
         MarkerCanvas.Children.Clear();
-        _senderMarker = null;
+        _sender1Marker = null;
+        _sender2Marker = null;
         _receiverMarker = null;
 
-        if (_senderPos.HasValue)
+        if (_sender1Pos.HasValue)
         {
-            var screenPos = ImageToScreenCoordinates(_senderPos.Value.x, _senderPos.Value.y);
-            _senderMarker = CreateMarker(screenPos, Brushes.LimeGreen);
-            MarkerCanvas.Children.Add(_senderMarker);
+            var screenPos = ImageToScreenCoordinates(_sender1Pos.Value.x, _sender1Pos.Value.y);
+            _sender1Marker = CreateMarker(screenPos, Brushes.LimeGreen);
+            MarkerCanvas.Children.Add(_sender1Marker);
+        }
+
+        if (_sender2Pos.HasValue)
+        {
+            var screenPos = ImageToScreenCoordinates(_sender2Pos.Value.x, _sender2Pos.Value.y);
+            _sender2Marker = CreateMarker(screenPos, Brushes.DodgerBlue);
+            MarkerCanvas.Children.Add(_sender2Marker);
         }
 
         if (_receiverPos.HasValue)
@@ -419,46 +434,58 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void UpdateParameters()
     {
-        if (_fastPathAudioSim is null || !_senderPos.HasValue || !_receiverPos.HasValue)
+        if (_fastPathAudioSim is null || !_sender1Pos.HasValue || !_sender2Pos.HasValue || !_receiverPos.HasValue)
         {
             return;
         }
 
-
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
         _fastPathAudioSim.ReturnAudioParams(_signal1Params);
+        _fastPathAudioSim.ReturnAudioParams(_signal2Params);
 
-        var audioParams = _fastPathAudioSim.CalculateAudioParams(
-            _fastPathAudioSim.PixelsToMeters(_senderPos.Value.x),
-            _fastPathAudioSim.PixelsToMeters(_senderPos.Value.y),
-            ViewModel.TXAltitude,
+        double rxSensitivity = ViewModel.FrequencyKhz <= 200000 ? -113 : -107;
+
+        // Path 1: Sender1 -> Receiver
+        var audioParams1 = _fastPathAudioSim.CalculateAudioParams(
+            _fastPathAudioSim.PixelsToMeters(_sender1Pos.Value.x),
+            _fastPathAudioSim.PixelsToMeters(_sender1Pos.Value.y),
+            ViewModel.TX1Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.FrequencyKhz <= 200000 ? -113 : -107,
+            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, rxSensitivity,
             true);
 
-        if (audioParams == null) throw new Exception("audioParams is null");
-        if (audioParams.TerrainProfile == null) throw new Exception("terrainProfile is null");
+        // Path 2: Sender2 -> Receiver
+        var audioParams2 = _fastPathAudioSim.CalculateAudioParams(
+            _fastPathAudioSim.PixelsToMeters(_sender2Pos.Value.x),
+            _fastPathAudioSim.PixelsToMeters(_sender2Pos.Value.y),
+            ViewModel.TX2Altitude,
+            _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
+            _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
+            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, rxSensitivity,
+            true);
 
-        UpdateProfileGraph(audioParams);
+        if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
 
-        GainText.Text = audioParams.Gain.ToString();
-        LowPassHzText.Text = audioParams.LowpassHz.ToString();
-        NoiseLvlText.Text = audioParams.NoiseLevel.ToString();
-        DropoutRateText.Text = audioParams.DropoutRate.ToString();
-        DeepFadeRateText.Text = audioParams.DeepFadeRate.ToString();
+        UpdateProfileGraph(audioParams1, audioParams2);
 
-        _signal1Params = audioParams.Copy();
-        _signal2Params = audioParams.Copy();
+        Gain1Text.Text = audioParams1.Gain.ToString();
+        LowPass1Text.Text = audioParams1.LowpassHz.ToString();
+        Noise1Text.Text = audioParams1.NoiseLevel.ToString();
+        Dropout1Text.Text = audioParams1.DropoutRate.ToString();
+        DeepFade1Text.Text = audioParams1.DeepFadeRate.ToString();
+
+        Gain2Text.Text = audioParams2.Gain.ToString();
+        LowPass2Text.Text = audioParams2.LowpassHz.ToString();
+        Noise2Text.Text = audioParams2.NoiseLevel.ToString();
+        Dropout2Text.Text = audioParams2.DropoutRate.ToString();
+        DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();
+
+        _signal1Params = audioParams1.Copy();
+        _signal2Params = audioParams2.Copy();
 
         _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
         _radioPlayback.SetSquelchLevel(ViewModel.FrequencyKhz, ViewModel.Squelch);
-
-        // Convert dB to linear multiplier: 10^(dB/20)
-        float linearMultiplier = MathF.Pow(10, ViewModel.SteppedDiffDbm / 20.0f);
-
-        _signal1Params.Gain = audioParams.Gain / linearMultiplier;
-        _signal2Params.Gain = audioParams.Gain * linearMultiplier;
 
         _radioPlayback.UpdateStreamParams(_stream1Id, _signal1Params);
         _radioPlayback.UpdateStreamParams(_stream2Id, _signal2Params);
@@ -466,71 +493,117 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void UpdatePositionDisplay()
     {
-        if (_senderPos.HasValue)
-        {
-            var pos = _senderPos.Value;
-            SenderPosText.Text = $"X: {pos.x}, Y: {pos.y}";
-        }
+        if (_sender1Pos.HasValue)
+            Sender1PosText.Text = $"X: {_sender1Pos.Value.x}, Y: {_sender1Pos.Value.y}";
         else
-        {
-            SenderPosText.Text = "Not set";
-        }
+            Sender1PosText.Text = "Not set";
+
+        if (_sender2Pos.HasValue)
+            Sender2PosText.Text = $"X: {_sender2Pos.Value.x}, Y: {_sender2Pos.Value.y}";
+        else
+            Sender2PosText.Text = "Not set";
 
         if (_receiverPos.HasValue)
-        {
-            var pos = _receiverPos.Value;
-            ReceiverPosText.Text = $"X: {pos.x}, Y: {pos.y}";
-        }
+            ReceiverPosText.Text = $"X: {_receiverPos.Value.x}, Y: {_receiverPos.Value.y}";
         else
-        {
             ReceiverPosText.Text = "Not set";
-        }
 
-        if (_senderPos.HasValue && _receiverPos.HasValue)
-        {
+        if (_sender1Pos.HasValue && _sender2Pos.HasValue && _receiverPos.HasValue)
             UpdateParameters();
-        }
     }
 
-    private void UpdateProfileGraph(AudioParams audioParams)
+    private void UpdateProfileGraph(AudioParams audioParams1, AudioParams audioParams2)
     {
         HeightProfilePlot.Plot.Clear();
-        if (audioParams.TerrainProfile?.Count == 0)
-            return;
+
+        Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
+
+        PixelPadding padding = new(80, 30, 30, 50);
+        HeightProfilePlot.Plot.Layout.Fixed(padding);
+
+        // Pre-compute distances to right-align both paths on the receiver
+        double dist1 = audioParams1.TerrainProfile != null && audioParams1.TerrainProfile.Count > 0
+            ? audioParams1.TerrainProfile.Last().dist - audioParams1.TerrainProfile.First().dist
+            : 0;
+        double dist2 = audioParams2.TerrainProfile != null && audioParams2.TerrainProfile.Count > 0
+            ? audioParams2.TerrainProfile.Last().dist - audioParams2.TerrainProfile.First().dist
+            : 0;
+        double maxDist = Math.Max(dist1, dist2);
+
+        // Draw both paths overlaid, offset so receiver endpoints align at maxDist
+        dist1 = DrawPathOnGraph(audioParams1, ViewModel.TX1Altitude,
+            Color.FromHex("#2E86AB"), Color.FromHex("#06D6A0"), Colors.Green, Colors.LimeGreen, "S1",
+            maxDist - dist1);
+        dist2 = DrawPathOnGraph(audioParams2, ViewModel.TX2Altitude,
+            Color.FromHex("#6B5B95"), Color.FromHex("#4A90D9"), Colors.Blue, Colors.DodgerBlue, "S2",
+            maxDist - dist2);
+
+        HeightProfilePlot.Plot.Title("Height Profiles: Sender 1 & 2 to Receiver");
+        HeightProfilePlot.Plot.XLabel("Distance (m)");
+        HeightProfilePlot.Plot.YLabel("Elevation (m)");
+
+        HeightProfilePlot.Plot.Axes.Title.Label.FontSize = 14;
+        HeightProfilePlot.Plot.Axes.Title.Label.Bold = true;
+
+        HeightProfilePlot.Plot.Grid.MajorLineColor = Color.FromHex("#E0E0E0");
+        HeightProfilePlot.Plot.Grid.MinorLineColor = Color.FromHex("#F0F0F0");
+
+        // Show legend
+        HeightProfilePlot.Plot.ShowLegend(Alignment.UpperRight);
+
+        HeightProfilePlot.Plot.Axes.AutoScale();
+        HeightProfilePlot.Plot.Axes.Margins(0.05, 0.15);
+
+        HeightProfilePlot.Refresh();
+
+        ProfileInfoText.Text = $"S1: {dist1 / 1000:F1} km | S2: {dist2 / 1000:F1} km";
+    }
+
+    /// <summary>
+    /// Draws a single sender-to-receiver path on the profile graph, including terrain fill,
+    /// terrain line, TX/RX markers, curved LOS with Earth curvature, and Fresnel zone.
+    /// Returns the total distance in meters.
+    /// </summary>
+    private double DrawPathOnGraph(AudioParams audioParams, int txAltitude,
+        Color terrainColor, Color txMarkerColor, Color losColor, Color fresnelColor, string label,
+        double xOffset = 0)
+    {
+        if (audioParams.TerrainProfile == null || audioParams.TerrainProfile.Count == 0)
+            return 0;
 
         double[] xValues = new double[audioParams.TerrainProfile.Count];
         double[] yValues = new double[audioParams.TerrainProfile.Count];
 
         for (int i = 0; i < audioParams.TerrainProfile.Count; i++)
         {
-            xValues[i] = audioParams.TerrainProfile[i].dist;
+            xValues[i] = audioParams.TerrainProfile[i].dist + xOffset;
             yValues[i] = audioParams.TerrainProfile[i].elev;
         }
 
+        // Terrain fill
         var scatter = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
-        scatter.Color = Color.FromHex("#2E86AB").WithAlpha(0.2);
+        scatter.Color = terrainColor.WithAlpha(0.2);
         scatter.LineWidth = 0;
         scatter.FillY = true;
         scatter.FillYValue = yValues.Min();
 
-        PixelPadding padding = new(80, 30, 30, 50);
-        HeightProfilePlot.Plot.Layout.Fixed(padding);
-
+        // Terrain line
         var line = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
-        line.Color = Color.FromHex("#2E86AB");
+        line.Color = terrainColor;
         line.LineWidth = 2.5f;
         line.Smooth = true;
+        line.LegendText = $"{label} Terrain";
 
-        Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
+        var txAbsoluteHeight = txAltitude + audioParams.TerrainProfile.First().elev;
+        var rxAbsoluteHeight = ViewModel!.RXAltitude + audioParams.TerrainProfile.Last().elev;
 
-        var txAbsoluteHeight = ViewModel.TXAltitude + audioParams.TerrainProfile.First().elev;
-        var rxAbsoluteHeight = ViewModel.RXAltitude + audioParams.TerrainProfile.Last().elev;
-
+        // TX marker
         var senderMarker = HeightProfilePlot.Plot.Add.Marker(xValues[0], txAbsoluteHeight);
-        senderMarker.Color = Color.FromHex("#06D6A0");
+        senderMarker.Color = txMarkerColor;
         senderMarker.Size = 12;
         senderMarker.Shape = MarkerShape.FilledCircle;
 
+        // RX marker (shared red color)
         var receiverMarker =
             HeightProfilePlot.Plot.Add.Marker(xValues[audioParams.TerrainProfile.Count - 1], rxAbsoluteHeight);
         receiverMarker.Color = Color.FromHex("#EF476F");
@@ -559,7 +632,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             double t = i / (double)(losPoints - 1);
             double d = totalDistance * t;
-            losDist[i] = d;
+            losDist[i] = d + xOffset;
 
             // Distance from TX and RX
             double d1 = d;
@@ -585,69 +658,36 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         // Plot curved LOS line
         var losLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, losHeight);
-        losLine.Color = Colors.Red.WithAlpha(0.8);
+        losLine.Color = losColor.WithAlpha(0.8);
         losLine.LineWidth = 2.0f;
         losLine.LinePattern = LinePattern.Dashed;
-        losLine.LegendText = "Radio LOS";
+        losLine.LegendText = $"{label} LOS";
 
         // Plot Fresnel zone boundaries
         var fresnelUpperLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelUpper);
-        fresnelUpperLine.Color = Colors.Orange.WithAlpha(0.4);
+        fresnelUpperLine.Color = fresnelColor.WithAlpha(0.4);
         fresnelUpperLine.LineWidth = 1.0f;
         fresnelUpperLine.LinePattern = LinePattern.Dotted;
-        fresnelUpperLine.LegendText = "1st Fresnel Zone";
+        fresnelUpperLine.LegendText = $"{label} Fresnel";
 
         var fresnelLowerLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelLower);
-        fresnelLowerLine.Color = Colors.Orange.WithAlpha(0.4);
+        fresnelLowerLine.Color = fresnelColor.WithAlpha(0.4);
         fresnelLowerLine.LineWidth = 1.0f;
         fresnelLowerLine.LinePattern = LinePattern.Dotted;
 
-        // Optional: Fill between Fresnel zone boundaries
+        // Fill between Fresnel zone boundaries
         var fresnelFill = HeightProfilePlot.Plot.Add.FillY(losDist, fresnelLower, fresnelUpper);
-        fresnelFill.FillColor = Colors.Orange.WithAlpha(0.1);
+        fresnelFill.FillColor = fresnelColor.WithAlpha(0.1);
         fresnelFill.LineWidth = 0;
 
-        // ==================== ORIGINAL MARKERS (keep for reference) ====================
+        // ==================== TX ALTITUDE REFERENCE LINE ====================
         var lineTXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(txAbsoluteHeight);
-        lineTXAlt.Text = $"{txAbsoluteHeight:0} m";
+        lineTXAlt.Text = $"{label}: {txAbsoluteHeight:0} m";
         lineTXAlt.LabelAlignment = Alignment.LowerLeft;
-        lineTXAlt.Color = Color.FromHex("#06D6A0").WithAlpha(0.3); // Make more transparent
+        lineTXAlt.Color = txMarkerColor.WithAlpha(0.3);
         lineTXAlt.LinePattern = LinePattern.Dotted;
 
-        var lineRXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(rxAbsoluteHeight);
-        lineRXAlt.Text = $"{rxAbsoluteHeight:0} m";
-        lineRXAlt.LabelAlignment = Alignment.LowerRight;
-        lineRXAlt.LabelOppositeAxis = true;
-        lineRXAlt.Color = Color.FromHex("#EF476F").WithAlpha(0.3); // Make more transparent
-        lineRXAlt.LinePattern = LinePattern.Dotted;
-
-        HeightProfilePlot.Plot.Title("Height Profile: Sender to Receiver");
-        HeightProfilePlot.Plot.XLabel("Distance (m)");
-        HeightProfilePlot.Plot.YLabel("Elevation (m)");
-
-        HeightProfilePlot.Plot.Axes.Title.Label.FontSize = 14;
-        HeightProfilePlot.Plot.Axes.Title.Label.Bold = true;
-
-        HeightProfilePlot.Plot.Grid.MajorLineColor = Color.FromHex("#E0E0E0");
-        HeightProfilePlot.Plot.Grid.MinorLineColor = Color.FromHex("#F0F0F0");
-
-        // Show legend
-        HeightProfilePlot.Plot.ShowLegend(Alignment.UpperRight);
-
-        HeightProfilePlot.Plot.Axes.AutoScale();
-        HeightProfilePlot.Plot.Axes.Margins(0.05, 0.15);
-
-        HeightProfilePlot.Refresh();
-
-        float minHeight = (float)yValues.Min();
-        float maxHeight = (float)yValues.Max();
-        float avgHeight = (float)yValues.Average();
-        float elevationGain = (float)(yValues[yValues.Length - 1] - yValues[0]);
-
-        ProfileInfoText.Text =
-            $"Samples: {audioParams.TerrainProfile.Count} | Distance: {totalDistance / 1000:F1} km | " +
-            $"Min: {minHeight:F1} m | Max: {maxHeight:F1} m | " +
-            $"Avg: {avgHeight:F1} m | Gain: {elevationGain:+0.0;-0.0} m";
+        return totalDistance;
     }
 
     private void OnAltSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)

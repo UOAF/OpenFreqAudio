@@ -23,7 +23,7 @@
             <!-- Left: Heightmap Image -->
             <Border Grid.Column="0" Margin="0,0,5,0" BorderBrush="Gray" BorderThickness="1">
                 <Grid RowDefinitions="Auto,*">
-                    <TextBlock Text="Click to place sender • Click again to place receiver"
+                    <TextBlock Text="Click: Sender 1 → Sender 2 → Receiver"
                                HorizontalAlignment="Left"
                                VerticalAlignment="Top"
                                Margin="10"
@@ -67,18 +67,28 @@
 
             <!-- Right: Height Profile Graph -->
             <Border Grid.Column="1" Margin="5,0,0,0" BorderBrush="Gray" BorderThickness="1">
-                <Grid ColumnDefinitions="Auto,*, Auto">
+                <Grid ColumnDefinitions="Auto,Auto,*,Auto">
                     <Grid Grid.Column="0" RowDefinitions="Auto,*,Auto">
-                        <TextBlock Grid.Row="0" FontWeight="SemiBold">TX AGL</TextBlock>
+                        <TextBlock Grid.Row="0" FontWeight="SemiBold" Foreground="LimeGreen">TX1 AGL</TextBlock>
                         <Slider Grid.Row="1" Orientation="Vertical" Minimum="0" Maximum="12000" TickPlacement="TopLeft"
-                                TickFrequency="10" Value="{Binding TXAltitude}"
+                                TickFrequency="10" Value="{Binding TX1Altitude}"
                                 ValueChanged="OnAltSliderChanged">
                         </Slider>
                         <TextBlock Grid.Row="2" HorizontalAlignment="Center"
-                                   Text="{Binding TXAltitude, StringFormat='{}{0} m'}">
+                                   Text="{Binding TX1Altitude, StringFormat='{}{0} m'}">
                         </TextBlock>
                     </Grid>
-                    <Grid Grid.Column="1" RowDefinitions="Auto,*">
+                    <Grid Grid.Column="1" RowDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Row="0" FontWeight="SemiBold" Foreground="DodgerBlue">TX2 AGL</TextBlock>
+                        <Slider Grid.Row="1" Orientation="Vertical" Minimum="0" Maximum="12000" TickPlacement="TopLeft"
+                                TickFrequency="10" Value="{Binding TX2Altitude}"
+                                ValueChanged="OnAltSliderChanged">
+                        </Slider>
+                        <TextBlock Grid.Row="2" HorizontalAlignment="Center"
+                                   Text="{Binding TX2Altitude, StringFormat='{}{0} m'}">
+                        </TextBlock>
+                    </Grid>
+                    <Grid Grid.Column="2" RowDefinitions="Auto,*">
                         <TextBlock Grid.Row="0"
                                    Name="ProfileInfoText"
                                    Text="Height Profile"
@@ -90,7 +100,7 @@
                                           Grid.Row="1"
                                           Margin="10" />
                     </Grid>
-                    <Grid Grid.Column="2" RowDefinitions="Auto,*,Auto">
+                    <Grid Grid.Column="3" RowDefinitions="Auto,*,Auto">
                         <TextBlock Grid.Row="0" FontWeight="SemiBold">RX AGL</TextBlock>
                         <Slider Grid.Row="1" Orientation="Vertical" Minimum="0" Maximum="12000"
                                 TickPlacement="BottomRight"
@@ -105,79 +115,90 @@
         </Grid>
 
         <!-- Bottom Info Panel -->
-        <Grid Grid.Row="2" Margin="10" ColumnDefinitions="*,*,*" Name="ConfigPanel" IsEnabled="False">
+        <Grid Grid.Row="2" Margin="10" ColumnDefinitions="*,*,*,*" Name="ConfigPanel" IsEnabled="False">
+            <!-- Sender 1 -->
             <StackPanel Grid.Column="0" Margin="5">
-                <TextBlock Text="Sender:" FontWeight="Bold" />
-                <TextBlock Name="SenderPosText" Text="Not set" />
-                <StackPanel>
-                    <TextBlock Text="{Binding TxWatts, StringFormat='{}{0} W'}"></TextBlock>
-                    <Slider Minimum="10" Maximum="50" Value="{Binding TxWatts}" ValueChanged="OnAltSliderChanged"></Slider>
-                    <StackPanel Orientation="Horizontal">
-                        <RadioButton Name="RadioButtonUhf" IsChecked="True"
-                                     IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF (left)" />
-                        <RadioButton Content="VHF (right)" Margin="5, 0" />
-                        <TextBlock VerticalAlignment="Center" Text="Frequency " Margin="15, 0, 0, 0" />
-                        <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}" />
-                        
-                        <TextBlock Margin="5, 0" Text="Squelch" VerticalAlignment="Center"/>
-                        <TextBlock Margin="5, 0" Text="{Binding Squelch}" VerticalAlignment="Center"/>
-                        <Slider Minimum="0" Maximum="20"
-                                TickPlacement="Outside"
-                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SquelchSliderValue}"
-                                ValueChanged="OnSquelchSliderChanged" MinWidth="80" VerticalAlignment="Center"/>
-                    </StackPanel>
-                    
-                    <StackPanel Orientation="Horizontal" Spacing="5">
-                        <TextBlock Text="Signal 1 Playback" VerticalAlignment="Center" Width="120"/>
-                        <RadioButton GroupName="Signal1Playback" Content="Continuous" IsChecked="{Binding Signal1Continuous}"/>
-                        <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
-                        <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="5">
-                        <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
-                        <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
-                        <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
-                        <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
-                    </StackPanel>
-                    
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock Text="Signal Boost" VerticalAlignment="Center"/>
-                        <TextBlock Margin="10, 0, 0, 0" Text="Signal 1" VerticalAlignment="Center" />
-                        <Slider Minimum="-15" Maximum="15"
-                                TickPlacement="Outside"
-                                TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding SteppedDiffDbm}"
-                                ValueChanged="OnAltSliderChanged" MinWidth="200">
-                        </Slider>
-                        <TextBlock Text="Signal 2" VerticalAlignment="Center" />
-                    </StackPanel>
+                <TextBlock Text="Sender 1:" FontWeight="Bold" Foreground="LimeGreen"/>
+                <TextBlock Name="Sender1PosText" Text="Not set" />
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Signal 1 Playback" VerticalAlignment="Center" Width="120"/>
+                    <RadioButton GroupName="Signal1Playback" Content="Continuous" IsChecked="{Binding Signal1Continuous}"/>
+                    <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
+                    <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
                 </StackPanel>
+                <TextBlock Text="Path S1 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
+                <Grid ColumnDefinitions="6*,4*">
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Text="Gain:" FontWeight="Bold" />
+                        <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
+                        <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
+                        <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
+                        <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                        <TextBlock Name="Gain1Text" Text="n/a" />
+                        <TextBlock Name="LowPass1Text" Text="n/a" />
+                        <TextBlock Name="Noise1Text" Text="n/a" />
+                        <TextBlock Name="Dropout1Text" Text="n/a" />
+                        <TextBlock Name="DeepFade1Text" Text="n/a" />
+                    </StackPanel>
+                </Grid>
             </StackPanel>
+            <!-- Sender 2 -->
             <StackPanel Grid.Column="1" Margin="5">
-                <TextBlock Text="Receiver:" FontWeight="Bold" />
+                <TextBlock Text="Sender 2:" FontWeight="Bold" Foreground="DodgerBlue"/>
+                <TextBlock Name="Sender2PosText" Text="Not set" />
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
+                    <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
+                    <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
+                    <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                </StackPanel>
+                <TextBlock Text="Path S2 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
+                <Grid ColumnDefinitions="6*,4*">
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Text="Gain:" FontWeight="Bold" />
+                        <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
+                        <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
+                        <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
+                        <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                        <TextBlock Name="Gain2Text" Text="n/a" />
+                        <TextBlock Name="LowPass2Text" Text="n/a" />
+                        <TextBlock Name="Noise2Text" Text="n/a" />
+                        <TextBlock Name="Dropout2Text" Text="n/a" />
+                        <TextBlock Name="DeepFade2Text" Text="n/a" />
+                    </StackPanel>
+                </Grid>
+            </StackPanel>
+            <!-- Receiver -->
+            <StackPanel Grid.Column="2" Margin="5">
+                <TextBlock Text="Receiver:" FontWeight="Bold" Foreground="Red"/>
                 <TextBlock Name="ReceiverPosText" Text="Not set" />
-                <StackPanel Grid.Row="1">
-                    <TextBlock Text="{Binding RxDbm, StringFormat='{}{0} dBm'}"></TextBlock>
-                    <Slider Minimum="-110" Maximum="-50" Value="{Binding RxDbm}" ValueChanged="OnAltSliderChanged"></Slider>
+                <TextBlock Text="{Binding RxDbm, StringFormat='{}{0} dBm'}"/>
+                <Slider Minimum="-110" Maximum="-50" Value="{Binding RxDbm}" ValueChanged="OnAltSliderChanged"/>
+            </StackPanel>
+            <!-- Shared Settings -->
+            <StackPanel Grid.Column="3" Margin="5">
+                <TextBlock Text="Shared Settings:" FontWeight="Bold"/>
+                <TextBlock Text="{Binding TxWatts, StringFormat='{}{0} W'}"/>
+                <Slider Minimum="10" Maximum="50" Value="{Binding TxWatts}" ValueChanged="OnAltSliderChanged"/>
+                <StackPanel Orientation="Horizontal">
+                    <RadioButton Name="RadioButtonUhf" IsChecked="True"
+                                 IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF"/>
+                    <RadioButton Content="VHF" Margin="5,0"/>
+                    <TextBlock VerticalAlignment="Center" Text="Freq " Margin="10,0,0,0"/>
+                    <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="Squelch" VerticalAlignment="Center"/>
+                    <TextBlock Margin="5,0" Text="{Binding Squelch}" VerticalAlignment="Center"/>
+                    <Slider Minimum="0" Maximum="20" TickPlacement="Outside" TickFrequency="1"
+                            IsSnapToTickEnabled="True" Value="{Binding SquelchSliderValue}"
+                            ValueChanged="OnSquelchSliderChanged" MinWidth="80" VerticalAlignment="Center"/>
                 </StackPanel>
             </StackPanel>
-            <Grid Grid.Column="2" ColumnDefinitions="6*,4*" Margin="5">
-                <StackPanel Grid.Column="0">
-                    <TextBlock Text="Gain:" FontWeight="Bold" />
-                    <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
-                    <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
-                    <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
-                    <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
-
-                </StackPanel>
-
-                <StackPanel Grid.Column="1" HorizontalAlignment="Right">
-                    <TextBlock Name="GainText" Text="n/a" />
-                    <TextBlock Name="LowPassHzText" Text="n/a" />
-                    <TextBlock Name="NoiseLvlText" Text="n/a" />
-                    <TextBlock Name="DropoutRateText" Text="n/a" />
-                    <TextBlock Name="DeepFadeRateText" Text="n/a" />
-                </StackPanel>
-            </Grid>
         </Grid>
     </Grid>
 </Window>
