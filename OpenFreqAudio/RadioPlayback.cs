@@ -263,7 +263,7 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    private class FrequencyConfig
+    public class FrequencyConfig
     {
         // ReSharper disable UnusedAutoPropertyAccessor.Local
         public float Volume { get; set; } = 1.0f;
@@ -292,8 +292,15 @@ public class RadioPlayback : IDisposable
         Both
     }
 
+    // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
+    
+    // Frequencies we are tuned to
     private readonly Dictionary<int, FrequencyConfig> _frequencies = new();
+    
+    // Frequencies were we are currently transmitting and which are therefore muted
+    private readonly HashSet<int> _transmittingFrequencies = new();
+    
     private readonly object _lock = new();
 
     private int _masterStream;
@@ -918,6 +925,46 @@ public class RadioPlayback : IDisposable
             _frequencies[frequencyKHz].AudioChannel = channel;
         }
     }
+    
+    public void AddTransmittingFrequencies(IEnumerable<int> frequencies)
+    {
+        lock (_lock)
+        {
+            foreach (var frequency in frequencies)
+            {
+                _transmittingFrequencies.Add(frequency);
+            }
+          
+            // Log changes
+            Console.WriteLine(_transmittingFrequencies.Count > 0
+                ? $"[TransmitBlock] Now blocking: {string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz"))}"
+                : "$[TransmitBlock] Not blocking any frequencies");
+        }
+    }
+
+    public void RemoveTransmittingFrequencies(IEnumerable<int> frequencies)
+    {
+        lock (_lock)
+        {
+            foreach (var frequency in frequencies)
+            {
+                _transmittingFrequencies.Remove(frequency);
+            }
+            
+            // Log changes
+            Console.WriteLine(_transmittingFrequencies.Count > 0
+                ? $"[TransmitBlock] Now blocking: {string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz"))}"
+                : "$[TransmitBlock] Not blocking any frequencies");
+        }
+    }
+
+    public void ClearTransmittingFrequencies()
+    {
+        lock (_lock)
+        {
+            _transmittingFrequencies.Clear();
+        }
+    }
 
     // Convert stream from native channel format to output channel format
     private void ConvertToOutputFormat(RadioStream stream, float[] dest, int destSamples)
@@ -1037,6 +1084,7 @@ public class RadioPlayback : IDisposable
             // Snapshot state once
             List<RadioStream> activeStreams;
             Dictionary<int, FrequencyConfig> frequencySnapshot;
+            HashSet<int>? transmittingFrequencies = null;
             lock (_lock)
             {
                 if (Apply3dEffects)
@@ -1044,6 +1092,9 @@ public class RadioPlayback : IDisposable
                     activeStreams = _streams.Values.Where(s =>
                         s.CurrentParams.Gain > 0 &&
                         s.CurrentParams.Gain >= _frequencies[s.FrequencyKHz].MinimumGain).ToList();
+                        
+                        // Snapshot transmitting frequencies - but only when we are in 3D Mode
+                        transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
                 }
 
                 else
@@ -1054,6 +1105,21 @@ public class RadioPlayback : IDisposable
                 frequencySnapshot = new Dictionary<int, FrequencyConfig>(_frequencies);
             }
 
+            // Filter out streams on transmitting frequencies
+            if (transmittingFrequencies?.Count > 0)
+            {
+                var originalCount = activeStreams.Count;
+                activeStreams = activeStreams
+                    .Where(s => !transmittingFrequencies.Contains(s.FrequencyKHz))
+                    .ToList();
+        
+                var blockedCount = originalCount - activeStreams.Count;
+                if (blockedCount > 0)
+                {
+                    // Streams blocked - this is expected during transmission
+                    // Optional: Log periodically for debugging (not every frame)
+                }
+            }
 
             int outputFrames = samples / _channels;
             Array.Clear(_dspScratch, 0, samples);
@@ -1352,6 +1418,7 @@ public class RadioPlayback : IDisposable
         {
             _frequencies.Clear();
         }
+        ClearTransmittingFrequencies();
 
         // 5. Free BASS device
         try
