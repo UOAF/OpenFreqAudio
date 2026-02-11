@@ -4,7 +4,8 @@ using ReactiveUI;
 
 public class MainWindowViewModel : ReactiveObject
 {
-    private int _txAltitude = 0;
+    private int _tx1Altitude = 0;
+    private int _tx2Altitude = 0;
     private int _rxAltitude = 0;
 
     private int _txWatts = 40;
@@ -12,7 +13,6 @@ public class MainWindowViewModel : ReactiveObject
 
     private int _frequencyKhz = 513750; // default UHF
 
-    private int _steppedDiffDbm = 0;
     private bool _signal1Continuous = false;
     private bool _signal2Continuous = false;
     private int _squelchSliderValue = 10;
@@ -36,10 +36,16 @@ public class MainWindowViewModel : ReactiveObject
     }
 
 
-    public int TXAltitude
+    public int TX1Altitude
     {
-        get => _txAltitude;
-        set => this.RaiseAndSetIfChanged(ref _txAltitude, value);
+        get => _tx1Altitude;
+        set => this.RaiseAndSetIfChanged(ref _tx1Altitude, value);
+    }
+
+    public int TX2Altitude
+    {
+        get => _tx2Altitude;
+        set => this.RaiseAndSetIfChanged(ref _tx2Altitude, value);
     }
 
     public int RXAltitude
@@ -54,12 +60,6 @@ public class MainWindowViewModel : ReactiveObject
         set => this.RaiseAndSetIfChanged(ref _txWatts, value);
     }
     
-    public int SteppedDiffDbm
-    {
-        get => _steppedDiffDbm;
-        set => this.RaiseAndSetIfChanged(ref _steppedDiffDbm, value);
-    }
-
     public int RxDbm
     {
         get => _rxDbm;
