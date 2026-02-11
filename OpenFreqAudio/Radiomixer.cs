@@ -124,10 +124,6 @@ public class Radiomixer
     public static SteppedOnParams CalculateSteppedOnParams(
         AudioParams tx1,
         AudioParams tx2,
-        float distance1_km,
-        float distance2_km,
-        float snr1_dB,
-        float snr2_dB,
         ModulationType modType = ModulationType.AM) // Add modulation type
     {
         var result = new SteppedOnParams();
@@ -256,17 +252,13 @@ public class Radiomixer
         result.BeatFrequency_Hz = beatHz;
 
         // Frequency instability influences pitch modulation depth
-        float avgSNR = (snr1_dB + snr2_dB) / 2.0f;
+        float avgSNR = (tx1.SNR_dB + tx2.SNR_dB) / 2.0f;
         float snrFactor = MathF.Max(0, (10.0f - avgSNR) / 20.0f);
         result.FreqInstability_Hz = 30.0f + snrFactor * 40.0f;
 
         // Amplitude variations
         float equalityFactor = 1.0f - MathF.Abs(result.CaptureRatio - 0.5f) * 2.0f;
         result.FastFadingRate_Hz = 45.0f + equalityFactor * 15.0f;
-
-        // === SIGNAL QUALITY ===
-        result.SignalQuality = Math.Clamp((avgSNR + 10.0f) / 30.0f, 0.0f, 1.0f);
-        result.SignalQuality *= (1.0f - result.InterferenceLevel * 0.6f);
 
         return result;
     }

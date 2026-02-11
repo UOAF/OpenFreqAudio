@@ -59,16 +59,13 @@ namespace OpenFreqAudio
     public class AudioParams
     {
         public float Gain; // linear gain
-        public float LowpassHz; // cutoff for low-pass filter (analog voice bandwidth)
         public float NoiseLevel; // 0..1 (analog static/hiss level)
         public float DropoutRate; // fast multipath flutter (events per second, can exceed 1.0)
         public float DeepFadeRate; // slow deep fades (events per second, typically 0-0.5)
         public int RadioFrequencyKHz;
 
         // RF propagation parameters (for physics-based stepped-on interference)
-        public float Distance_km; // Distance from transmitter to receiver
         public float SNR_dB; // Signal-to-noise ratio
-        public float PathLoss_dB; // Total path loss
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
@@ -77,9 +74,9 @@ namespace OpenFreqAudio
         {
             return new AudioParams()
             {
-                Distance_km = Distance_km, DropoutRate = DropoutRate, DeepFadeRate = DeepFadeRate,
-                LowpassHz = LowpassHz, NoiseLevel = NoiseLevel,
-                Gain = Gain, PathLoss_dB = PathLoss_dB, RadioFrequencyKHz = RadioFrequencyKHz, SNR_dB = SNR_dB,
+                DropoutRate = DropoutRate, DeepFadeRate = DeepFadeRate,
+                NoiseLevel = NoiseLevel,
+                Gain = Gain, RadioFrequencyKHz = RadioFrequencyKHz, SNR_dB = SNR_dB,
                 TerrainProfile = TerrainProfile
             };
         }
@@ -311,12 +308,10 @@ namespace OpenFreqAudio
         }
 
         // Helper to finalize AudioParams with common fields and optional terrain profile
-        private void FinalizeAudioParams(AudioParams ap, double dist, double snrDb, double pathLossDb,
+        private void FinalizeAudioParams(AudioParams ap, double snrDb,
             List<(double dist, double elev)> profile, bool includeTerrainProfile)
         {
-            ap.Distance_km = (float)(dist / 1000.0);
             ap.SNR_dB = (float)snrDb;
-            ap.PathLoss_dB = (float)pathLossDb;
             if (includeTerrainProfile)
                 ap.TerrainProfile = profile;
         }
@@ -485,7 +480,6 @@ namespace OpenFreqAudio
                 snrDb = effectiveSignalDbm - noiseFloorDbm;
 
                 CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
                 return;
             }
 
@@ -633,24 +627,6 @@ namespace OpenFreqAudio
 
             // Calculate noise and dropout from SNR (physics-based)
             CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-
-            // Set bandwidth
-            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
-        }
-
-        /// <summary>
-        /// Update noise, dropout, and bandwidth without recalculating gain
-        /// </summary>
-        public void UpdateStaticParamsOnly(AudioParams ap, double snrDb, RadioBandConfig bandConfig)
-        {
-            // Update noise/dropout without recalculating gain
-            // (used when gain is already correctly set but we need to recalculate noise/dropout)
-
-            // Calculate noise and dropout from SNR (physics-based)
-            CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-
-            // Set bandwidth
-            ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
         }
 
         /// <summary>
@@ -714,11 +690,10 @@ namespace OpenFreqAudio
             if (dist < 1.0)
             {
                 ap.Gain = 1.0f;
-                ap.LowpassHz = bandConfig.VoiceBandwidth_Hz;
                 ap.NoiseLevel = 0.01f;
                 ap.DropoutRate = 0.0f;
                 ap.DeepFadeRate = 0.0f;
-                FinalizeAudioParams(ap, dist, 40.0, 0.0, new List<(double, double)>(), includeTerrainProfile);
+                FinalizeAudioParams(ap, 40.0, new List<(double, double)>(), includeTerrainProfile);
                 return ap;
             }
 
@@ -746,13 +721,12 @@ namespace OpenFreqAudio
             {
                 double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
                 ap.Gain = ApplyAGC((float)rfGainLinear);
-                ap.LowpassHz = CalculateDynamicBandwidth(snrDb, bandConfig);
 
                 // SNR = Received Power - Noise Floor
                 snrDb = prDbm - rxSensitivity;
 
                 CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-                FinalizeAudioParams(ap, dist, snrDb, fspl + weatherLoss, profile, includeTerrainProfile);
+                FinalizeAudioParams(ap, snrDb, profile, includeTerrainProfile);
                 return ap;
             }
 
@@ -819,7 +793,7 @@ namespace OpenFreqAudio
             snrDb = prDbm - rxSensitivity;
 
             // Finalize and return
-            FinalizeAudioParams(ap, dist, snrDb, pathLossDb, profile, includeTerrainProfile);
+            FinalizeAudioParams(ap, snrDb, profile, includeTerrainProfile);
             return ap;
         }
 
@@ -877,56 +851,6 @@ namespace OpenFreqAudio
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
 
-        /// <summary>
-        /// Calculate dynamic bandwidth based on SNR and band configuration
-        /// </summary>
-        private float CalculateDynamicBandwidth(double snrDb, RadioBandConfig bandConfig)
-        {
-            // Full bandwidth target for this modulation type
-            float maxBandwidth = bandConfig.VoiceBandwidth_Hz;
-
-            // Minimum intelligible bandwidth (telephone quality)
-            const float minBandwidth = 1200f;
-
-            if (snrDb > 20.0)
-            {
-                // Excellent signal - full bandwidth
-                return maxBandwidth;
-            }
-
-            if (snrDb > 10.0)
-            {
-                // Good signal - slight HF rolloff (3000 → 2600 Hz)
-                float reduction = (float)((20.0 - snrDb) / 10.0 * 0.15); // 0% → 15% reduction
-                return maxBandwidth * (1f - reduction);
-            }
-
-            if (snrDb > 5.0)
-            {
-                // Marginal signal - noticeable narrowing (2600 → 2000 Hz)
-                float startBw = maxBandwidth * 0.85f;
-                float endBw = maxBandwidth * 0.60f;
-                float t = (float)((10.0 - snrDb) / 5.0);
-                return startBw + t * (endBw - startBw);
-            }
-
-            if (snrDb > 0.0)
-            {
-                // Poor signal - telephone quality (2000 → 1500 Hz)
-                float startBw = maxBandwidth * 0.60f;
-                float endBw = maxBandwidth * 0.45f;
-                float t = (float)((5.0 - snrDb) / 5.0);
-                return startBw + t * (endBw - startBw);
-            }
-            else
-            {
-                // Very poor - minimal intelligibility (1500 → 1200 Hz)
-                float startBw = maxBandwidth * 0.45f;
-                float reduction = (float)Math.Min(-snrDb / 10.0, 0.2); // Additional 20% max
-                return Math.Max(minBandwidth, startBw * (1f - reduction));
-            }
-        }
-
         public static AudioParams GetDefaultAudioParams(int frequencyKhz)
         {
             var bandConfig = GetBandConfig(frequencyKhz);
@@ -934,7 +858,6 @@ namespace OpenFreqAudio
             {
                 RadioFrequencyKHz = frequencyKhz,
                 Gain = 1.0f,
-                LowpassHz = bandConfig.VoiceBandwidth_Hz,
                 NoiseLevel = 0f,
                 DropoutRate = 0f,
                 DeepFadeRate = 0f

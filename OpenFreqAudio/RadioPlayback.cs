@@ -1355,9 +1355,7 @@ public class RadioPlayback : IDisposable
                         ConvertToOutputFormat(secondary, _mixBuffer2, samples);
 
                         var steppedParams = Radiomixer.CalculateSteppedOnParams(
-                            primary.CurrentParams, secondary.CurrentParams,
-                            primary.CurrentParams.Distance_km, secondary.CurrentParams.Distance_km,
-                            primary.CurrentParams.SNR_dB, secondary.CurrentParams.SNR_dB);
+                            primary.CurrentParams, secondary.CurrentParams);
 
                         freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, samples,
                             steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(),

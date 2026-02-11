@@ -130,14 +130,12 @@
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
                         <TextBlock Text="Gain:" FontWeight="Bold" />
-                        <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
                         <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
                         <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
                         <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right">
                         <TextBlock Name="Gain1Text" Text="n/a" />
-                        <TextBlock Name="LowPass1Text" Text="n/a" />
                         <TextBlock Name="Noise1Text" Text="n/a" />
                         <TextBlock Name="Dropout1Text" Text="n/a" />
                         <TextBlock Name="DeepFade1Text" Text="n/a" />
@@ -158,14 +156,12 @@
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
                         <TextBlock Text="Gain:" FontWeight="Bold" />
-                        <TextBlock Text="Low Pass Hz:" FontWeight="Bold" />
                         <TextBlock Text="Noise Lvl:" FontWeight="Bold" />
                         <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
                         <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right">
                         <TextBlock Name="Gain2Text" Text="n/a" />
-                        <TextBlock Name="LowPass2Text" Text="n/a" />
                         <TextBlock Name="Noise2Text" Text="n/a" />
                         <TextBlock Name="Dropout2Text" Text="n/a" />
                         <TextBlock Name="DeepFade2Text" Text="n/a" />

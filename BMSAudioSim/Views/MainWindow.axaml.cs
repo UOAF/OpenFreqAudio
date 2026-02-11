@@ -469,13 +469,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         UpdateProfileGraph(audioParams1, audioParams2);
 
         Gain1Text.Text = audioParams1.Gain.ToString();
-        LowPass1Text.Text = audioParams1.LowpassHz.ToString();
         Noise1Text.Text = audioParams1.NoiseLevel.ToString();
         Dropout1Text.Text = audioParams1.DropoutRate.ToString();
         DeepFade1Text.Text = audioParams1.DeepFadeRate.ToString();
 
         Gain2Text.Text = audioParams2.Gain.ToString();
-        LowPass2Text.Text = audioParams2.LowpassHz.ToString();
         Noise2Text.Text = audioParams2.NoiseLevel.ToString();
         Dropout2Text.Text = audioParams2.DropoutRate.ToString();
         DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();

@@ -62,12 +62,6 @@ public class SteppedOnParams
     /// </summary>
     public bool IsVHF;
     
-    /// <summary>
-    /// Average signal quality indicator (0-1).
-    /// Based on combined SNR of both signals.
-    /// </summary>
-    public float SignalQuality;
-
     public override string ToString()
     {
         return $"PowerDiff_dBm = {PowerDiff_dBm} CaptureRatio = {CaptureRatio} BeatFrequency_Hz={BeatFrequency_Hz}";
