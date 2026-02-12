@@ -1,3 +1,7 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
 namespace OpenFreqAudio;
 
 /// <summary>
@@ -317,7 +321,7 @@ public static class RadioStationPresets
     /// <summary>
     /// Get all unique categories
     /// </summary>
-    public static IEnumerable<string> GetCategories()
+    public static IOrderedEnumerable<string?> GetCategories()
     {
         return GetAllPresets().Select(p => p.Category).Distinct().OrderBy(c => c);
     }
@@ -328,6 +332,6 @@ public static class RadioStationPresets
     public static RadioStationPreset? FindByName(string name)
     {
         return GetAllPresets().FirstOrDefault(p =>
-            p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            p.Name != null && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
     }
 }

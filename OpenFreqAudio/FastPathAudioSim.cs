@@ -8,8 +8,12 @@
 // - Wavelength-dependent corrections with configurable AM/FM modulation
 // - Parametrized radio band characteristics (bandwidth, diffraction, modulation type)
 
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 // ReSharper disable InconsistentNaming
 
