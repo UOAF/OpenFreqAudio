@@ -1,10 +1,15 @@
-﻿namespace OpenFreqAudio;
+﻿using System;
+using System.Threading;
+using Microsoft.Extensions.Logging;
+
+namespace OpenFreqAudio;
 
 /// <summary>
 /// Generates squelch burst sounds.
 /// </summary>
 public class SquelchBurstGenerator
 {
+    private readonly ILogger _logger;
     private readonly int _sampleRate;
     private readonly int _channels;
     
@@ -30,10 +35,11 @@ public class SquelchBurstGenerator
     private static readonly ThreadLocal<Random> ThreadRng =
         new(() => new Random(Environment.TickCount * Thread.CurrentThread.ManagedThreadId));
     
-    public SquelchBurstGenerator(int sampleRate, int channels)
+    public SquelchBurstGenerator(int sampleRate, int channels, ILogger logger)
     {
         _sampleRate = sampleRate;
         _channels = channels;
+        _logger = logger;
     }
     
     /// <summary>
@@ -53,7 +59,7 @@ public class SquelchBurstGenerator
         Array.Clear(_filterHistory, 0, _filterHistory.Length);
         _filterIndex = 0;
         
-        Console.WriteLine("[SquelchBurst] Opening burst triggered (click)");
+        _logger.LogDebug("Opening burst triggered (click)");
     }
     
     /// <summary>
@@ -68,7 +74,7 @@ public class SquelchBurstGenerator
         Array.Clear(_filterHistory, 0, _filterHistory.Length);
         _filterIndex = 0;
         
-        Console.WriteLine("[SquelchBurst] Closing burst triggered (ksssh)");
+        _logger.LogDebug("Closing burst triggered (ksssh)");
     }
     
     /// <summary>

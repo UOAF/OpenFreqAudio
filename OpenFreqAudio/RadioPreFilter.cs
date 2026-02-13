@@ -1,4 +1,7 @@
 // ReSharper disable InconsistentNaming
+
+using System;
+
 namespace OpenFreqAudio;
 
 /// <summary>

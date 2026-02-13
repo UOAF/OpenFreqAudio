@@ -1,5 +1,8 @@
+using System;
+using System.IO;
 using System.Reflection;
 using ManagedBass;
+using Microsoft.Extensions.Logging;
 using OpenFreqAudio.Models;
 
 // ReSharper disable InconsistentNaming
@@ -104,12 +107,6 @@ public class Radiomixer
                     _steppedOnSample[i] = sum / channels;
                 }
             }
-
-            Console.WriteLine("[RadioMixer] Loaded stepped-on sample:");
-            Console.WriteLine($"  Sample rate: {_sampleRate} Hz");
-            Console.WriteLine($"  Channels: {channels} -> 1 (mono)");
-            Console.WriteLine($"  Samples: {_steppedOnSample.Length}");
-            Console.WriteLine($"  Duration: {_steppedOnSample.Length / (float)_sampleRate:F2} seconds");
         }
         finally
         {

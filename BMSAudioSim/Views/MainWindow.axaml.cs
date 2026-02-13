@@ -41,7 +41,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private DEMReader? _demReader;
     private AudioParams? _signal1Params;
     private AudioParams? _signal2Params;
-    private RadioPlayback _radioPlayback = new();
+    private RadioPlayback _radioPlayback;
     private ILoggerFactory _loggerFactory;
     private MainWindowViewModel _viewModel;
 
@@ -60,6 +60,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         _viewModel = viewModel;
         _loggerFactory = loggerFactory;
+        _radioPlayback = new RadioPlayback(_loggerFactory);
         DataContext = viewModel;
         this.WhenActivated(disposables =>
         {

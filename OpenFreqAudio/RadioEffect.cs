@@ -1,4 +1,10 @@
 // ReSharper disable InconsistentNaming
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using Microsoft.Extensions.Logging;
+
 namespace OpenFreqAudio;
 
 /// <summary>
@@ -20,6 +26,7 @@ namespace OpenFreqAudio;
 /// </summary>
 public class RadioEffect
 {
+    private ILogger _logger;
     private readonly int _channels;
     private readonly int _sampleRate;
     private readonly Lock _lock = new();
@@ -202,11 +209,12 @@ public class RadioEffect
         }
     }
 
-    public RadioEffect(int sampleRate, int channels, AudioParams initial)
+    public RadioEffect(int sampleRate, int channels, AudioParams initial, ILogger logger)
     {
         _sampleRate = sampleRate;
         _channels = channels;
         _params = initial;
+        _logger = logger;
         _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
 
         // Get or calculate filter coefficients (cached per sample rate)
@@ -216,11 +224,15 @@ public class RadioEffect
             {
                 coeffs = CalculateFilterCoefficients(sampleRate);
                 FilterCache[sampleRate] = coeffs;
-                Console.WriteLine($"[RadioEffect] Calculated and cached filter coefficients for {sampleRate} Hz");
+                #if DEBUG
+                logger.LogDebug($"Calculated and cached filter coefficients for {sampleRate} Hz");
+                #endif
             }
             else
             {
-                Console.WriteLine($"[RadioEffect] Using cached filter coefficients for {sampleRate} Hz");
+                #if DEBUG
+                logger.LogDebug($"Using cached filter coefficients for {sampleRate} Hz");
+                #endif
             }
 
             (_b0, _b1, _b2, _a1, _a2) = coeffs;

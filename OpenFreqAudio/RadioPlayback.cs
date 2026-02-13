@@ -1,5 +1,11 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using ManagedBass;
+using Microsoft.Extensions.Logging;
 
 // ReSharper disable InconsistentNaming
 
@@ -15,6 +21,7 @@ public class RadioPlayback : IDisposable
 {
     private class RadioStream
     {
+        private ILogger _logger;
         public string StreamId { get; set; } = "";
         public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
@@ -33,6 +40,11 @@ public class RadioPlayback : IDisposable
         private int _ringReadPos;
         private int _ringCount; // number of floats in buffer
         private readonly object _ringLock = new();
+
+        public RadioStream(ILogger logger)
+        {
+            _logger = logger;
+        }
 
         // For file-based streams we run a reader task that decodes and pushes into the ring
         public CancellationTokenSource? FileReaderCts { get; set; }
@@ -113,12 +125,15 @@ public class RadioPlayback : IDisposable
 
                 // Only log significant overflows (>1000 frames = ~23ms at 44.1kHz)
                 // Small overflows during RadioEffect processing are normal
+#if DEBUG
                 if (framesDropped > 1000)
                 {
                     float fillPercent = (float)_ringCount / RingBuffer.Length * 100f;
-                    Console.WriteLine(
-                        $"[PushToRing:{StreamId}] OVERFLOW! Dropped {framesDropped} frames to make room. Buffer was {fillPercent:F1}% full");
+                    _logger.LogWarning(
+                        "OVERFLOW! Dropped {DroppedFrames} frames to make room. Buffer was {FillPercent:F1}% full (StreamId: {StreamId})",
+                        framesDropped, fillPercent, StreamId);
                 }
+#endif
 
                 int src = 0;
                 for (int f = 0; f < frameCount; f++)
@@ -139,8 +154,11 @@ public class RadioPlayback : IDisposable
                 if (IsBuffering && _ringCount >= MinBufferFrames * Channels)
                 {
                     IsBuffering = false;
-                    Console.WriteLine(
-                        $"[PushToRing:{StreamId}] Buffering complete! {_ringCount / Channels} frames buffered ({(float)_ringCount / RingBuffer.Length * 100f:F1}% full)");
+#if DEBUG
+                    _logger.LogDebug(
+                        "Buffering complete! {FrameCount} frames buffered ({FillPercent:F1}% full) (StreamId: {StreamId})",
+                        _ringCount / Channels, (float)_ringCount / RingBuffer.Length * 100f, StreamId);
+#endif
                 }
             }
         }
@@ -162,8 +180,11 @@ public class RadioPlayback : IDisposable
                     if (availableFrames >= MinBufferFrames)
                     {
                         IsBuffering = false;
-                        Console.WriteLine(
-                            $"[ReadFromRing:{StreamId}] Buffering complete! {availableFrames} frames buffered ({fillPercent:F1}% full)");
+#if DEBUG
+                        _logger.LogDebug(
+                            "Buffering complete! {AvailableFrames} frames buffered ({FillPercent:F1}% full) (StreamId: {StreamId})",
+                            availableFrames, fillPercent, StreamId);
+#endif
                     }
                     // Fallback exit condition: stream stopped but we have substantial data (>60% of target)
                     // Wait 200ms after last packet to ensure stream truly stopped
@@ -172,18 +193,15 @@ public class RadioPlayback : IDisposable
                              (DateTime.UtcNow - LastAudioReceived).TotalMilliseconds > 200)
                     {
                         IsBuffering = false;
-                        Console.WriteLine(
-                            $"[ReadFromRing:{StreamId}] Buffering timeout! Stream inactive, using {availableFrames} frames ({fillPercent:F1}% full)");
+#if DEBUG
+                        _logger.LogDebug(
+                            "Buffering timeout! Stream inactive, using {AvailableFrames} frames ({FillPercent:F1}% full) (StreamId: {StreamId})",
+                            availableFrames, fillPercent, StreamId);
+#endif
                     }
                     // Still buffering - log progress and return silence
                     else
                     {
-                        // Log buffering progress periodically (not every call to avoid spam)
-                        if (availableFrames % 480 == 0 || availableFrames == 0)
-                        {
-                            // Console.WriteLine($"[DSP:{StreamId}] Buffering... {availableFrames}/{MinBufferFrames} frames ({fillPercent:F1}%)");
-                        }
-
                         // Return silence while buffering
                         int destSamples = frameCount * Channels;
                         Array.Clear(dest, 0, destSamples);
@@ -199,16 +217,18 @@ public class RadioPlayback : IDisposable
                 {
                     if (fillPercent < 25f)
                     {
-                        Console.WriteLine(
-                            $"[ReadFromRing:{StreamId}] UNDERRUN! Requested {frameCount} frames, only {availableFrames} available ({fillPercent:F1}% full, {_ringCount}/{RingBuffer.Length})");
+                        _logger.LogWarning(
+                            "UNDERRUN! Requested {RequestedFrames} frames, only {AvailableFrames} available ({FillPercent:F1}% full, {Count}/{Capacity}) (StreamId: {StreamId})",
+                            frameCount, availableFrames, fillPercent, _ringCount, RingBuffer.Length, StreamId);
                     }
 
                     // Enter rebuffering mode if buffer critically low (< 5%)
                     if (fillPercent < 5f && !IsBuffering)
                     {
                         IsBuffering = true;
-                        Console.WriteLine(
-                            $"[ReadFromRing:{StreamId}] Buffer critically low ({fillPercent:F1}%) - entering rebuffering mode");
+                        _logger.LogWarning(
+                            "Buffer critically low ({FillPercent:F1}%) - entering rebuffering mode (StreamId: {StreamId})",
+                            fillPercent, StreamId);
                     }
                 }
 
@@ -292,15 +312,18 @@ public class RadioPlayback : IDisposable
         Both
     }
 
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<RadioPlayback> _logger;
+
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
-    
+
     // Frequencies we are tuned to
     private readonly Dictionary<int, FrequencyConfig> _frequencies = new();
-    
+
     // Frequencies were we are currently transmitting and which are therefore muted
     private readonly HashSet<int> _transmittingFrequencies = new();
-    
+
     private readonly object _lock = new();
 
     private int _masterStream;
@@ -328,8 +351,10 @@ public class RadioPlayback : IDisposable
 
     public bool Apply3dEffects { get; set; }
 
-    public RadioPlayback(int playbackDeviceIndex = -1)
+    public RadioPlayback(ILoggerFactory loggerFactory, int playbackDeviceIndex = -1)
     {
+        _logger = loggerFactory.CreateLogger<RadioPlayback>();
+        _loggerFactory = loggerFactory;
         lock (_bassInitLock)
         {
             // Just use the default device - BASS doesnt like any checks on that
@@ -345,12 +370,14 @@ public class RadioPlayback : IDisposable
                     // Initialize the new device
                     if (!Bass.Init(playbackDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
                     {
-                        Console.WriteLine($"Failed to initialize device {playbackDeviceIndex}: {Bass.LastError}");
+                        _logger.LogError($"Failed to initialize device {playbackDeviceIndex}: {Bass.LastError}");
                         return;
                     }
                 }
+
                 Bass.CurrentDevice = playbackDeviceIndex;
             }
+
             // Configure BASS for low-latency operation
             Bass.Configure(Configuration.UpdatePeriod, 5);
             Bass.Configure(Configuration.PlaybackBufferLength, 40);
@@ -383,20 +410,22 @@ public class RadioPlayback : IDisposable
 
             info = Bass.ChannelGetInfo(bassStream);
 
-            Console.WriteLine($"[StartStream] File info: SampleRate={info.Frequency}, Channels={info.Channels}");
+            _logger.LogInformation("File info: SampleRate={SampleRate}, Channels={Channels}", info.Frequency,
+                info.Channels);
 
             // Check if sample rate changed - recreate master stream if needed
             if (_sampleRate != info.Frequency)
             {
-                Console.WriteLine(
-                    $"[StartStream] Sample rate mismatch! File={info.Frequency}, Master={_sampleRate}. Recreating master stream.");
+                _logger.LogWarning(
+                    "Sample rate mismatch! File={FileSampleRate}, Master={MasterSampleRate}. Recreating master stream.",
+                    info.Frequency, _sampleRate);
                 needsRecreate = true;
                 newSampleRate = info.Frequency;
             }
             else
             {
-                Console.WriteLine(
-                    $"[StartStream] Using existing master stream: SampleRate={_sampleRate}, Channels={_channels}");
+                _logger.LogDebug("Using existing master stream: SampleRate={SampleRate}, Channels={Channels}",
+                    _sampleRate, _channels);
             }
         }
 
@@ -413,14 +442,15 @@ public class RadioPlayback : IDisposable
 
         lock (_lock)
         {
-            var stream = new RadioStream
+            var stream = new RadioStream(_logger)
             {
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = bassStream,
                 Channels = info.Channels,
                 IsPush = false,
-                RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams),
+                RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams,
+                    _loggerFactory.CreateLogger<RadioEffect>()),
                 RadioPreFilter = new RadioPreFilter(info.Frequency),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
@@ -463,8 +493,9 @@ public class RadioPlayback : IDisposable
 
                             if (consecutiveNoData == 1)
                             {
-                                Console.WriteLine(
-                                    $"[FileReader:{streamId}] Reached end of stream after reading {totalFramesRead} total frames ({(float)totalFramesRead / streamSampleRate:F2}s) at {DateTime.Now:HH:mm:ss.fff}");
+                                _logger.LogDebug(
+                                    "Reached end of stream after reading {TotalFrames} total frames ({Duration:F2}s) at {Time:HH:mm:ss.fff} (StreamId: {StreamId})",
+                                    totalFramesRead, (float)totalFramesRead / streamSampleRate, DateTime.Now, streamId);
                             }
 
                             continue;
@@ -531,15 +562,15 @@ public class RadioPlayback : IDisposable
                         }
                     }
 
-                    Console.WriteLine($"[FileReader:{streamId}] Task cancelled, exiting");
+                    _logger.LogDebug("Task cancelled, exiting (StreamId: {StreamId})", streamId);
                 }
                 catch (OperationCanceledException)
                 {
-                    Console.WriteLine($"[FileReader:{streamId}] Task cancelled");
+                    _logger.LogDebug("Task cancelled (StreamId: {StreamId})", streamId);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[FileReader] Exception for stream {streamId}: {ex}");
+                    _logger.LogError(ex, "Exception in FileReader for stream {StreamId}", streamId);
                 }
             }, token);
 
@@ -557,13 +588,16 @@ public class RadioPlayback : IDisposable
 
             _streams.Add(streamId, stream);
 
-            Console.WriteLine(
-                $"[StartStream] Added file stream {streamId}: Freq={audioParams.RadioFrequencyKHz / 1000.0:F3}MHz, Gain={audioParams.Gain}, Channels={info.Channels}, FileRate={info.Frequency}Hz, MasterRate={_sampleRate}Hz, RingBuffer={stream.RingBuffer.Length} floats");
+            _logger.LogInformation(
+                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Gain={Gain}, Channels={Channels}, FileRate={FileRate}Hz, MasterRate={MasterRate}Hz, RingBuffer={RingBufferSize} floats",
+                streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.Gain, info.Channels, info.Frequency,
+                _sampleRate, stream.RingBuffer.Length);
 
             if (info.Frequency != _sampleRate)
             {
-                Console.WriteLine(
-                    $"[StartStream] WARNING: Sample rate mismatch! File={info.Frequency}Hz, Master={_sampleRate}Hz - this will cause timing issues!");
+                _logger.LogWarning(
+                    "Sample rate mismatch! File={FileRate}Hz, Master={MasterRate}Hz - this will cause timing issues!",
+                    info.Frequency, _sampleRate);
             }
         }
     }
@@ -600,14 +634,15 @@ public class RadioPlayback : IDisposable
 
         lock (_lock)
         {
-            var stream = new RadioStream
+            var stream = new RadioStream(_loggerFactory.CreateLogger<RadioStream>())
             {
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = 0,
                 Channels = channels,
                 IsPush = true,
-                RadioEffect = new RadioEffect(sampleRate, channels, audioParams),
+                RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
+                    _loggerFactory.CreateLogger<RadioEffect>()),
                 RadioPreFilter = new RadioPreFilter(sampleRate),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
@@ -631,11 +666,12 @@ public class RadioPlayback : IDisposable
                 stream.RadioEffect.SetSquelchThreshold(noiseFloor);
             }
 
-            Console.WriteLine(
-                $"[StartPushStream] Stream '{streamId}' on {audioParams.RadioFrequencyKHz / 1000.0:F3} MHz");
-            Console.WriteLine($"[StartPushStream]   SampleRate={sampleRate}, Channels={channels}");
-            Console.WriteLine(
-                $"[StartPushStream]   RingBuffer: {ringFrames} frames × {Math.Max(1, channels)} ch = {ringCapacity} samples ({(float)ringFrames / sampleRate:F1}s)");
+            _logger.LogInformation("Stream '{StreamId}' on {Frequency:F3} MHz", streamId,
+                audioParams.RadioFrequencyKHz / 1000.0);
+            _logger.LogInformation("  SampleRate={SampleRate}, Channels={Channels}", sampleRate, channels);
+            _logger.LogInformation(
+                "  RingBuffer: {RingFrames} frames × {Channels} ch = {RingCapacity} samples ({Duration:F1}s)",
+                ringFrames, Math.Max(1, channels), ringCapacity, (float)ringFrames / sampleRate);
 
             _streams.Add(streamId, stream);
         }
@@ -648,13 +684,13 @@ public class RadioPlayback : IDisposable
         {
             if (!_streams.TryGetValue(streamId, out var stream))
             {
-                Console.WriteLine($"[PushAudioData] Stream '{streamId}' not found");
+                _logger.LogWarning("Stream '{StreamId}' not found", streamId);
                 return false;
             }
 
             if (!stream.IsPush)
             {
-                Console.WriteLine($"[PushAudioData] Stream '{streamId}' is not a push stream");
+                _logger.LogWarning("Stream '{StreamId}' is not a push stream", streamId);
                 return false;
             }
 
@@ -678,13 +714,13 @@ public class RadioPlayback : IDisposable
                 stream.IsBuffering = true;
 
                 string reason = startMarker ? "marker" : (isFirstAudio ? "first-audio" : "gap-restart");
-                Console.WriteLine($"[PushAudioData:{streamId}] Transmission START ({reason})");
+                _logger.LogDebug("Transmission START ({Reason}) (StreamId: {StreamId})", reason, streamId);
             }
 
             // Sanity check: both markers set (shouldn't happen but handle gracefully)
             if (startMarker && endMarker)
             {
-                Console.WriteLine($"[PushAudioData:{streamId}] WARNING: Both start and end markers set!");
+                _logger.LogWarning("Both start and end markers set! (StreamId: {StreamId})", streamId);
             }
 
             int bytesPerSample = 2; // assume 16-bit PCM
@@ -710,8 +746,9 @@ public class RadioPlayback : IDisposable
             var (fillCount, capacity) = stream.GetRingBufferFillLevel();
 #if DEBUG
             float fillPercent = (float)fillCount / capacity * 100f;
-            Console.WriteLine(
-                $"[PushAudioData:{streamId}] Pushed {frames} frames ({audioData.Length} bytes, {bytesPerSample * 8}-bit), buffer now {fillPercent:F1}% full ({fillCount}/{capacity})");
+            _logger.LogDebug(
+                "Pushed {Frames} frames ({Bytes} bytes, {BitsPerSample}-bit), buffer now {FillPercent:F1}% full ({FillCount}/{Capacity}) (StreamId: {StreamId})",
+                frames, audioData.Length, bytesPerSample * 8, fillPercent, fillCount, capacity, streamId);
 #endif
 
             // Handle transmission end marker
@@ -721,8 +758,8 @@ public class RadioPlayback : IDisposable
                 var duration = DateTime.UtcNow - stream.TransmissionStartTime;
                 stream.IsTransmitting = false;
                 stream.TransmissionEndTime = DateTime.UtcNow;
-                Console.WriteLine(
-                    $"[PushAudioData:{streamId}] Transmission END (marker) - duration: {duration.TotalSeconds:F2}s");
+                _logger.LogInformation("Transmission END (marker) - duration: {Duration:F2}s (StreamId: {StreamId})",
+                    duration.TotalSeconds, streamId);
             }
 
             return true;
@@ -806,7 +843,8 @@ public class RadioPlayback : IDisposable
             var freqConfig = _frequencies[frequencyKHz];
             if (freqConfig.SquelchBurst == null)
             {
-                freqConfig.SquelchBurst = new SquelchBurstGenerator(_sampleRate, _channels);
+                freqConfig.SquelchBurst = new SquelchBurstGenerator(_sampleRate, _channels,
+                    _loggerFactory.CreateLogger<SquelchBurstGenerator>());
             }
 
             freqConfig.IsTuned = true;
@@ -828,8 +866,9 @@ public class RadioPlayback : IDisposable
                     stream.RadioEffect.SetSquelchThreshold(noiseFloor);
                 }
 
-                Console.WriteLine(
-                    $"[TuneFrequency] {frequencyKHz / 1000.0:F3} MHz: MinimumGain={freqConfig.MinimumGain:F3}, NoiseFloor={noiseFloor:F3}");
+                _logger.LogInformation(
+                    "TuneFrequency {Frequency:F3} MHz: MinimumGain={MinimumGain:F3}, NoiseFloor={NoiseFloor:F3}",
+                    frequencyKHz / 1000.0, freqConfig.MinimumGain, noiseFloor);
             }
         }
     }
@@ -925,7 +964,7 @@ public class RadioPlayback : IDisposable
             _frequencies[frequencyKHz].AudioChannel = channel;
         }
     }
-    
+
     public void AddTransmittingFrequencies(IEnumerable<int> frequencies)
     {
         lock (_lock)
@@ -934,11 +973,12 @@ public class RadioPlayback : IDisposable
             {
                 _transmittingFrequencies.Add(frequency);
             }
-          
+
             // Log changes
-            Console.WriteLine(_transmittingFrequencies.Count > 0
-                ? $"[TransmitBlock] Now blocking: {string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz"))}"
-                : "$[TransmitBlock] Not blocking any frequencies");
+            _logger.LogDebug(_transmittingFrequencies.Count > 0
+                    ? "Now blocking: {Frequencies}"
+                    : "Not blocking any frequencies",
+                string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz")));
         }
     }
 
@@ -950,11 +990,12 @@ public class RadioPlayback : IDisposable
             {
                 _transmittingFrequencies.Remove(frequency);
             }
-            
+
             // Log changes
-            Console.WriteLine(_transmittingFrequencies.Count > 0
-                ? $"[TransmitBlock] Now blocking: {string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz"))}"
-                : "$[TransmitBlock] Not blocking any frequencies");
+            _logger.LogDebug(_transmittingFrequencies.Count > 0
+                    ? "Now blocking: {Frequencies}"
+                    : "Not blocking any frequencies",
+                string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz")));
         }
     }
 
@@ -1092,9 +1133,9 @@ public class RadioPlayback : IDisposable
                     activeStreams = _streams.Values.Where(s =>
                         s.CurrentParams.Gain > 0 &&
                         s.CurrentParams.Gain >= _frequencies[s.FrequencyKHz].MinimumGain).ToList();
-                        
-                        // Snapshot transmitting frequencies - but only when we are in 3D Mode
-                        transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
+
+                    // Snapshot transmitting frequencies - but only when we are in 3D Mode
+                    transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
                 }
 
                 else
@@ -1112,7 +1153,7 @@ public class RadioPlayback : IDisposable
                 activeStreams = activeStreams
                     .Where(s => !transmittingFrequencies.Contains(s.FrequencyKHz))
                     .ToList();
-        
+
                 var blockedCount = originalCount - activeStreams.Count;
                 if (blockedCount > 0)
                 {
@@ -1240,7 +1281,10 @@ public class RadioPlayback : IDisposable
                                  s.IsTransmitting &&
                                  (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
                     {
-                        Console.WriteLine($"[DSP] Force-ending stale transmission for {s.StreamId}");
+#if DEBUG
+                        _logger.LogDebug("Force-ending stale transmission for {StreamId}", s.StreamId);
+#endif
+
                         s.IsTransmitting = false;
                         s.TransmissionEndTime = DateTime.UtcNow;
                     }
@@ -1263,9 +1307,12 @@ public class RadioPlayback : IDisposable
 
                     if (squelchIsActive && isSquelchOpen != freqConfig.WasSquelchOpen)
                     {
-                        Console.WriteLine($"[DSP:{freq}] SQUELCH {(isSquelchOpen ? "OPEN" : "CLOSED")} " +
-                                          $"(threshold={squelchThreshold:F3}, noise={freqConfig.MinimumGain:F3}, " +
-                                          $"hasSignal={hasAudibleSignal}, noiseAbove={backgroundNoiseAboveSquelch})");
+#if DEBUG
+                        _logger.LogDebug(
+                            "SQUELCH {State} (Freq: {Frequency}, threshold={Threshold:F3}, noise={Noise:F3}, hasSignal={HasSignal}, noiseAbove={NoiseAbove})",
+                            isSquelchOpen ? "OPEN" : "CLOSED", freq, squelchThreshold, freqConfig.MinimumGain,
+                            hasAudibleSignal, backgroundNoiseAboveSquelch);
+#endif
 
                         if (isSquelchOpen)
                             freqConfig.SquelchBurst.TriggerOpening();
@@ -1371,8 +1418,7 @@ public class RadioPlayback : IDisposable
 
     public async Task StopAll()
     {
-        Console.WriteLine("[RadioPlayback] Stopping all streams and cleaning up resources...");
-
+        _logger.LogInformation("Stopping all streams and cleaning up resources...");
         // 1. Stop timeout monitor first
         try
         {
@@ -1384,7 +1430,7 @@ public class RadioPlayback : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RadioPlayback] Error stopping timeout monitor: {ex.Message}");
+            _logger.LogError(ex, "Error stopping timeout monitor");
         }
         finally
         {
@@ -1418,6 +1464,7 @@ public class RadioPlayback : IDisposable
         {
             _frequencies.Clear();
         }
+
         ClearTransmittingFrequencies();
 
         // 5. Free BASS device
@@ -1427,15 +1474,12 @@ public class RadioPlayback : IDisposable
             if (currentDevice != -1)
             {
                 Bass.Free();
-                Console.WriteLine("[RadioPlayback] BASS device freed");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RadioPlayback] Error freeing BASS device: {ex.Message}");
+            _logger.LogError(ex, "Error freeing BASS device");
         }
-
-        Console.WriteLine("[RadioPlayback] Cleanup complete");
     }
 
     public List<string> GetActiveStreams()
@@ -1479,7 +1523,7 @@ public class RadioPlayback : IDisposable
 
     public void ChangeOutputDevice(int newDeviceIndex)
     {
-        Console.WriteLine($"Changing output device to index {newDeviceIndex}");
+        _logger.LogError("Failed to initialize device {DeviceIndex}: {Error}", newDeviceIndex, Bass.LastError);
         bool hadMasterStream = false;
 
         lock (_lock)
@@ -1500,7 +1544,7 @@ public class RadioPlayback : IDisposable
             // Initialize the new device
             if (!Bass.Init(newDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
             {
-                Console.WriteLine($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
+                _logger.LogError($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
                 return;
             }
         }
@@ -1526,7 +1570,7 @@ public class RadioPlayback : IDisposable
 
             // WebSocket arrives before RTP packets typically
             // Just log for validation - RTP start marker will trigger actual transmission start
-            Console.WriteLine($"[WebSocket:{streamId}] PTT pressed - expecting RTP start marker");
+            _logger.LogDebug("PTT pressed - expecting RTP start marker (StreamId: {StreamId})", streamId);
         }
     }
 
@@ -1550,8 +1594,9 @@ public class RadioPlayback : IDisposable
                         if (_streams.TryGetValue(streamId, out var s) && s.IsTransmitting)
                         {
                             var stallTime = DateTime.UtcNow - s.LastPacketReceived;
-                            Console.WriteLine(
-                                $"[WebSocket:{streamId}] Force-ending transmission - RTP end marker missing (last packet {stallTime.TotalMilliseconds:F0}ms ago)");
+                            _logger.LogWarning(
+                                "Force-ending transmission - RTP end marker missing (last packet {StallTime:F0}ms ago) (StreamId: {StreamId})",
+                                stallTime.TotalMilliseconds, streamId);
                             s.IsTransmitting = false;
                             s.TransmissionEndTime = DateTime.UtcNow;
                         }
@@ -1559,7 +1604,7 @@ public class RadioPlayback : IDisposable
                 });
             }
 
-            Console.WriteLine($"[WebSocket:{streamId}] PTT released - expecting RTP end marker");
+            _logger.LogDebug("PTT released - expecting RTP end marker (StreamId: {StreamId})", streamId);
         }
     }
 
@@ -1572,7 +1617,7 @@ public class RadioPlayback : IDisposable
         {
             if (_timeoutMonitoringStarted)
             {
-                Console.WriteLine("[TimeoutMonitor] Already started");
+                _logger.LogWarning("Already started");
                 return;
             }
 
@@ -1582,7 +1627,7 @@ public class RadioPlayback : IDisposable
 
         _timeoutMonitorTask = Task.Run(async () =>
         {
-            Console.WriteLine("[TimeoutMonitor] Starting peer timeout monitoring");
+            _logger.LogInformation("Starting peer timeout monitoring");
 
             try
             {
@@ -1602,8 +1647,9 @@ public class RadioPlayback : IDisposable
                         foreach (var stream in timedOutStreams)
                         {
                             var stallTime = now - stream.LastPacketReceived;
-                            Console.WriteLine(
-                                $"[TimeoutMonitor:{stream.StreamId}] Peer timeout during transmission (no packets for {stallTime.TotalSeconds:F1}s)");
+                            _logger.LogWarning(
+                                "Peer timeout during transmission (no packets for {StallTime:F1}s) (StreamId: {StreamId})",
+                                stallTime.TotalSeconds, stream.StreamId);
 
                             stream.IsTransmitting = false;
                             stream.TransmissionEndTime = now;
@@ -1614,7 +1660,7 @@ public class RadioPlayback : IDisposable
             }
             catch (OperationCanceledException)
             {
-                Console.WriteLine("[TimeoutMonitor] Stopped");
+                _logger.LogInformation("Stopped");
             }
         }, _timeoutMonitorCts.Token);
     }
