@@ -9,11 +9,9 @@
 // - Parametrized radio band characteristics (bandwidth, diffraction, modulation type)
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
-using System.Threading;
 using Microsoft.Extensions.Logging;
 // ReSharper disable InconsistentNaming
 
@@ -56,52 +54,6 @@ namespace OpenFreqAudio
         }
     }
 
-    // ================================================================
-    // Object pool for AudioParams to reduce allocations
-    // ================================================================
-    public class AudioParamsPool
-    {
-        private readonly ConcurrentBag<AudioParams> _pool = new();
-        private int _count;
-        private readonly int _maxPoolSize;
-
-        public AudioParamsPool(int maxPoolSize = 100)
-        {
-            _maxPoolSize = maxPoolSize;
-        }
-
-        public AudioParams Rent()
-        {
-            if (_pool.TryTake(out var obj))
-            {
-                return obj;
-            }
-
-            return new AudioParams();
-        }
-
-        public void Return(AudioParams obj)
-        {
-            // Reset the object
-            obj.Gain = 0;
-            obj.LowpassHz = 0;
-            obj.NoiseLevel = 0;
-            obj.DropoutRate = 0;
-            obj.DeepFadeRate = 0;
-            obj.RadioFrequencyKHz = 0;
-            obj.Distance_km = 0;
-            obj.SNR_dB = 0;
-            obj.PathLoss_dB = 0;
-            obj.TerrainProfile = null;
-
-            // Only return to pool if we haven't exceeded max size
-            if (_count < _maxPoolSize)
-            {
-                _pool.Add(obj);
-                Interlocked.Increment(ref _count);
-            }
-        }
-    }
 
     // ================================================================
     public class AudioParams
@@ -219,16 +171,13 @@ namespace OpenFreqAudio
         private readonly int maxSamplesPerPath = 512;
         private readonly double weatherDbPerKm = 0.02;
         private readonly ILogger<FastPathAudioSim> _logger;
-        private readonly AudioParamsPool paramsPool;
-
         public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters,
-            ILogger<FastPathAudioSim> logger, AudioParamsPool? paramsPool = null)
+            ILogger<FastPathAudioSim> logger)
         {
             this.dem = dem;
             this.originX = originX;
             this.originY = originY;
             this.cellSizeMeters = cellSizeMeters;
-            this.paramsPool = paramsPool ?? new AudioParamsPool();
             _logger = logger;
         }
 
@@ -254,17 +203,6 @@ namespace OpenFreqAudio
             return pixelDistance * cellSizeMeters;
         }
 
-        /// <summary>
-        /// Return an AudioParams object to the pool for reuse.
-        /// Call this when you're done using an AudioParams object to reduce allocations.
-        /// </summary>
-        public void ReturnAudioParams(AudioParams? ap)
-        {
-            if (ap != null)
-            {
-                paramsPool.Return(ap);
-            }
-        }
 
         // Bilinear elevation sampling
         private double SampleElevation(double xMeters, double yMeters)
@@ -736,7 +674,7 @@ namespace OpenFreqAudio
             RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
 
             // Rent from pool instead of allocating
-            var ap = paramsPool.Rent();
+            var ap = new AudioParams();
             ap.RadioFrequencyKHz = frequencyKhz;
 
             // Stupid C# does not recognize null-safety with the early return;

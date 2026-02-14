@@ -441,8 +441,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
-        _fastPathAudioSim.ReturnAudioParams(_signal1Params);
-        _fastPathAudioSim.ReturnAudioParams(_signal2Params);
 
         double rxSensitivity = ViewModel.FrequencyKhz <= 200000 ? -113 : -107;
 
