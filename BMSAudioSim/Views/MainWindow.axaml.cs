@@ -478,8 +478,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         Dropout2Text.Text = audioParams2.DropoutRate.ToString();
         DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();
 
-        _signal1Params = audioParams1.Copy();
-        _signal2Params = audioParams2.Copy();
+        _signal1Params = audioParams1;
+        _signal2Params = audioParams2;
 
         _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
         _radioPlayback.SetSquelchLevel(ViewModel.FrequencyKhz, ViewModel.Squelch);

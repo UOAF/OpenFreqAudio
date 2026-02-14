@@ -69,17 +69,6 @@ namespace OpenFreqAudio
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
-
-        public AudioParams Copy()
-        {
-            return new AudioParams()
-            {
-                DropoutRate = DropoutRate, DeepFadeRate = DeepFadeRate,
-                NoiseLevel = NoiseLevel,
-                Gain = Gain, RadioFrequencyKHz = RadioFrequencyKHz, SNR_dB = SNR_dB,
-                TerrainProfile = TerrainProfile
-            };
-        }
     }
 
     // ================================================================
