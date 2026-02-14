@@ -390,8 +390,15 @@ namespace OpenFreqAudio
                     ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
             }
 
-            // === FAST FLUTTER: Rapid multipath fading (20-80ms) ===
-            // This is the "picket-fencing" effect from rapid phase cancellation
+            ap.DropoutRate = CalculateDropoutRate(snrDb, bandConfig);
+            ap.DeepFadeRate = CalculateDeepFadeRate(snrDb, bandConfig);
+        }
+
+        /// <summary>
+        /// Fast flutter rate from rapid multipath fading (20-80ms "picket-fencing" effect).
+        /// </summary>
+        public static float CalculateDropoutRate(double snrDb, RadioBandConfig bandConfig)
+        {
             double dropout;
             if (snrDb > 15.0)
                 dropout = 0.0; // Clean signal
@@ -407,11 +414,15 @@ namespace OpenFreqAudio
             if (bandConfig.DiffractionCorrection_dB > 0) // Positive correction = better diffraction = longer wavelength
                 dropout *= 0.7;
 
-            ap.DropoutRate = (float)Math.Clamp(dropout, 0.0, 1.5);
+            return (float)Math.Clamp(dropout, 0.0, 1.5);
+        }
 
-            // === DEEP FADES: Slow severe dropouts (400-2000ms) ===
-            // These are from terrain shadowing, deep multipath nulls, atmospheric ducting changes
-            // They can drop signal below squelch threshold → trigger squelch pops
+        /// <summary>
+        /// Slow deep fade rate from terrain shadowing, deep multipath nulls, atmospheric ducting (400-2000ms).
+        /// Can drop signal below squelch threshold, triggering squelch pops.
+        /// </summary>
+        public static float CalculateDeepFadeRate(double snrDb, RadioBandConfig bandConfig)
+        {
             double deepFade;
             if (snrDb > 10.0)
                 deepFade = 0.0; // Good signal - no deep fades
@@ -426,7 +437,7 @@ namespace OpenFreqAudio
             if (bandConfig.DiffractionCorrection_dB < 0) // Negative correction = worse diffraction = shorter wavelength
                 deepFade *= 1.5;
 
-            ap.DeepFadeRate = (float)Math.Clamp(deepFade, 0.0, 0.5);
+            return (float)Math.Clamp(deepFade, 0.0, 0.5);
         }
 
         /// <summary>
