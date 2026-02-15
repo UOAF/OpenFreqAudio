@@ -632,8 +632,8 @@ public class RadioPlayback : IDisposable
                 Buffer = new float[MaxBufferSize],
             };
 
-            int ringFrames = (sampleRate * 60) / 1000; // 60ms
-            int minBufferFrames = (sampleRate * 20) / 1000; // 20ms
+            int ringFrames = (sampleRate * 150) / 1000; // 150ms
+            int minBufferFrames = (sampleRate * 120) / 1000; // 120ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
             stream.EnsureRingBufferCapacity(ringCapacity);
             stream.MinBufferFrames = minBufferFrames;
