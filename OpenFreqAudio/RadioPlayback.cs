@@ -291,14 +291,10 @@ public class RadioPlayback : IDisposable
         public Radiomixer Mixer { get; set; } = new();
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
-        public float NoiseFadeGain { get; set; }
-        public double MinimumGain { get; set; }
         public bool WasHearableLastFrame { get; set; }
 
-        // Physics-based default - will be set to noise floor when frequency is tuned
-        public float DefaultSquelchThreshold { get; set; } = 0.1f; // Fallback if not yet calculated
         public bool IsNoiseMuted { get; set; }
-        public float SquelchLevel { get; set; }
+        public float SquelchLevel { get; set; } = 1.0f;
         // ReSharper restore UnusedAutoPropertyAccessor.Local
 
         public SquelchBurstGenerator? SquelchBurst { get; set; }
@@ -574,23 +570,11 @@ public class RadioPlayback : IDisposable
                 }
             }, token);
 
-            // Apply frequency's default squelch threshold to the new stream
-            if (_frequencies.TryGetValue(audioParams.RadioFrequencyKHz, out var freqConfig))
-            {
-                stream.RadioEffect.SetSquelchThreshold(freqConfig.DefaultSquelchThreshold);
-            }
-            else
-            {
-                // Frequency not tuned yet - calculate physics-based default
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyKHz);
-                stream.RadioEffect.SetSquelchThreshold(noiseFloor);
-            }
-
             _streams.Add(streamId, stream);
 
             _logger.LogInformation(
-                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Gain={Gain}, Channels={Channels}, FileRate={FileRate}Hz, MasterRate={MasterRate}Hz, RingBuffer={RingBufferSize} floats",
-                streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.Gain, info.Channels, info.Frequency,
+                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, FileRate={FileRate}Hz, MasterRate={MasterRate}Hz, RingBuffer={RingBufferSize} floats",
+                streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.ReceivedDb, info.Channels, info.Frequency,
                 _sampleRate, stream.RingBuffer.Length);
 
             if (info.Frequency != _sampleRate)
@@ -654,17 +638,6 @@ public class RadioPlayback : IDisposable
             stream.EnsureRingBufferCapacity(ringCapacity);
             stream.MinBufferFrames = minBufferFrames;
             stream.IsBuffering = true;
-
-            if (_frequencies.TryGetValue(audioParams.RadioFrequencyKHz, out var freqConfig))
-            {
-                stream.RadioEffect.SetSquelchThreshold(freqConfig.DefaultSquelchThreshold);
-            }
-            else
-            {
-                // Frequency not tuned yet - calculate physics-based default
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(audioParams.RadioFrequencyKHz);
-                stream.RadioEffect.SetSquelchThreshold(noiseFloor);
-            }
 
             _logger.LogInformation("Stream '{StreamId}' on {Frequency:F3} MHz", streamId,
                 audioParams.RadioFrequencyKHz / 1000.0);
@@ -852,23 +825,9 @@ public class RadioPlayback : IDisposable
             {
                 freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyKHz);
 
-                // Background noise amplitude when no one is transmitting
-                freqConfig.MinimumGain = FastPathAudioSim.CalculateBackgroundNoiseAmplitude(frequencyKHz);
+                var bandConfig = FastPathAudioSim.GetBandConfig(frequencyKHz);
 
-                // Set physics-based default squelch threshold based on noise floor
-                // This is the minimum detectable signal level - signals below this are unintelligible
-                float noiseFloor = FastPathAudioSim.CalculateNoiseFloorAmplitude(frequencyKHz);
-                freqConfig.DefaultSquelchThreshold = noiseFloor;
-
-                // Apply to any existing streams on this frequency
-                foreach (var stream in _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz))
-                {
-                    stream.RadioEffect.SetSquelchThreshold(noiseFloor);
-                }
-
-                _logger.LogInformation(
-                    "TuneFrequency {Frequency:F3} MHz: MinimumGain={MinimumGain:F3}, NoiseFloor={NoiseFloor:F3}",
-                    frequencyKHz / 1000.0, freqConfig.MinimumGain, noiseFloor);
+                _logger.LogInformation("TuneFrequency {Frequency:F3} MHz", frequencyKHz / 1000.0);
             }
         }
     }
@@ -897,24 +856,7 @@ public class RadioPlayback : IDisposable
             if (!_frequencies.ContainsKey(frequencyKHz))
                 _frequencies[frequencyKHz] = new FrequencyConfig();
 
-            var freqConfig = _frequencies[frequencyKHz];
-
-            // Calculate effective threshold based on background noise amplitude
-            // squelchLevel = 1.0 means threshold equals background noise (cuts it out)
-            // squelchLevel = 1.5 means threshold is 50% higher (more aggressive)
-            float effectiveThreshold = (float)freqConfig.MinimumGain * squelchLevel;
-
-            // Store the relative squelch level (user-friendly)
-            freqConfig.SquelchLevel = squelchLevel;
-
-            // Apply absolute threshold to all streams on this frequency
-            foreach (var s in _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz))
-            {
-                s.RadioEffect.SetSquelchThreshold(effectiveThreshold);
-            }
-
-            // Store for new streams
-            freqConfig.DefaultSquelchThreshold = effectiveThreshold;
+            _frequencies[frequencyKHz].SquelchLevel = squelchLevel;
         }
     }
 
@@ -927,32 +869,6 @@ public class RadioPlayback : IDisposable
         }
 
         return 1.0f; // Default
-    }
-
-    public float? GetSquelchThreshold(int frequencyKHz)
-    {
-        lock (_lock)
-        {
-            // Get threshold from any stream on this frequency
-            var stream = _streams.Values.FirstOrDefault(s => s.FrequencyKHz == frequencyKHz);
-            if (stream != null)
-                return stream.RadioEffect.GetSquelchThreshold();
-
-            // If no active streams, return the default for this frequency
-            if (_frequencies.TryGetValue(frequencyKHz, out var config))
-                return config.DefaultSquelchThreshold;
-        }
-
-        return null;
-    }
-
-    public void SetFrequencyVolume(int frequencyKHz, float volume)
-    {
-        lock (_lock)
-        {
-            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
-            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 2f); // allow for some boost
-        }
     }
 
     public void SetFrequencyAudioChannel(int frequencyKHz, AudioChannel channel)
@@ -1131,8 +1047,10 @@ public class RadioPlayback : IDisposable
                 if (Apply3dEffects)
                 {
                     activeStreams = _streams.Values.Where(s =>
-                        s.CurrentParams.Gain > 0 &&
-                        s.CurrentParams.Gain >= _frequencies[s.FrequencyKHz].MinimumGain).ToList();
+                    {
+                        var bc = FastPathAudioSim.GetBandConfig(s.FrequencyKHz);
+                        return s.CurrentParams.ReceivedSnrDb > 0;
+                    }).ToList();
 
                     // Snapshot transmitting frequencies - but only when we are in 3D Mode
                     transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
@@ -1212,39 +1130,43 @@ public class RadioPlayback : IDisposable
                     ? streams
                     : new List<RadioStream>();
 
-                // Get squelch threshold once for this frequency
-                float squelchThreshold = freqStreams.FirstOrDefault()?.RadioEffect.GetSquelchThreshold()
-                                         ?? freqConfig.DefaultSquelchThreshold;
+                // --- PER-FREQUENCY RF PARAMETERS ---
+                var bandConfig = FastPathAudioSim.GetBandConfig(freq);
 
-                // --- NOISE GENERATION ---
+                // Find strongest signal on this frequency, and base SNR on it.
+                // If nothing is playing, make SNR 0.
+                double snrDb = 0;
+                var transmittingStreams = freqStreams.Where(s => s.IsTransmitting).ToList();
+                if (transmittingStreams.Count > 0)
+                {
+                    snrDb = transmittingStreams.Max(s => s.CurrentParams.ReceivedSnrDb);
+                }
+                // Typical squelch is at +6 dB
+                bool isSquelchOpen = snrDb >= freqConfig.SquelchLevel * 6.0f;
+
+                // --- BACKGROUND NOISE GENERATION ---
                 if (Apply3dEffects && freqConfig.NoiseGenerator != null)
                 {
-                    bool freqHasHearableStreams = freqStreams.Any(s => s.RadioEffect.IsSquelchOpen);
-                    bool noiseIsSquelched = (float)freqConfig.MinimumGain <= squelchThreshold ||
-                                            freqHasHearableStreams ||
-                                            freqConfig.IsNoiseMuted;
-
                     lock (_lock)
                     {
                         if (_frequencies.TryGetValue(freq, out var fc))
-                            fc.WasHearableLastFrame = freqHasHearableStreams;
+                            fc.WasHearableLastFrame = isSquelchOpen;
                     }
 
-                    if (!noiseIsSquelched && (float)freqConfig.MinimumGain > 0.001f)
+                    // If we're not squelched or muted, but nothing's there,
+                    if (isSquelchOpen && !freqConfig.IsNoiseMuted)
                     {
-                        float targetGain = (float)freqConfig.MinimumGain * freqConfig.Volume;
+                        float targetGain = freqConfig.Volume;
                         float fadeStep = targetGain / NoiseFadeSamples;
-                        freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, 1.0f);
+                        float noiseLevel = FastPathAudioSim.CalculateNoiseLevel(snrDb, bandConfig.Modulation);
+                        freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, noiseLevel);
 
                         // Upmix to Stereo
                         for (int frame = 0; frame < outputFrames; frame++)
                         {
-                            if (freqConfig.NoiseFadeGain < targetGain)
-                                freqConfig.NoiseFadeGain =
-                                    Math.Min(freqConfig.NoiseFadeGain + fadeStep, targetGain);
                             int leftIdx = frame * 2;
                             int rightIdx = leftIdx + 1;
-                            float noiseSample = _noiseBuffer[leftIdx] * freqConfig.NoiseFadeGain;
+                            float noiseSample = _noiseBuffer[leftIdx];
                             switch (freqConfig.AudioChannel)
                             {
                                 case AudioChannel.Left: _dspScratch[leftIdx] += noiseSample; break;
@@ -1255,12 +1177,6 @@ public class RadioPlayback : IDisposable
                                     break;
                             }
                         }
-                    }
-                    else
-                    {
-                        float fadeStep = (float)freqConfig.MinimumGain / NoiseFadeSamples;
-                        if (freqConfig.NoiseFadeGain > 0f)
-                            freqConfig.NoiseFadeGain = Math.Max(freqConfig.NoiseFadeGain - fadeStep, 0f);
                     }
                 }
 
@@ -1291,27 +1207,12 @@ public class RadioPlayback : IDisposable
 
                     bool isActiveTransmission = hasActiveTransmission && hasRecentPackets;
 
-                    // Check if background noise is above squelch threshold (keeps gate open)
-                    bool backgroundNoiseAboveSquelch = (float)freqConfig.MinimumGain > squelchThreshold;
-
-                    // Check if any transmitting stream has signal strength above squelch threshold
-                    bool hasAudibleSignal = isActiveTransmission &&
-                                            freqStreams.Any(s =>
-                                                s.IsTransmitting && s.CurrentParams.Gain > squelchThreshold);
-
-                    // Gate is open if either background noise OR audible signal is present
-                    bool isSquelchOpen = backgroundNoiseAboveSquelch || hasAudibleSignal;
-
-                    // Squelch bursts only happen if threshold > 0 (otherwise gate always open, no point in bursts)
-                    bool squelchIsActive = squelchThreshold > 0.0f;
-
-                    if (squelchIsActive && isSquelchOpen != freqConfig.WasSquelchOpen)
+                    if (isSquelchOpen != freqConfig.WasSquelchOpen)
                     {
 #if DEBUG
                         _logger.LogDebug(
-                            "SQUELCH {State} (Freq: {Frequency}, threshold={Threshold:F3}, noise={Noise:F3}, hasSignal={HasSignal}, noiseAbove={NoiseAbove})",
-                            isSquelchOpen ? "OPEN" : "CLOSED", freq, squelchThreshold, freqConfig.MinimumGain,
-                            hasAudibleSignal, backgroundNoiseAboveSquelch);
+                            "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
+                            isSquelchOpen ? "OPEN" : "CLOSED", freq, snrDb);
 #endif
 
                         if (isSquelchOpen)
@@ -1321,15 +1222,9 @@ public class RadioPlayback : IDisposable
 
                         freqConfig.WasSquelchOpen = isSquelchOpen;
                     }
-                    else if (!squelchIsActive)
-                    {
-                        // Squelch at 0 - ensure we track gate as open
-                        freqConfig.WasSquelchOpen = true;
-                    }
                 }
 
                 // --- AUDIO MIXING ---
-                var transmittingStreams = freqStreams.Where(s => s.IsTransmitting).ToList();
                 bool hasBurstPlaying = freqConfig.SquelchBurst?.IsPlaying ?? false;
 
                 // Skip if no audio to process
@@ -1347,7 +1242,8 @@ public class RadioPlayback : IDisposable
                     }
                     else if (Apply3dEffects) // 2+ transmitting streams = stepped-on
                     {
-                        var sorted = transmittingStreams.OrderByDescending(s => s.CurrentParams.Gain).ToList();
+                        var sorted = transmittingStreams
+                            .OrderByDescending(s => s.CurrentParams.ReceivedDb).ToList();
                         var primary = sorted[0];
                         var secondary = sorted[1];
 
@@ -1358,8 +1254,8 @@ public class RadioPlayback : IDisposable
                             primary.CurrentParams, secondary.CurrentParams);
 
                         freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, samples,
-                            steppedParams, _sampleRate, primary.RadioEffect.GetSquelchThreshold(),
-                            primary.CurrentParams.Gain, secondary.CurrentParams.Gain);
+                            steppedParams, _sampleRate,
+                            primary.CurrentParams.ReceivedDb, secondary.CurrentParams.ReceivedDb);
                     }
 
                     else // 2+ streams without effects, simple additive mix
@@ -1371,6 +1267,23 @@ public class RadioPlayback : IDisposable
                             ConvertToOutputFormat(stream, _mixBuffer1, samples);
                             for (int i = 0; i < samples; i++)
                                 _frequencyMixBuffer[i] += _mixBuffer1[i] * mixGain;
+                        }
+                    }
+
+                    // --- PER-FREQUENCY AGC ---
+                    if (Apply3dEffects)
+                    {
+                        if (isSquelchOpen)
+                        {
+                            float linearizedSnr = (float)Math.Pow(10, snrDb / 20.0); // from decibels
+                            float agcGain = FastPathAudioSim.ApplyAGC(linearizedSnr);
+                            for (int i = 0; i < samples; i++)
+                                _frequencyMixBuffer[i] *= agcGain;
+                        }
+                        else
+                        {
+                            // Squelch closed — silence the mixed audio
+                            Array.Clear(_frequencyMixBuffer, 0, samples);
                         }
                     }
                 }

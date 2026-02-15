@@ -129,9 +129,7 @@ public class Radiomixer
         var result = new SteppedOnParams();
 
         // === POWER RELATIONSHIP ===
-        float gain1_dB = 20 * MathF.Log10(Math.Max(tx1.Gain, 1e-6f));
-        float gain2_dB = 20 * MathF.Log10(Math.Max(tx2.Gain, 1e-6f));
-        result.PowerDiff_dBm = gain1_dB - gain2_dB;
+        result.PowerDiff_dBm = tx1.ReceivedDb - tx2.ReceivedDb;
 
         float absDiff = MathF.Abs(result.PowerDiff_dBm);
 
@@ -252,7 +250,9 @@ public class Radiomixer
         result.BeatFrequency_Hz = beatHz;
 
         // Frequency instability influences pitch modulation depth
-        float avgSNR = (tx1.SNR_dB + tx2.SNR_dB) / 2.0f;
+        var bandConfig = FastPathAudioSim.GetBandConfig(avgFreqKHz);
+        float avgPower = (tx1.ReceivedDb + tx2.ReceivedDb) / 2.0f;
+        float avgSNR = (tx1.ReceivedSnrDb + tx2.ReceivedSnrDb) / 2.0f;
         float snrFactor = MathF.Max(0, (10.0f - avgSNR) / 20.0f);
         result.FreqInstability_Hz = 30.0f + snrFactor * 40.0f;
 
@@ -274,38 +274,12 @@ public class Radiomixer
     /// 5. Mix with suppressed audio from both transmitters
     /// </summary>
     public void ProcessSteppedOn(float[] buffer1, float[] buffer2, float[] output, int length, SteppedOnParams stepped,
-        int sampleRate, float squelchThreshold, float gain1, float gain2)
+        int sampleRate, float power1_dBm, float power2_dBm)
     {
-        // No signals → silence
-        if (gain1 < squelchThreshold && gain2 < squelchThreshold)
-        {
-            Array.Clear(output);
-            _isPlaying = false;
-            return;
-        }
-
-        // Only one signal → no interference
-        if (gain1 < squelchThreshold)
-        {
-            int copyLength = Math.Min(buffer2.Length, output.Length);
-            Array.Copy(buffer2, output, copyLength);
-            _isPlaying = false;
-            return;
-        }
-
-        if (gain2 < squelchThreshold)
-        {
-            int copyLength = Math.Min(buffer1.Length, output.Length);
-            Array.Copy(buffer1, output, copyLength);
-            _isPlaying = false;
-            return;
-        }
-
         // Clean capture → pass through stronger signal
         if (stepped.InterferenceLevel < 0.05f)
         {
-            // Use the stronger signal
-            if (gain1 >= gain2)
+            if (power1_dBm >= power2_dBm)
             {
                 int copyLength = Math.Min(buffer1.Length, output.Length);
                 Array.Copy(buffer1, output, copyLength);
@@ -343,26 +317,19 @@ public class Radiomixer
         // The capture ratio is calculated assuming buffer1 is stronger (positive PowerDiff)
         // If buffer2 is actually stronger, we need to swap and invert the ratio
 
-        float strongerGain, weakerGain;
         float[] strongerBuffer, weakerBuffer;
         float actualCaptureRatio;
 
-        if (gain1 >= gain2)
+        if (power1_dBm >= power2_dBm)
         {
-            // Buffer1 is stronger - use capture ratio as-is
             strongerBuffer = buffer1;
             weakerBuffer = buffer2;
-            strongerGain = gain1;
-            weakerGain = gain2;
             actualCaptureRatio = stepped.CaptureRatio;
         }
         else
         {
-            // Buffer2 is stronger - swap and invert capture ratio
             strongerBuffer = buffer2;
             weakerBuffer = buffer1;
-            strongerGain = gain2;
-            weakerGain = gain1;
             actualCaptureRatio = 1.0f - stepped.CaptureRatio;
         }
 
@@ -388,9 +355,7 @@ public class Radiomixer
         double dt = 1.0 / sampleRate;
 
         // === PARAMETERS ===
-        float overallSignal = Math.Min(strongerGain, weakerGain);
-
-        // Audio suppression
+        // Audio suppression (how much the voice signals are reduced during interference)
         float audioSuppression;
         if (stepped.InterferenceLevel < 0.3f)
             audioSuppression = 0.25f;
@@ -399,8 +364,8 @@ public class Radiomixer
         else
             audioSuppression = 0.04f;
 
-        // Stepped-on sample amplitude
-        float steppedOnAmplitude = 0.9f * overallSignal * Math.Min(1.0f, stepped.InterferenceLevel * 1.5f);
+        // Stepped-on sample amplitude (AGC handles overall volume in RadioPlayback)
+        float steppedOnAmplitude = 0.9f * Math.Min(1.0f, stepped.InterferenceLevel * 1.5f);
 
         // Modulation rates
         float pitchModRate = 5.0f; // Hz - subtle pitch wobble
@@ -428,7 +393,7 @@ public class Radiomixer
                 mixed = 0; // Safety fallback if buffers are too short
             }
 
-            float suppressedAudio = mixed * audioSuppression * overallSignal;
+            float suppressedAudio = mixed * audioSuppression;
 
             // === STEPPED-ON SAMPLE PLAYBACK ===
 

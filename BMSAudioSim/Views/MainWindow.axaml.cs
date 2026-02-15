@@ -442,8 +442,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         Debug.Assert(ViewModel != null, nameof(ViewModel) + " != null");
 
-        double rxSensitivity = ViewModel.FrequencyKhz <= 200000 ? -113 : -107;
-
         // Path 1: Sender1 -> Receiver
         var audioParams1 = _fastPathAudioSim.CalculateAudioParams(
             _fastPathAudioSim.PixelsToMeters(_sender1Pos.Value.x),
@@ -451,7 +449,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX1Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, rxSensitivity,
+            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
             true);
 
         // Path 2: Sender2 -> Receiver
@@ -461,20 +459,18 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX2Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, rxSensitivity,
+            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
             true);
 
         if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
 
         UpdateProfileGraph(audioParams1, audioParams2);
 
-        Gain1Text.Text = audioParams1.Gain.ToString();
-        Noise1Text.Text = audioParams1.NoiseLevel.ToString();
+        Power1Text.Text = audioParams1.ReceivedDb.ToString("F1");
         Dropout1Text.Text = audioParams1.DropoutRate.ToString();
         DeepFade1Text.Text = audioParams1.DeepFadeRate.ToString();
 
-        Gain2Text.Text = audioParams2.Gain.ToString();
-        Noise2Text.Text = audioParams2.NoiseLevel.ToString();
+        Power2Text.Text = audioParams2.ReceivedDb.ToString("F1");
         Dropout2Text.Text = audioParams2.DropoutRate.ToString();
         DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();
 

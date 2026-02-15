@@ -13,7 +13,6 @@ namespace OpenFreqAudio;
 /// Signal chain: Analog AM/FM transmission → Analog AM/FM demodulator → Digital audio processing
 /// 
 /// Receiver-side effects (AFTER demodulation):
-/// - Fast digital squelch (DSP-based)
 /// - Sharp brick-wall filtering (digital IIR filters)
 /// - RF fading effects (pre-demod phenomena that affect audio)
 /// 
@@ -32,11 +31,6 @@ public class RadioEffect
     private readonly Lock _lock = new();
     private AudioParams _params;
 
-    private float _squelchThreshold = 0.1f;
-
-    // A stream can have good signal but no audio data flowing (i.e. WebRTC streams)
-    private bool _isStreamActive;
-
     // Pre-calculated filter coefficients (cached per sample rate)
     private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> FilterCache = new();
 
@@ -48,21 +42,6 @@ public class RadioEffect
     // Digital filter state (2-stage biquad needs 4 states per channel)
     private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
 
-    // Squelch gate state (digital = much faster)
-    private enum SquelchState
-    {
-        Closed,
-        Opening,
-        Open,
-        Closing
-    }
-
-    private SquelchState _squelchState;
-    private int _squelchTransitionSamples;
-    private int _squelchTransitionLength;
-    private const int SquelchAttackSamples = 12; // ~0.25ms at 48kHz (very fast digital)
-    private const int SquelchReleaseSamples = 240; // ~5ms at 48kHz (fast digital)
-
     // DC whine state
     private double _whinePhase;
     private const float WhineFreq = 520f; // typical avionics inverter whine (400–800 Hz)
@@ -73,122 +52,21 @@ public class RadioEffect
     private const float RumbleFreq = 80f;    // Low rumble
     private const float RumbleLevel = 0.03f; // Subtle but noticeable
     
-    // Noise
-    const float BaseNoiseFloor = 0.02f;
-    const float NoiseBoost = 1.04f;
-    
     // Oxygen-mask style muffling
     private const float MuffleCutoff = 900f; // muffled low-pass
     private float _muffleA; // filter coefficient
     private float[] _muffleLPChannels;
     private float[] _muffleLP2Channels;
 
-    /// <summary>
-    /// Check if squelch is currently open (allowing audio through).
-    /// Squelch is open only when we have BOTH:
-    /// 1. Good RF signal strength (based on effectiveGain vs threshold)
-    /// 2. Active audio data flow (based on SetStreamActive calls from RadioPlayback)
-    /// 
-    /// This matches real radio behavior - you need carrier AND modulation.
-    /// </summary>
-    public bool IsSquelchOpen
-    {
-        get
-        {
-            lock (_lock)
-            {
-                bool signalSquelchOpen = _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
-
-                // True squelch requires BOTH good signal AND active stream
-                return signalSquelchOpen && _isStreamActive;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Get whether RF signal squelch is open (independent of stream activity).
-    /// Useful for debugging or UI display.
-    /// </summary>
-    public bool IsSignalSquelchOpen
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return _squelchState == SquelchState.Open || _squelchState == SquelchState.Opening;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Get current stream activity state
-    /// </summary>
-    public bool IsStreamActive
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return _isStreamActive;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Get the current squelch threshold value
-    /// </summary>
-    public float GetSquelchThreshold()
-    {
-        lock (_lock)
-        {
-            return _squelchThreshold;
-        }
-    }
-
-    /// <summary>
-    /// Set the squelch threshold. Values are clamped to 0.001-1.0 range.
-    /// </summary>
-    public void SetSquelchThreshold(float threshold)
-    {
-        lock (_lock)
-        {
-            float oldThreshold = _squelchThreshold;
-            _squelchThreshold = Math.Clamp(threshold, 0.001f, 1.0f);
-
-            // Re-evaluate squelch state with new threshold
-            bool wasWeak = _prevEffectiveGain < oldThreshold;
-            bool isWeak = _prevEffectiveGain < _squelchThreshold;
-
-            // Handle all states - signal crossed threshold
-            if (wasWeak && !isWeak)
-            {
-                // Signal is now strong enough - open squelch regardless of current state
-                _squelchState = SquelchState.Opening;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchAttackSamples;
-            }
-            else if (!wasWeak && isWeak)
-            {
-                // Signal is now too weak - close squelch regardless of current state
-                _squelchState = SquelchState.Closing;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchReleaseSamples;
-            }
-        }
-    }
-
     // Fast flutter state (rapid multipath fading, 20-80ms)
     private int _dropoutSamplesLeft;
     private int _dropoutFadeSamples;
     private int _dropoutInitialSamples; // Track initial duration for envelope calculation
 
-    // Deep fade state (slow severe fading, 400-2000ms, can trigger squelch)
+    // Deep fade state (slow severe fading, 400-2000ms)
     private int _deepFadeSamplesLeft;
     private int _deepFadeFadeSamples;
     private int _deepFadeInitialSamples;
-
-    // Track effective gain for squelch decisions (includes fade effects)
-    private float _prevEffectiveGain;
 
     private static readonly ThreadLocal<Random> ThreadRng =
         new(() => new Random(Environment.TickCount * Thread.CurrentThread.ManagedThreadId));
@@ -204,7 +82,6 @@ public class RadioEffect
             lock (_lock)
             {
                 _params = value;
-                // Note: Squelch decisions now based on effective gain (calculated in Process)
             }
         }
     }
@@ -237,10 +114,6 @@ public class RadioEffect
 
             (_b0, _b1, _b2, _a1, _a2) = coeffs;
         }
-
-        // Initialize squelch state based on initial signal strength
-        _squelchState = initial.Gain >= _squelchThreshold ? SquelchState.Open : SquelchState.Closed;
-        _prevEffectiveGain = initial.Gain;
 
         // Precompute one-pole LPF coefficient for muffling (oxygen mask effect)
         // Lower cutoff = more muffled (typical military masks: 600-700 Hz)
@@ -346,102 +219,8 @@ public class RadioEffect
 
         for (int frame = 0; frame < frames; frame++)
         {
-            // === Calculate effective gain (includes fade effects) ===
-            float effectiveGain = p.Gain;
-
-            // Apply fast flutter envelope
             bool inDrop = _dropoutSamplesLeft > 0;
-            if (inDrop)
-            {
-                int fadeIn = _dropoutFadeSamples;
-                int fadeOut = _dropoutFadeSamples;
-                int age = _dropoutInitialSamples - _dropoutSamplesLeft;
-
-                float dropoutEnvelope;
-                if (age < fadeIn)
-                    dropoutEnvelope = 1f - (float)age / fadeIn;
-                else if (_dropoutSamplesLeft < fadeOut)
-                    dropoutEnvelope = (float)(fadeOut - _dropoutSamplesLeft) / fadeOut;
-                else
-                    dropoutEnvelope = 0f;
-
-                effectiveGain *= dropoutEnvelope;
-            }
-
-            // Apply deep fade envelope
             bool inDeepFade = _deepFadeSamplesLeft > 0;
-            if (inDeepFade)
-            {
-                int fadeIn = _deepFadeFadeSamples;
-                int fadeOut = _deepFadeFadeSamples;
-                int age = _deepFadeInitialSamples - _deepFadeSamplesLeft;
-
-                float deepFadeEnvelope;
-                if (age < fadeIn)
-                    deepFadeEnvelope = 1f - (float)age / fadeIn;
-                else if (_deepFadeSamplesLeft < fadeOut)
-                    deepFadeEnvelope = (float)(fadeOut - _deepFadeSamplesLeft) / fadeOut;
-                else
-                    deepFadeEnvelope = 0f;
-
-                effectiveGain *= deepFadeEnvelope;
-            }
-
-            // === Digital squelch gate (responds to effective gain) ===
-            // Check if effective gain crossed squelch threshold
-            bool wasWeak = _prevEffectiveGain < _squelchThreshold;
-            bool isWeak = effectiveGain < _squelchThreshold;
-
-            if (wasWeak && !isWeak)
-            {
-                // Effective gain came up - open squelch (deep fade ended)
-                _squelchState = SquelchState.Opening;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchAttackSamples;
-            }
-            else if (!wasWeak && isWeak)
-            {
-                // Effective gain dropped - close squelch (deep fade started)
-                _squelchState = SquelchState.Closing;
-                _squelchTransitionSamples = 0;
-                _squelchTransitionLength = SquelchReleaseSamples;
-            }
-
-            _prevEffectiveGain = effectiveGain;
-
-            // Calculate squelch gate gain
-            float squelchGain = 1f;
-
-            switch (_squelchState)
-            {
-                case SquelchState.Closed:
-                    squelchGain = 0f;
-                    break;
-
-                case SquelchState.Opening:
-                    // Linear ramp (digital is clean and fast)
-                    float openProgress = (float)_squelchTransitionSamples / _squelchTransitionLength;
-                    squelchGain = openProgress;
-
-                    _squelchTransitionSamples++;
-                    if (_squelchTransitionSamples >= _squelchTransitionLength)
-                        _squelchState = SquelchState.Open;
-                    break;
-
-                case SquelchState.Open:
-                    squelchGain = 1f;
-                    break;
-
-                case SquelchState.Closing:
-                    // Linear ramp down (fast)
-                    float closeProgress = (float)_squelchTransitionSamples / _squelchTransitionLength;
-                    squelchGain = 1f - closeProgress;
-
-                    _squelchTransitionSamples++;
-                    if (_squelchTransitionSamples >= _squelchTransitionLength)
-                        _squelchState = SquelchState.Closed;
-                    break;
-            }
 
             // Generate subtle DC whine (actually AC tone)
             double whineIncrement = 2.0 * Math.PI * WhineFreq / _sampleRate;
@@ -460,11 +239,7 @@ public class RadioEffect
                 int idx = offset + frame * _channels + c;
                 float x = buffer[idx];
 
-                // Apply squelch gate (clean digital, no burst)
-                x *= squelchGain;
-
                 // === RF Fading (both fast flutter and deep fades) ===
-                // Apply fades to audio signal (these already affected effectiveGain for squelch)
                 if (inDrop)
                 {
                     int fadeIn = _dropoutFadeSamples;
@@ -533,36 +308,9 @@ public class RadioEffect
                 _filterState[stateBase + 3] = yn1; // y[n-2] = y[n-1]
                 _filterState[stateBase + 2] = y; // y[n-1] = y[n]
 
-                // Apply gain (using original p.Gain, not effectiveGain - fades already applied)
-                float val = y * p.Gain;
+                float val = Math.Clamp(y, -1f, 1f);
 
-                if (p.NoiseLevel > 0.001f && squelchGain > 0f)
-                {
-                    // Base pink noise (your current approach)
-                    float noise1 = (float)(rng.NextDouble() * 2.0 - 1.0);
-                    float noise2 = (float)(rng.NextDouble() * 2.0 - 1.0);
-                    float noise3 = (float)(rng.NextDouble() * 2.0 - 1.0);
-                    float noise4 = (float)(rng.NextDouble() * 2.0 - 1.0);
-                    float pinkNoise = (noise1 + noise2 + noise3 + noise4) / 4.0f;
-    
-                    // Add raw white noise for "grit" (unaveraged)
-                    float whiteNoise = (float)(rng.NextDouble() * 2.0 - 1.0);
-    
-                    // Blend: mostly pink (smooth) with some white (texture)
-                    float radioNoise = (pinkNoise * 0.75f) + (whiteNoise * 0.25f);
-    
-                    // Boosted base level for noticeable background
-                    float noiseGain = p.NoiseLevel < 0.1f
-                        ? BaseNoiseFloor + (p.NoiseLevel * NoiseBoost)
-                        : BaseNoiseFloor + (MathF.Sqrt(p.NoiseLevel) * 1.2f);
-    
-                    val += radioNoise * noiseGain;
-                }
-
-                // Clamp to safe range
-                val = Math.Clamp(val, -1f, 1f);
-
-                if (!inDrop && _squelchState != SquelchState.Closed)
+                if (!inDrop)
                 {
                     val += whineSample + rumbleSample;
                 }

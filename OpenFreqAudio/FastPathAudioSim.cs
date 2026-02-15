@@ -58,14 +58,15 @@ namespace OpenFreqAudio
     // ================================================================
     public class AudioParams
     {
-        public float Gain; // linear gain
-        public float NoiseLevel; // 0..1 (analog static/hiss level)
-        public float DropoutRate; // fast multipath flutter (events per second, can exceed 1.0)
-        public float DeepFadeRate; // slow deep fades (events per second, typically 0-0.5)
+        // Decibels of received power (before AGC)
+        public float ReceivedDb;
+        // SNR compared to the noise floor of the receiver (thermal + noise figure)
+        public float ReceivedSnrDb;
+        // fast multipath flutter (events per second, can exceed 1.0). A function of SNR, but cached here.
+        public float DropoutRate;
+        // slow deep fades (events per second, typically 0-0.5). Also a function of SNR, but cached here.
+        public float DeepFadeRate;
         public int RadioFrequencyKHz;
-
-        // RF propagation parameters (for physics-based stepped-on interference)
-        public float SNR_dB; // Signal-to-noise ratio
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
@@ -170,7 +171,7 @@ namespace OpenFreqAudio
         /// <summary>
         /// Determine which radio band configuration to use for a given frequency
         /// </summary>
-        private static RadioBandConfig GetBandConfig(int frequencyKhz)
+        public static RadioBandConfig GetBandConfig(int frequencyKhz)
         {
             foreach (var config in bandConfigs)
             {
@@ -232,75 +233,9 @@ namespace OpenFreqAudio
             return 6.9 + 20.0 * Math.Log10(term);
         }
 
-        /// <summary>
-        /// Calculate the thermal noise floor amplitude for background noise playback.
-        /// This is the noise level heard through speakers when squelch is open but no signal present.
-        /// </summary>
-        /// <param name="frequencyKhz"></param>
-        /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
-        /// <param name="modulation">Modulation type (affects noise characteristics)</param>
-        /// <returns>Background noise amplitude (0.0 to 1.0 scale where 1.0 = 0 dBm)</returns>
-        public static float CalculateBackgroundNoiseAmplitude(int frequencyKhz,
-            double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
-        {
-            var bandwidthHz = GetBandConfig(frequencyKhz).VoiceBandwidth_Hz;
-            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyKhz / 1000.0:F3} MHz not found in Band Config");
-
-            // Default sensitivities based on modulation type
-            double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
-
-            // Thermal noise floor calculation
-            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz); // ≈ -139.2 dBm for 3000 Hz
-            double receiverNoiseFigure = 7.0; // dB
-            double noiseFloorDbm = thermalNoise + receiverNoiseFigure; // ≈ -132 dBm
-
-            // Noise floor relative to receiver sensitivity
-            double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
-            // AM (default -113 dBm): -132 - (-113) = -19 dB
-            // FM (default -107 dBm): -132 - (-107) = -25 dB
-
-            // Convert to linear amplitude (0 dB = 1.0)
-            float noiseFloorAmplitude = (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
-            // AM: ≈ 0.112
-            // FM: ≈ 0.056
-
-            // Reduce by 6 dB for playback (allows weak signals at noise floor + 3dB to be heard)
-            return noiseFloorAmplitude * 0.5f;
-            // AM: ≈ 0.056
-            // FM: ≈ 0.028
-        }
-
-        /// <summary>
-        /// Calculate minimum gain threshold for signal detection.
-        /// Signals below this are considered drowned by thermal noise.
-        /// </summary>
-        /// <param name="frequencyKhz"></param>
-        /// <param name="receiverSensitivityDbm">Receiver sensitivity in dBm (optional, uses defaults if not provided)</param>
-        /// <param name="modulation">Modulation type (affects default sensitivity)</param>
-        public static float CalculateNoiseFloorAmplitude(int frequencyKhz,
-            double? receiverSensitivityDbm = null, ModulationType modulation = ModulationType.AM)
-        {
-            var bandwidthHz = GetBandConfig(frequencyKhz).VoiceBandwidth_Hz;
-            if (bandwidthHz == 0) throw new Exception($"Frequency {frequencyKhz / 1000.0:F3} MHz not found in Band Config");
-
-            // Default sensitivities based on modulation type
-            double rxSensitivity = receiverSensitivityDbm ?? (modulation == ModulationType.AM ? -113.0 : -107.0);
-
-            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
-            double receiverNoiseFigure = 7.0;
-            double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
-            double noiseRelativeDb = noiseFloorDbm - rxSensitivity;
-
-            return (float)Math.Pow(10.0, noiseRelativeDb / 20.0);
-            // AM (default -113 dBm): ≈ 0.112
-            // FM (default -107 dBm): ≈ 0.056
-        }
-
-        // Helper to finalize AudioParams with common fields and optional terrain profile
-        private void FinalizeAudioParams(AudioParams ap, double snrDb,
+        private static void SetTerrainProfile(AudioParams ap,
             List<(double dist, double elev)> profile, bool includeTerrainProfile)
         {
-            ap.SNR_dB = (float)snrDb;
             if (includeTerrainProfile)
                 ap.TerrainProfile = profile;
         }
@@ -354,50 +289,44 @@ namespace OpenFreqAudio
         }
 
         /// <summary>
-        /// Calculate noise level and dropout probability from SNR.
-        /// Physics-informed: based on modulation type characteristics and thermal noise.
-        /// 
-        /// MULTI-SCALE FADING MODEL:
-        /// - DropoutRate: Fast flutter (20-80ms, 0-1.2 events/sec) - rapid multipath interference
-        /// - DeepFadeRate: Slow deep fades (400-2000ms, 0-0.3 events/sec) - terrain nulls, severe multipath
+        /// Calculate noise level from SNR and modulation type.
+        /// AM: analog static increases smoothly with decreasing SNR.
+        /// FM: threshold effect — noise suppression until below threshold.
         /// </summary>
-        private void CalculateNoiseAndDropout(AudioParams ap, double snrDb, RadioBandConfig bandConfig)
+        public static float CalculateNoiseLevel(double snrDb, ModulationType modulation)
         {
-            if (bandConfig.Modulation == ModulationType.AM)
+            if (modulation == ModulationType.AM)
             {
                 // AM: Analog static increases smoothly with decreasing SNR
                 if (snrDb > 20.0)
-                    ap.NoiseLevel = 0.02f; // Clean signal
+                    return 0.02f; // Clean signal
                 else if (snrDb > 10.0)
-                    ap.NoiseLevel = (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02 → 0.20
+                    return (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02 → 0.20
                 else if (snrDb > 0.0)
-                    ap.NoiseLevel = (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20 → 0.55
+                    return (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20 → 0.55
                 else
-                    ap.NoiseLevel = (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55 → 0.85
+                    return (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55 → 0.85
             }
             else // FM
             {
                 // FM: FM threshold effect - noise suppression until below threshold
                 if (snrDb > 15.0)
-                    ap.NoiseLevel = 0.01f; // Excellent FM quieting
+                    return 0.01f; // Excellent FM quieting
                 else if (snrDb > 10.0)
-                    ap.NoiseLevel = (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01 → 0.10
+                    return (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01 → 0.10
                 else if (snrDb > 5.0)
-                    ap.NoiseLevel = (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10 → 0.40 (FM threshold)
+                    return (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10 → 0.40 (FM threshold)
                 else if (snrDb > 0.0)
-                    ap.NoiseLevel = (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40 → 0.75
+                    return (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40 → 0.75
                 else
-                    ap.NoiseLevel = (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
+                    return (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
             }
-
-            ap.DropoutRate = CalculateDropoutRate(snrDb, bandConfig);
-            ap.DeepFadeRate = CalculateDeepFadeRate(snrDb, bandConfig);
         }
 
         /// <summary>
         /// Fast flutter rate from rapid multipath fading (20-80ms "picket-fencing" effect).
         /// </summary>
-        public static float CalculateDropoutRate(double snrDb, RadioBandConfig bandConfig)
+        private static float CalculateDropoutRate(double snrDb, RadioBandConfig bandConfig)
         {
             double dropout;
             if (snrDb > 15.0)
@@ -445,24 +374,12 @@ namespace OpenFreqAudio
         /// Uses knife-edge diffraction theory with wavelength-dependent corrections.
         /// No discrete branches - single continuous function for realistic "degradation window".
         /// </summary>
-        private void ApplyTerrainDegradation(AudioParams ap, double fresnelClearance, double diffLoss,
-            double baseGainDb, RadioBandConfig bandConfig, double rxSensitivity)
+        private double ApplyTerrainDegradation(double fresnelClearance, double diffLoss, RadioBandConfig bandConfig)
         {
             _logger.LogDebug($"ApplyTerrainDegradation:");
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
             _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
-            _logger.LogDebug($"  baseGainDb: {baseGainDb:F1} dB");
             _logger.LogDebug($"  Band: {bandConfig.BandName} ({bandConfig.Modulation})");
-
-            double effectiveSignalDbm;
-            double snrDb;
-
-            double bandwidthHz = bandConfig.VoiceBandwidth_Hz;
-            double thermalNoise = -174.0 + 10.0 * Math.Log10(bandwidthHz);
-            double receiverNoiseFigure = 7.0;
-            double noiseFloorDbm = thermalNoise + receiverNoiseFigure;
-
-            double rfGainLinear;
 
             // === CHECK FOR CLEAR LOS FIRST ===
             // fresnelClearance >= 1.0 means terrain is below Fresnel zone edge (definitely clear)
@@ -470,17 +387,7 @@ namespace OpenFreqAudio
             if (fresnelClearance >= 1.0 || (fresnelClearance >= 0.6 && diffLoss < 3.0))
             {
                 _logger.LogDebug($"  → Taking CLEAR LOS path");
-                // Clear LOS - no terrain degradation needed
-                rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
-                ap.Gain = ApplyAGC((float)rfGainLinear);
-
-                // Calculate SNR for clean signal
-                effectiveSignalDbm = rxSensitivity + baseGainDb;
-                noiseFloorDbm = thermalNoise + receiverNoiseFigure;
-                snrDb = effectiveSignalDbm - noiseFloorDbm;
-
-                CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-                return;
+                return 0;
             }
 
             _logger.LogDebug($"  → Taking OBSTRUCTED path");
@@ -602,31 +509,16 @@ namespace OpenFreqAudio
                 }
             }
 
-            // Apply terrain loss to base gain
-            double finalGainDb = baseGainDb - totalTerrainLoss;
-
             // Shorter wavelength hard cutoff: severe obstructions should completely block signal
             // When 3+ Fresnel zones are blocked, signal is essentially gone
-            if (bandConfig.DiffractionCorrection_dB < 0 && fresnelClearance < -2.0) // More than 3 zones blocked
+            if (bandConfig.DiffractionCorrection_dB < 0 && fresnelClearance < -2.0)
             {
-                finalGainDb = Math.Min(finalGainDb, MinimumGainDb + 10.0); // Cap at -50 dB
+                return 200.0;
             }
-
-            // Clamp to physical limits
-            finalGainDb = Math.Clamp(finalGainDb, MinimumGainDb, 20.0);
-
-            // Convert to linear gain
-            rfGainLinear = Math.Pow(10.0, finalGainDb / 20.0);
-            // Apply AGC to get audio gain (0.0-1.0)
-            ap.Gain = ApplyAGC((float)rfGainLinear);
-            _logger.LogDebug($"AGC: rfGain={rfGainLinear:F2} → audioGain={ApplyAGC((float)rfGainLinear):F3}");
-
-            // Calculate SNR from final gain
-            effectiveSignalDbm = rxSensitivity + finalGainDb;
-            snrDb = effectiveSignalDbm - noiseFloorDbm;
-
-            // Calculate noise and dropout from SNR (physics-based)
-            CalculateNoiseAndDropout(ap, snrDb, bandConfig);
+            else
+            {
+                return totalTerrainLoss;
+            }
         }
 
         /// <summary>
@@ -646,10 +538,6 @@ namespace OpenFreqAudio
                 return GetDefaultAudioParams(frequencyKhz);
             }
 
-            // Get band configuration for this frequency
-            RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
-
-            // Rent from pool instead of allocating
             var ap = new AudioParams();
             ap.RadioFrequencyKHz = frequencyKhz;
 
@@ -676,26 +564,12 @@ namespace OpenFreqAudio
                 txAltVal += SampleElevation(txXVal, txYVal);
             }
 
-            // Use provided sensitivity or default values based on modulation
-            double rxSensitivity = receiverSensitivityDbm ??
-                                   (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
-
             // Distance between transmitter and receiver
             double dx = rxXVal - txXVal;
             double dy = rxYVal - txYVal;
             double dz = rxAltVal - txAltVal;
             double dist2D = Math.Sqrt(dx * dx + dy * dy);
             double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-
-            if (dist < 1.0)
-            {
-                ap.Gain = 1.0f;
-                ap.NoiseLevel = 0.01f;
-                ap.DropoutRate = 0.0f;
-                ap.DeepFadeRate = 0.0f;
-                FinalizeAudioParams(ap, 40.0, new List<(double, double)>(), includeTerrainProfile);
-                return ap;
-            }
 
             // Free-space path loss
             double freqHz = frequencyKhz * 1e3; // kHz to Hz
@@ -708,25 +582,25 @@ namespace OpenFreqAudio
             double kAvg = CalculateKAvg(txAltVal, rxAltVal);
             double effectiveEarthRadius = kAvg * EarthRadius;
 
-            // Received power before terrain effects
-            double prDbm = txPowerDbm - fspl - weatherLoss;
+            // Get band configuration for this frequency
+            RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
 
-            // Base gain without terrain effects
-            double baseGainDb = Math.Clamp(prDbm - rxSensitivity, MinimumGainDb, 50.0);
+            // Use provided sensitivity or default values based on modulation
+            double rxSensitivity = receiverSensitivityDbm ??
+                                   (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
+
+            // Received power before terrain effects
+            ap.ReceivedDb = (float)(txPowerDbm - fspl - weatherLoss);
 
             // Sample terrain profile
             var profile = SampleProfileAdaptive(txXVal, txYVal, rxXVal, rxYVal, maxSamplesPerPath);
-            double snrDb = 0;
+            // Bail now if there's not any terrain to obstruct us.
             if (profile.Count < 2)
             {
-                double rfGainLinear = Math.Pow(10.0, baseGainDb / 20.0);
-                ap.Gain = ApplyAGC((float)rfGainLinear);
-
-                // SNR = Received Power - Noise Floor
-                snrDb = prDbm - rxSensitivity;
-
-                CalculateNoiseAndDropout(ap, snrDb, bandConfig);
-                FinalizeAudioParams(ap, snrDb, profile, includeTerrainProfile);
+                ap.ReceivedSnrDb = ap.ReceivedDb - (float)rxSensitivity;
+                ap.DropoutRate = CalculateDropoutRate(ap.ReceivedSnrDb, bandConfig);
+                ap.DeepFadeRate = CalculateDeepFadeRate(ap.ReceivedSnrDb, bandConfig);
+                SetTerrainProfile(ap, profile, includeTerrainProfile);
                 return ap;
             }
 
@@ -783,17 +657,11 @@ namespace OpenFreqAudio
             _logger.LogDebug($"  Profile points: {profile.Count}");
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
-            ApplyTerrainDegradation(ap, fresnelClearance, diffLoss, baseGainDb, bandConfig, rxSensitivity);
-
-            // Calculate final path loss and SNR for output
-            double pathLossDb = fspl + weatherLoss + (baseGainDb - 20.0 * Math.Log10(Math.Max(ap.Gain, 1e-6)));
-
-            // SNR = Received Power - Noise Floor
-            // rxSensitivity is the receiver noise floor (minimum detectable signal)
-            snrDb = prDbm - rxSensitivity;
-
-            // Finalize and return
-            FinalizeAudioParams(ap, snrDb, profile, includeTerrainProfile);
+            ap.ReceivedDb -= (float)ApplyTerrainDegradation(fresnelClearance, diffLoss, bandConfig);
+            ap.ReceivedSnrDb = ap.ReceivedDb - (float)rxSensitivity;
+            ap.DropoutRate = CalculateDropoutRate(ap.ReceivedSnrDb, bandConfig);
+            ap.DeepFadeRate = CalculateDeepFadeRate(ap.ReceivedSnrDb, bandConfig);
+            SetTerrainProfile(ap, profile, includeTerrainProfile);
             return ap;
         }
 
@@ -830,7 +698,7 @@ namespace OpenFreqAudio
         /// <summary>
         /// Apply AGC (Automatic Gain Control) curve to map RF gain to audio gain.
         /// </summary>
-        private static float ApplyAGC(float rfGain)
+        public static float ApplyAGC(float rfGain)
         {
             // Use logarithmic compression (similar to real AGC circuits)
             // Formula: audioGain = tanh(log10(rfGain + 1) * k) where k controls compression
@@ -853,12 +721,11 @@ namespace OpenFreqAudio
 
         public static AudioParams GetDefaultAudioParams(int frequencyKhz)
         {
-            var bandConfig = GetBandConfig(frequencyKhz);
             var ap = new AudioParams
             {
                 RadioFrequencyKHz = frequencyKhz,
-                Gain = 1.0f,
-                NoiseLevel = 0f,
+                ReceivedDb = 0f, // no losses
+                ReceivedSnrDb = 50, // Clear as day.
                 DropoutRate = 0f,
                 DeepFadeRate = 0f
             };
