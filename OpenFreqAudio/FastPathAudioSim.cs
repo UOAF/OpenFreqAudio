@@ -650,6 +650,7 @@ namespace OpenFreqAudio
             double fresnelClearance = F1_radius > 0 ? (1.0 - worstExcess / F1_radius) : 1.0;
 
             _logger.LogDebug($"Terrain Analysis:");
+            _logger.LogDebug($"  distance: {dist:F1}m");
             _logger.LogDebug($"  worstExcess: {worstExcess:F1}m");
             _logger.LogDebug($"  F1_radius: {F1_radius:F1}m");
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
