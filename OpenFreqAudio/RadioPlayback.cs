@@ -870,6 +870,15 @@ public class RadioPlayback : IDisposable
 
         return 1.0f; // Default
     }
+    
+    public void SetFrequencyVolume(int frequencyKHz, float volume)
+    {
+        lock (_lock)
+        {
+            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
+            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 2f); // allow for some boost
+        }
+    }
 
     public void SetFrequencyAudioChannel(int frequencyKHz, AudioChannel channel)
     {
@@ -1317,7 +1326,10 @@ public class RadioPlayback : IDisposable
 
             // Final output clamping
             for (int i = 0; i < samples; i++)
-                _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 1f);
+            {
+                // again allow for some extra boost here
+                _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 2f);
+            }
 
             Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
         };
