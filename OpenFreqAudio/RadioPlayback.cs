@@ -717,12 +717,12 @@ public class RadioPlayback : IDisposable
 
             // Get buffer status after push
             var (fillCount, capacity) = stream.GetRingBufferFillLevel();
-#if DEBUG
+            #if DEBUG
             float fillPercent = (float)fillCount / capacity * 100f;
             _logger.LogDebug(
                 "Pushed {Frames} frames ({Bytes} bytes, {BitsPerSample}-bit), buffer now {FillPercent:F1}% full ({FillCount}/{Capacity}) (StreamId: {StreamId})",
                 frames, audioData.Length, bytesPerSample * 8, fillPercent, fillCount, capacity, streamId);
-#endif
+            #endif
 
             // Handle transmission end marker
             // Process AFTER pushing audio so this final packet's audio is included
