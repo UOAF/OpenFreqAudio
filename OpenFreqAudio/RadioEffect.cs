@@ -43,12 +43,12 @@ public class RadioEffect
     private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
 
     // DC whine state
-    private double _whinePhase;
+    // private double _whinePhase;
     private const float WhineFreq = 520f; // typical avionics inverter whine (400–800 Hz)
     private const float WhineLevel = 0.003f; // extremely subtle, like cockpit background
 
     // Deep rumble state
-    private double _rumblePhase;
+    // private double _rumblePhase;
     private const float RumbleFreq = 80f;    // Low rumble
     private const float RumbleLevel = 0.03f; // Subtle but noticeable
     
@@ -222,18 +222,6 @@ public class RadioEffect
             bool inDrop = _dropoutSamplesLeft > 0;
             bool inDeepFade = _deepFadeSamplesLeft > 0;
 
-            // Generate subtle DC whine (actually AC tone)
-            double whineIncrement = 2.0 * Math.PI * WhineFreq / _sampleRate;
-            float whineSample = (float)Math.Sin(_whinePhase) * WhineLevel;
-            _whinePhase += whineIncrement;
-            if (_whinePhase > Math.PI * 2) _whinePhase -= Math.PI * 2;
-            
-            // Generate subtle deep rumble
-            double rumbleIncrement = 2.0 * Math.PI * RumbleFreq / _sampleRate;
-            float rumbleSample = (float)Math.Sin(_rumblePhase) * RumbleLevel;
-            _rumblePhase += rumbleIncrement;
-            if (_rumblePhase > Math.PI * 2) _rumblePhase -= Math.PI * 2;
-
             for (int c = 0; c < _channels; c++)
             {
                 int idx = offset + frame * _channels + c;
@@ -273,6 +261,19 @@ public class RadioEffect
 
                     x *= deepFadeEnvelope;
                 }
+                // TODO: Add back in, DOWNRANGE OF DEMODULATION AND MIXING
+                /*
+                // Generate subtle DC whine (actually AC tone)
+                double whineIncrement = 2.0 * Math.PI * WhineFreq / _sampleRate;
+                float whineSample = (float)Math.Sin(_whinePhase) * WhineLevel;
+                _whinePhase += whineIncrement;
+                if (_whinePhase > Math.PI * 2) _whinePhase -= Math.PI * 2;
+                
+                // Generate subtle deep rumble
+                double rumbleIncrement = 2.0 * Math.PI * RumbleFreq / _sampleRate;
+                float rumbleSample = (float)Math.Sin(_rumblePhase) * RumbleLevel;
+                _rumblePhase += rumbleIncrement;
+                if (_rumblePhase > Math.PI * 2) _rumblePhase -= Math.PI * 2;
 
                 // === Oxygen mask (two-pole strong LPF + nasal boost) ===
                 float lp1 = _muffleLPChannels[c];
@@ -282,6 +283,7 @@ public class RadioEffect
                 float lp2 = _muffleLP2Channels[c];
                 lp2 = _muffleA * lp2 + (1f - _muffleA) * lp1;
                 _muffleLP2Channels[c] = lp2;
+
 
                 // Stronger nasal boost for helmet/mask resonance
                 float nasal = x * 0.55f;
@@ -307,15 +309,8 @@ public class RadioEffect
                 _filterState[stateBase] = x; // x[n-1] = x[n]
                 _filterState[stateBase + 3] = yn1; // y[n-2] = y[n-1]
                 _filterState[stateBase + 2] = y; // y[n-1] = y[n]
-
-                float val = Math.Clamp(y, -1f, 1f);
-
-                if (!inDrop)
-                {
-                    val += whineSample + rumbleSample;
-                }
-
-                buffer[idx] = Math.Clamp(val, -1f, 1f);
+                */
+                buffer[idx] = Math.Clamp(x, -1f, 1f);
             }
 
             if (inDrop) _dropoutSamplesLeft--;

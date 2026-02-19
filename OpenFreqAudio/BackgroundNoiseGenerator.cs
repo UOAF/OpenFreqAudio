@@ -73,9 +73,7 @@ public class BackgroundNoiseGenerator
     /// <param name="gain">Overall noise level (0.0 to 1.0)</param>
     public void GenerateNoise(float[] buffer, int offset, int samples, float gain)
     {
-        int frames = samples / _channels;
-
-        for (int frame = 0; frame < frames; frame++)
+        for (int frame = 0; frame < samples; frame++)
         {
             // Generate base noise sample
             float noiseSample = _radioType switch
@@ -100,14 +98,7 @@ public class BackgroundNoiseGenerator
             }
 
             // Apply gain
-            noiseSample *= gain;
-
-            // Write to all channels
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                buffer[idx] = Math.Clamp(noiseSample, -1f, 1f);
-            }
+            buffer[frame] = noiseSample * gain;
         }
     }
 
@@ -145,7 +136,7 @@ public class BackgroundNoiseGenerator
         }
 
         // Mix pink noise (continuous) with crackles (intermittent)
-        return pinkNoise * 0.15f + crackle;
+        return pinkNoise + crackle;
     }
 
     /// <summary>
@@ -180,7 +171,7 @@ public class BackgroundNoiseGenerator
         }
 
         // Mix pink noise with lighter crackles - INCREASED base level
-        return pinkNoise * 0.18f + crackle; // Was 0.12f, now 0.18f
+        return pinkNoise + crackle; // Was 0.12f, now 0.18f
     }
 
     /// <summary>

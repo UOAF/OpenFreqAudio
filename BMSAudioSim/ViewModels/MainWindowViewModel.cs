@@ -18,6 +18,8 @@ public class MainWindowViewModel : ReactiveObject
     private int _squelchSliderValue = 10;
     private float _squelch = 1.0f;
     private bool _enable3dEffects = true;
+    private float _ppm1 = 0;
+    private float _ppm2 = 0;
 
     public float Squelch
     {
@@ -88,6 +90,18 @@ public class MainWindowViewModel : ReactiveObject
     {
         get => _enable3dEffects;
         set => this.RaiseAndSetIfChanged(ref _enable3dEffects, value);
+    }
+
+    public float Ppm1
+    {
+        get => _ppm1;
+        set => this.RaiseAndSetIfChanged(ref _ppm1, value);
+    }
+
+    public float Ppm2
+    {
+        get => _ppm2;
+        set => this.RaiseAndSetIfChanged(ref _ppm2, value);
     }
 
     public double FrequencyMhz => FrequencyKhz / 1000d;

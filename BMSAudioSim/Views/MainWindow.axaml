@@ -126,6 +126,12 @@
                     <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
                     <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
                 </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Tune Frequency Offset (PPM)" VerticalAlignment="Center" Width="200"/>
+                    <TextBlock Text="{Binding Ppm1}" VerticalAlignment="Center" Width="25"/>
+                    <Slider x:Name="Ppm1Slider" Minimum="-2" Maximum="2" TickPlacement="Outside" TickFrequency="0.1"
+                            IsSnapToTickEnabled="True" Value="{Binding Ppm1}" ValueChanged="OnPpmSliderChanged" MinWidth="100" VerticalAlignment="Center"/>
+                </StackPanel>
                 <TextBlock Text="Path S1 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
@@ -149,6 +155,12 @@
                     <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
                     <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
                     <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Tune Frequency Offset (PPM)" VerticalAlignment="Center" Width="200"/>
+                    <TextBlock Text="{Binding Ppm2}" VerticalAlignment="Center" Width="25"/>
+                    <Slider x:Name="Ppm2Slider" Minimum="-2" Maximum="2" TickPlacement="Outside" TickFrequency="0.1"
+                            IsSnapToTickEnabled="True" Value="{Binding Ppm2}" ValueChanged="OnPpmSliderChanged" MinWidth="100" VerticalAlignment="Center"/>
                 </StackPanel>
                 <TextBlock Text="Path S2 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
                 <Grid ColumnDefinitions="6*,4*">

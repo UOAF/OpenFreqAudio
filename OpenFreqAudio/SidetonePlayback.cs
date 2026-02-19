@@ -52,7 +52,6 @@ public class SidetonePlayback : IDisposable
 
         // Working buffer for DSP callback
         public float[] Buffer { get; set; } = new float[MaxBufferSize];
-        public int ValidSamples { get; set; }
 
         public bool IsBuffering { get; set; } = true; // Start in buffering mode
         public int MinBufferFrames { get; set; } // Minimum frames before playback
@@ -481,12 +480,8 @@ public class SidetonePlayback : IDisposable
                 int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
                 if (framesRead == 0)
                 {
-                    stream.ValidSamples = 0;
                     continue;
                 }
-
-                int samplesRead = framesRead * stream.Channels;
-                stream.ValidSamples = samplesRead;
 
                 // Get frequency configuration for volume and channel routing
                 var freqConfig = _getFrequencyConfig(stream.FrequencyKHz);

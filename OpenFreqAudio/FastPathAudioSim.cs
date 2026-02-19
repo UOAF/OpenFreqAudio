@@ -67,6 +67,8 @@ namespace OpenFreqAudio
         // slow deep fades (events per second, typically 0-0.5). Also a function of SNR, but cached here.
         public float DeepFadeRate;
         public int RadioFrequencyKHz;
+        // Tune offset of the radio in parts per million.
+        public float TuneOffsetPPM;
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
@@ -527,19 +529,19 @@ namespace OpenFreqAudio
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
-            int frequencyKhz, double txPowerWatts = 10.0,
+            int frequencyKhz,
+            float ppm = 0.0f,
+            double txPowerWatts = 10.0,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool txAltitudeIsMSL = false,
             bool rxAltitudeIsMSL = false)
         {
+            var ap = GetDefaultAudioParams(frequencyKhz, ppm);
             if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
             {
-                return GetDefaultAudioParams(frequencyKhz);
+                return ap;
             }
-
-            var ap = new AudioParams();
-            ap.RadioFrequencyKHz = frequencyKhz;
 
             // Stupid C# does not recognize null-safety with the early return;
             double txXVal = txX.Value;
@@ -720,11 +722,12 @@ namespace OpenFreqAudio
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
 
-        public static AudioParams GetDefaultAudioParams(int frequencyKhz)
+        public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm)
         {
             var ap = new AudioParams
             {
                 RadioFrequencyKHz = frequencyKhz,
+                TuneOffsetPPM = ppm,
                 ReceivedDb = 0f, // no losses
                 ReceivedSnrDb = 50, // Clear as day.
                 DropoutRate = 0f,

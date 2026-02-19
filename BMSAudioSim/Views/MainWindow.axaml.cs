@@ -93,7 +93,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         _radioPlayback.Initialize();
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
         _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Right);
-        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Left);
+        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Both);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -449,7 +449,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX1Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
+            ViewModel.RXAltitude,
+            ViewModel.FrequencyKhz,
+            ViewModel.Ppm1,
+            ViewModel.TxWatts,
+            ViewModel.RxDbm,
             true);
 
         // Path 2: Sender2 -> Receiver
@@ -459,7 +463,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX2Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
+            ViewModel.RXAltitude,
+            ViewModel.FrequencyKhz,
+            ViewModel.Ppm2,
+            ViewModel.TxWatts,
+            ViewModel.RxDbm,
             true);
 
         if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
@@ -742,6 +750,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
         }
+    }
+
+    private void OnPpmSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (sender == Ppm1Slider)
+            ViewModel.Ppm1 = (float)e.NewValue;
+        else
+            ViewModel.Ppm2 = (float)e.NewValue;
+        UpdateParameters();
     }
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)

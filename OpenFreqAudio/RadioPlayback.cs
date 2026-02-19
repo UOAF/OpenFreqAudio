@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -52,7 +53,6 @@ public class RadioPlayback : IDisposable
 
         public bool HasReceivedAudio { get; set; }
         public DateTime LastAudioReceived { get; set; } = DateTime.MinValue;
-        public int ValidSamples { get; set; }
 
         // Transmission state (separate from stream lifecycle)
         public bool IsTransmitting { get; set; }
@@ -288,7 +288,6 @@ public class RadioPlayback : IDisposable
         // ReSharper disable UnusedAutoPropertyAccessor.Local
         public float Volume { get; set; } = 1.0f;
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
-        public Radiomixer Mixer { get; set; } = new();
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
         public bool WasHearableLastFrame { get; set; }
@@ -297,7 +296,6 @@ public class RadioPlayback : IDisposable
         public float SquelchLevel { get; set; } = 1.0f;
         // ReSharper restore UnusedAutoPropertyAccessor.Local
 
-        public SquelchBurstGenerator? SquelchBurst { get; set; }
         public bool WasSquelchOpen { get; set; }
     }
 
@@ -327,10 +325,20 @@ public class RadioPlayback : IDisposable
 
     private const int MaxBufferSize = 24576;
     private float[] _dspScratch = new float[MaxBufferSize];
-    private float[] _mixBuffer1 = new float[MaxBufferSize];
-    private float[] _mixBuffer2 = new float[MaxBufferSize];
-    private float[] _frequencyMixBuffer = new float[MaxBufferSize];
-    private float[] _noiseBuffer = new float[MaxBufferSize];
+    private float[] _stereoBuffer = new float[MaxBufferSize * 2];
+
+    // Phase coherence is good - don't have phase jumps between DSP callbacks.
+    private int _sampleNum = 0;
+
+    // AGC gain; varies as a low-pass of the received signal
+    // according to attack and decay params below.
+    private double _agcGain = 1;
+
+    // ~3ms attack
+    private const double _agcAttack = 0.003f;
+
+    // ~100ms decay
+    private const double _agcDecay = 0.1f;
 
     private int _sampleRate = 48000;
 
@@ -380,8 +388,6 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 2);
         }
-
-        Radiomixer.LoadSteppedOnSample();
 
         // Start peer timeout monitoring
         StartPeerTimeoutMonitoring();
@@ -814,11 +820,6 @@ public class RadioPlayback : IDisposable
                 _frequencies[frequencyKHz] = new FrequencyConfig();
 
             var freqConfig = _frequencies[frequencyKHz];
-            if (freqConfig.SquelchBurst == null)
-            {
-                freqConfig.SquelchBurst = new SquelchBurstGenerator(_sampleRate, _channels,
-                    _loggerFactory.CreateLogger<SquelchBurstGenerator>());
-            }
 
             freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
@@ -932,48 +933,6 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    // Convert stream from native channel format to output channel format
-    private void ConvertToOutputFormat(RadioStream stream, float[] dest, int destSamples)
-    {
-        int validSamples = stream.ValidSamples;
-        int validFrames = validSamples / stream.Channels;
-        int outputFrames = destSamples / _channels;
-
-        if (stream.Channels == 1 && _channels == 2)
-        {
-            // Mono → Stereo: duplicate each sample
-            for (int frame = 0; frame < validFrames && frame < outputFrames; frame++)
-            {
-                float sample = stream.Buffer[frame];
-                dest[frame * 2] = sample;
-                dest[frame * 2 + 1] = sample;
-            }
-
-            // Clear remainder
-            if (validFrames < outputFrames)
-                Array.Clear(dest, validFrames * 2, (outputFrames - validFrames) * 2);
-        }
-        else if (stream.Channels == 2 && _channels == 2)
-        {
-            // Stereo → Stereo: direct copy
-            Array.Copy(stream.Buffer, dest, Math.Min(validSamples, destSamples));
-            if (validSamples < destSamples)
-                Array.Clear(dest, validSamples, destSamples - validSamples);
-        }
-        else if (stream.Channels == 1 && _channels == 1)
-        {
-            // Mono → Mono: direct copy
-            Array.Copy(stream.Buffer, dest, Math.Min(validSamples, destSamples));
-            if (validSamples < destSamples)
-                Array.Clear(dest, validSamples, destSamples - validSamples);
-        }
-        else
-        {
-            // Generic fallback (shouldn't happen normally)
-            Array.Clear(dest, 0, destSamples);
-        }
-    }
-
     private void StartMasterStream()
     {
         StreamProcedure streamProc = (_, buffer, length, _) =>
@@ -1030,9 +989,14 @@ public class RadioPlayback : IDisposable
 
     private void SetupDSPAndPlay()
     {
+        // This callback is fired continuously - to avoid stutters,
+        // we need to provide length bytes of stereo audio samples.
         _dspProc = (_, _, bufferPtr, length, _) =>
         {
-            int samples = length / sizeof(float);
+            // Output is always stereo, so we can mix left & right ear outputs.
+            Debug.Assert(_channels == 2);
+            int stereoOutputSamples = length / sizeof(float);
+            int samples = stereoOutputSamples / 2; 
 
             // Ensure buffers are large enough
             if (samples > MaxBufferSize)
@@ -1040,14 +1004,11 @@ public class RadioPlayback : IDisposable
                 lock (_lock)
                 {
                     _dspScratch = new float[samples];
-                    _mixBuffer1 = new float[samples];
-                    _mixBuffer2 = new float[samples];
-                    _frequencyMixBuffer = new float[samples];
-                    _noiseBuffer = new float[samples];
+                    _stereoBuffer = new float[stereoOutputSamples];
                 }
             }
 
-            // Snapshot state once
+            // Snapshot state for UI consumption
             List<RadioStream> activeStreams;
             Dictionary<int, FrequencyConfig> frequencySnapshot;
             HashSet<int>? transmittingFrequencies = null;
@@ -1064,7 +1025,6 @@ public class RadioPlayback : IDisposable
                     // Snapshot transmitting frequencies - but only when we are in 3D Mode
                     transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
                 }
-
                 else
                 {
                     activeStreams = _streams.Values.ToList();
@@ -1073,29 +1033,13 @@ public class RadioPlayback : IDisposable
                 frequencySnapshot = new Dictionary<int, FrequencyConfig>(_frequencies);
             }
 
-            // Filter out streams on transmitting frequencies
-            if (transmittingFrequencies?.Count > 0)
-            {
-                var originalCount = activeStreams.Count;
-                activeStreams = activeStreams
-                    .Where(s => !transmittingFrequencies.Contains(s.FrequencyKHz))
-                    .ToList();
-
-                var blockedCount = originalCount - activeStreams.Count;
-                if (blockedCount > 0)
-                {
-                    // Streams blocked - this is expected during transmission
-                    // Optional: Log periodically for debugging (not every frame)
-                }
-            }
-
-            int outputFrames = samples / _channels;
-            Array.Clear(_dspScratch, 0, samples);
-
             // Pre-group streams by frequency
+            // TODO: Process each frequency in-line here,
+            //       instead of creating the intermediate dict?
             var streamsByFrequency = new Dictionary<int, List<RadioStream>>();
             foreach (var stream in activeStreams)
             {
+                Debug.Assert(stream.Channels == 1); // Mono, right?
                 int freq = stream.FrequencyKHz;
                 if (!streamsByFrequency.TryGetValue(freq, out var list))
                 {
@@ -1106,35 +1050,45 @@ public class RadioPlayback : IDisposable
                 list.Add(stream);
             }
 
+            // Important: Don't process more samples than we can read from all streams
+            //            (desync is very bad)
+            int maxReady = samples;
+            foreach (var stream in activeStreams)
+            {
+                var (c, _) = stream.GetRingBufferFillLevel();
+                maxReady = Math.Min(maxReady,c);
+            }
+            samples = maxReady;
+            stereoOutputSamples = samples * 2;
+            Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
+
             // 1: Process all streams (read from ring + apply effects)
             foreach (var stream in activeStreams)
             {
-                int framesRead = stream.ReadFromRing(stream.Buffer, outputFrames);
+                int framesRead = stream.ReadFromRing(stream.Buffer, samples);
                 if (framesRead == 0)
                 {
-                    stream.ValidSamples = 0;
                     Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
                     continue;
                 }
 
-                int samplesRead = framesRead * stream.Channels;
-                stream.ValidSamples = samplesRead;
-
                 if (Apply3dEffects)
                 {
-                    stream.RadioEffect.Process(stream.Buffer, 0, samplesRead);
-                    stream.RadioPreFilter.Process(stream.Buffer, 0, samplesRead, stream.Channels);
+                    stream.RadioEffect.Process(stream.Buffer, 0, samples);
                 }
             }
 
-            // 2: Process each frequency (noise + squelch + mixing)
+            // 2: Process each frequency (noise + squelch + mixing), AKA radio,
+            //    which should have its own AGC, Squelch, etc.
             foreach (var kvp in frequencySnapshot)
             {
                 int freq = kvp.Key;
                 var freqConfig = kvp.Value;
-                if (!freqConfig.IsTuned) continue;
+                if (!freqConfig.IsTuned || freqConfig.IsNoiseMuted) continue;
 
                 // Get pre-grouped streams for this frequency
+                // Don't bail early if these are empty;
+                // still want to apply squelch sound and other FX.
                 var freqStreams = streamsByFrequency.TryGetValue(freq, out var streams)
                     ? streams
                     : new List<RadioStream>();
@@ -1142,56 +1096,165 @@ public class RadioPlayback : IDisposable
                 // --- PER-FREQUENCY RF PARAMETERS ---
                 var bandConfig = FastPathAudioSim.GetBandConfig(freq);
 
-                // Find strongest signal on this frequency, and base SNR on it.
-                // If nothing is playing, make SNR 0.
-                double snrDb = 0;
                 var transmittingStreams = freqStreams.Where(s => s.IsTransmitting).ToList();
-                if (transmittingStreams.Count > 0)
-                {
-                    snrDb = transmittingStreams.Max(s => s.CurrentParams.ReceivedSnrDb);
-                }
-                // Typical squelch is at +6 dB
-                bool isSquelchOpen = snrDb >= freqConfig.SquelchLevel * 6.0f;
 
-                // --- BACKGROUND NOISE GENERATION ---
-                if (Apply3dEffects && freqConfig.NoiseGenerator != null)
+                bool isSquelchOpen = false;
+
+                // Mix transmitting streams
+                if (Apply3dEffects)
                 {
+                    // Noise is always there!
+                    // The question is just "how loud compared to the signal?"
+                    // (What's the SNR?)
+                    freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch, 0, samples, 1.0f);
+
+                    if (transmittingStreams.Count > 0)
+                    {
+                        // TODO: Factor this out into a function.
+
+                        // AM demodulators are envelope detectors
+                        // (https://en.wikipedia.org/wiki/Envelope_detector)
+                        // They pull out the modulated voice by extracting
+                        // the shape (envelope) of the signal.
+                        // This has some nice advantages:
+                        //
+                        // 1. Receivers don't have to perfectly match the channel frequency
+                        //    of the transmitter - as long as a TX is in the passband of an RX,
+                        //    we can recover the transmitted voice without any frequency errors
+                        //    that would make it sound too high or too low.
+                        //    (This is especially nice for fast aircraft, since the Doppler effect
+                        //    means the frequencies are changing all the time!)
+                        //
+                        // 2. The electronics for an envelope detector are pretty cheap and simple.
+                        //
+                        // All is well when a single transmitter is sending on a frequency,
+                        // but when *multiple* transmitters send at once, trouble starts.
+                        // IRL radios are never tuned to the exact same frequency, since
+                        // making two oscillators moving at several million cycles per second
+                        // match perfectly is very hard - and so the carrier frequencies
+                        // create beats (https://en.wikipedia.org/wiki/Beat_(acoustics)).
+                        // Along with people talking over each other,
+                        // the receiver hears some nasty effects:
+                        //
+                        // 1. The receiver hears tones at each of the beat frequencies.
+                        //
+                        // 2. The beat frequencies ring modulate the weaker voice -
+                        //    each frequency f turns into two: f + beat and f - beat.
+                        //    (Find some videos of guitar pedals and vocoders that apply
+                        //    ring modulation for an example of what this sounds like.)
+                        //
+                        // 3. The louder voice amplitude-modulates the weaker one.
+                        //
+                        // 4. Low beat frequencies that fall inside the AGC's passband
+                        //    can cause the volume to "pump" up and down.
+                        //
+                        // Instead of trying to simulate all this, we can calculate the real thing!
+                        // For some signal s[n], its envelope is E[n] = sqrt(I[n]^2 + Q[n]^2)
+                        // where (I + jQ) is the representation of the signal as a complex number
+                        // (see https://en.wikipedia.org/wiki/In-phase_and_quadrature_components).
+                        //
+                        // And for each beat frequency k,
+                        // I_k = cos(θ_k[n])
+                        // Q_k = sin(θ_k[n])
+                        // where θ_k[n] = 2π · beat[k] · n / F_s
+                        //   and F_s is the sample rate.
+                        // We'll multiply those terms by each AM signal A_k + v_k[n],
+                        // where A_k is the received power of the carrier and v_k[n] is the modulated voice.
+                        // All together, we get
+                        //
+                        // I[n] = Σ_k (A_k + v_k[n]) · cos(θ_k[n])
+                        // Q[n] = Σ_k (A_k + v_k[n]) · sin(θ_k[n])
+                        // E[n] = sqrt(I[n]² + Q[n]²)
+                        //
+                        // which gives us an envelope between 0 and 2.
+                        // Shift that back to [-1, 1] and we have ourselves the envelope.
+
+                        var numStreams = transmittingStreams.Count;
+                        var relativePowers = new List<float>(numStreams);
+                        var beats = new List<float>(numStreams);
+                        // We can make any of the frequencies "0" and calculate beats off of it.
+                        // Just pick the first transmitter in the list.
+                        float zeroFreq = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
+                        zeroFreq += zeroFreq * transmittingStreams[0].CurrentParams.TuneOffsetPPM * 1e-6f;
+                        for (int i = 0; i < numStreams; ++i)
+                        {
+                            // We need to convert from dB to linear power when weighing the signals.
+                            var thisSnrLinear = Math.Pow(10, transmittingStreams[i].CurrentParams.ReceivedSnrDb / 20.0);
+                            // This is essentially doing AGC - the loudest transmitter goes from [0, 2]
+                            // and the rest are some fraction of that.
+                            // See the comment about squelch - we could replace this with an actual ramp up and down.
+                            relativePowers.Add((float)thisSnrLinear);
+                            if (i == 0)
+                            {
+                                beats.Add(0);
+                            }
+                            else
+                            {
+                                var thisFreq = (float)transmittingStreams[i].CurrentParams.RadioFrequencyKHz * 1e3f;
+                                thisFreq += thisFreq * transmittingStreams[i].CurrentParams.TuneOffsetPPM * 1e-6f;
+                                beats.Add(Math.Abs(thisFreq - zeroFreq));
+                            }
+                        }
+
+                        // Calculate E[n] for each sample n.
+                        for (int n = 0; n < samples; ++n)
+                        {
+                            double i = 0;
+                            double q = 0;
+                            // Real aircraft radios don't have 100% modulation.
+                            // A bunch of the standards are paywalled, but those I've found
+                            // suggest minimum specs are 85% modulation, with 90-95% being common.
+                            // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
+                            // https://avweb.com/avionics/vhf-nav-comm-basics/
+                            const double modIndex = 0.9;
+                            for (int k = 0; k < numStreams; ++k)
+                            {
+                                // θ_k is the phasor that rotates around at each beat frequency k.
+                                double theta = 2.0f * Math.PI * beats[k] *
+                                    (double)(n + _sampleNum) / (double)_sampleRate;
+                                // Sum IQ components _before_ taking the length of the vector,
+                                // as that's a nonlinear operation.
+                                i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
+                                    Math.Cos(theta);
+                                q += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
+                                    Math.Sin(theta);
+                            }
+
+                            // Add the envelope to the noise.
+                            _dspScratch[n] += (float)Math.Sqrt(i * i + q * q);
+                            // AGC time: are we attacking or decaying?
+                            double tau = _dspScratch[n] > _agcGain ? _agcAttack : _agcDecay;
+                            double alpha = 1 - Math.Exp(-1 / (_sampleRate * tau));
+                            // Update the AGC:
+                            _agcGain = alpha * _dspScratch[n] + (1 - alpha) * _agcGain;
+
+                            // Apply AGC, then remove our DC component, i.e.,
+                            // shift our envelope from [0, 2] back to [-1, 1].
+                            // Real electronics would use some high-pass filter that notches out 0 Hz.
+                            _dspScratch[n] = _dspScratch[n] / (float)_agcGain - 1.0f;
+                        }
+                    }
+                    // Nothing is transmitting except noise, decay AGC back to unity.
+                    else
+                    {
+                        var alpha = 1 - Math.Exp(-1 / (_sampleRate / samples * _agcDecay));
+                        // Decay back to unity
+                        _agcGain = alpha * 1.0 + (1 - alpha) * _agcGain;
+                    }
+
+                    // Squelch is driven by the AGC gain.
+                    // When it starts attenuating, we know we hear something.
+                    //
+                    // Typical squelch is at +6 dB, which is a factor of 2x.
+                    isSquelchOpen = _agcGain >= freqConfig.SquelchLevel * 2.0f;
+
+                    // Was previously above, but is all downstream of squelch, so:
                     lock (_lock)
                     {
                         if (_frequencies.TryGetValue(freq, out var fc))
                             fc.WasHearableLastFrame = isSquelchOpen;
                     }
 
-                    // If we're not squelched or muted, but nothing's there,
-                    if (isSquelchOpen && !freqConfig.IsNoiseMuted)
-                    {
-                        float targetGain = freqConfig.Volume;
-                        float fadeStep = targetGain / NoiseFadeSamples;
-                        float noiseLevel = FastPathAudioSim.CalculateNoiseLevel(snrDb, bandConfig.Modulation);
-                        freqConfig.NoiseGenerator.GenerateNoise(_noiseBuffer, 0, samples, noiseLevel);
-
-                        // Upmix to Stereo
-                        for (int frame = 0; frame < outputFrames; frame++)
-                        {
-                            int leftIdx = frame * 2;
-                            int rightIdx = leftIdx + 1;
-                            float noiseSample = _noiseBuffer[leftIdx];
-                            switch (freqConfig.AudioChannel)
-                            {
-                                case AudioChannel.Left: _dspScratch[leftIdx] += noiseSample; break;
-                                case AudioChannel.Right: _dspScratch[rightIdx] += noiseSample; break;
-                                case AudioChannel.Both:
-                                    _dspScratch[leftIdx] += noiseSample;
-                                    _dspScratch[rightIdx] += noiseSample;
-                                    break;
-                            }
-                        }
-                    }
-                }
-
-                // --- SQUELCH BURST HANDLING ---
-                if (Apply3dEffects && freqConfig.SquelchBurst != null)
-                {
                     // Use explicit transmission state from RTP markers
                     bool hasActiveTransmission = freqStreams.Any(s => s.IsTransmitting);
 
@@ -1202,9 +1265,9 @@ public class RadioPlayback : IDisposable
 
                     // Force-end stale transmissions (ONLY for push streams)
                     foreach (var s in freqStreams.Where(s =>
-                                 s.IsPush &&
-                                 s.IsTransmitting &&
-                                 (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
+                                s.IsPush &&
+                                s.IsTransmitting &&
+                                (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
                     {
 #if DEBUG
                         _logger.LogDebug("Force-ending stale transmission for {StreamId}", s.StreamId);
@@ -1221,117 +1284,62 @@ public class RadioPlayback : IDisposable
 #if DEBUG
                         _logger.LogDebug(
                             "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                            isSquelchOpen ? "OPEN" : "CLOSED", freq, snrDb);
+                            isSquelchOpen ? "OPEN" : "CLOSED", freq, _agcGain);
 #endif
-
-                        if (isSquelchOpen)
-                            freqConfig.SquelchBurst.TriggerOpening();
-                        else
-                            freqConfig.SquelchBurst.TriggerClosing();
 
                         freqConfig.WasSquelchOpen = isSquelchOpen;
                     }
                 }
-
-                // --- AUDIO MIXING ---
-                bool hasBurstPlaying = freqConfig.SquelchBurst?.IsPlaying ?? false;
-
-                // Skip if no audio to process
-                if (transmittingStreams.Count == 0 && !hasBurstPlaying)
-                    continue;
-
-                Array.Clear(_frequencyMixBuffer, 0, samples);
-
-                // Mix transmitting streams
-                if (transmittingStreams.Count > 0)
+                // Straight mix when we're not applying any FX
+                else
                 {
-                    if (transmittingStreams.Count == 1)
+                    Array.Clear(_dspScratch, 0, samples);
+                    foreach (var t in transmittingStreams)
                     {
-                        ConvertToOutputFormat(transmittingStreams[0], _frequencyMixBuffer, samples);
-                    }
-                    else if (Apply3dEffects) // 2+ transmitting streams = stepped-on
-                    {
-                        var sorted = transmittingStreams
-                            .OrderByDescending(s => s.CurrentParams.ReceivedDb).ToList();
-                        var primary = sorted[0];
-                        var secondary = sorted[1];
-
-                        ConvertToOutputFormat(primary, _mixBuffer1, samples);
-                        ConvertToOutputFormat(secondary, _mixBuffer2, samples);
-
-                        var steppedParams = Radiomixer.CalculateSteppedOnParams(
-                            primary.CurrentParams, secondary.CurrentParams);
-
-                        freqConfig.Mixer.ProcessSteppedOn(_mixBuffer1, _mixBuffer2, _frequencyMixBuffer, samples,
-                            steppedParams, _sampleRate,
-                            primary.CurrentParams.ReceivedDb, secondary.CurrentParams.ReceivedDb);
-                    }
-
-                    else // 2+ streams without effects, simple additive mix
-                    {
-                        // Simple additive mixing with normalization
-                        float mixGain = 1.0f / MathF.Sqrt(transmittingStreams.Count); // Preserve energy
-                        foreach (var stream in transmittingStreams)
+                        for (int i = 0; i < samples; ++i)
                         {
-                            ConvertToOutputFormat(stream, _mixBuffer1, samples);
-                            for (int i = 0; i < samples; i++)
-                                _frequencyMixBuffer[i] += _mixBuffer1[i] * mixGain;
+                            _dspScratch[i] += t.Buffer[i];
                         }
                     }
-
-                    // --- PER-FREQUENCY AGC ---
-                    if (Apply3dEffects)
-                    {
-                        if (isSquelchOpen)
-                        {
-                            float linearizedSnr = (float)Math.Pow(10, snrDb / 20.0); // from decibels
-                            float agcGain = FastPathAudioSim.ApplyAGC(linearizedSnr);
-                            for (int i = 0; i < samples; i++)
-                                _frequencyMixBuffer[i] *= agcGain;
-                        }
-                        else
-                        {
-                            // Squelch closed — silence the mixed audio
-                            Array.Clear(_frequencyMixBuffer, 0, samples);
-                        }
-                    }
+                    // Set AGC back to unity so there's not sudden jumps
+                    // when we turn FX back on.
+                    _agcGain = 1;
+                    // Always play unless muted.
+                    isSquelchOpen = true;
                 }
 
-                // Process squelch burst (happens even if no transmitting streams)
-                if (Apply3dEffects && freqConfig.SquelchBurst != null)
-                    freqConfig.SquelchBurst.Process(_frequencyMixBuffer, 0, samples);
+                if (Apply3dEffects && !isSquelchOpen) continue;
 
-                // Upmix to stereo output
+                // Final mix, split to stereo output.
+                // Note that we _sum_, not set stereo buffer so that we can combine multiple radios.
                 float volume = freqConfig.Volume;
-                var audioChannel = freqConfig.AudioChannel;
-
-                int frames = samples / 2;
-                for (int frame = 0; frame < frames; frame++)
+                for (int frame = 0; frame < samples; frame++)
                 {
-                    int li = frame * 2;
-                    int ri = li + 1;
-                    float l = _frequencyMixBuffer[li] * volume;
-                    float r = _frequencyMixBuffer[ri] * volume;
-                    switch (audioChannel)
+                    int leftIdx = frame * 2;
+                    int rightIdx = leftIdx + 1;
+                    switch (freqConfig.AudioChannel)
                     {
-                        case AudioChannel.Left: _dspScratch[li] += l + r; break;
-                        case AudioChannel.Right: _dspScratch[ri] += l + r; break;
+                        case AudioChannel.Left: _stereoBuffer[leftIdx] += volume * _dspScratch[frame]; break;
+                        case AudioChannel.Right: _stereoBuffer[rightIdx] += volume * _dspScratch[frame]; break;
                         case AudioChannel.Both:
-                            _dspScratch[li] += l;
-                            _dspScratch[ri] += r;
+                            _stereoBuffer[leftIdx] += volume * _dspScratch[frame];
+                            _stereoBuffer[rightIdx] += volume * _dspScratch[frame];
                             break;
                     }
                 }
             }
 
             // Final output clamping
-            for (int i = 0; i < samples; i++)
+            // TODO: We could add peak limiting to prevent hard clipping.
+            for (int i = 0; i < stereoOutputSamples; ++i)
             {
-                // again allow for some extra boost here
-                _dspScratch[i] = Math.Clamp(_dspScratch[i], -1f, 2f);
+                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i], -1, 1);
             }
 
-            Marshal.Copy(_dspScratch, 0, bufferPtr, samples);
+            Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
+            // Keep sinusoids phase-coherent across callbacks.
+            // (At least until we roll over, but that's once every blue moon.)
+            _sampleNum += samples;
         };
 
         _masterDspProcHandle = Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
