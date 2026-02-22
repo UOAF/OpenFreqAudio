@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using ManagedBass;
+using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
 
 // ReSharper disable InconsistentNaming
@@ -26,6 +27,7 @@ public class RadioPlayback : IDisposable
         public string StreamId { get; set; } = "";
         public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
+        public int BassMixerHandle { get; set; } // 0 if no mixer (push streams)
         public int Channels { get; set; } // 1=mono,2=stereo
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
         public required RadioEffect RadioEffect { get; set; }
@@ -357,7 +359,9 @@ public class RadioPlayback : IDisposable
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
     private int _sampleNum = 0;
 
-    private int _sampleRate = 48000;
+    // Baseband is 8 kHz (4kHz Nyquist)
+    // NB: Opus only accepts 8000, 12000, 16000, 24000, or 48000 Hz
+    public const int SampleRate = 8000;
 
     private readonly int _channels = 2; // Always use Stereo output
 
@@ -389,7 +393,7 @@ public class RadioPlayback : IDisposable
                 if (!deviceInfo.IsInitialized)
                 {
                     // Initialize the new device
-                    if (!Bass.Init(playbackDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+                    if (!Bass.Init(playbackDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
                     {
                         _logger.LogError($"Failed to initialize device {playbackDeviceIndex}: {Bass.LastError}");
                         return;
@@ -416,8 +420,6 @@ public class RadioPlayback : IDisposable
         _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
         int bassStream;
         ChannelInfo info;
-        bool needsRecreate = false;
-        int newSampleRate = 0;
 
         lock (_lock)
         {
@@ -431,46 +433,29 @@ public class RadioPlayback : IDisposable
 
             info = Bass.ChannelGetInfo(bassStream);
 
-            _logger.LogInformation("File info: SampleRate={SampleRate}, Channels={Channels}", info.Frequency,
-                info.Channels);
-
-            // Check if sample rate changed - recreate master stream if needed
-            if (_sampleRate != info.Frequency)
-            {
-                _logger.LogWarning(
-                    "Sample rate mismatch! File={FileSampleRate}, Master={MasterSampleRate}. Recreating master stream.",
-                    info.Frequency, _sampleRate);
-                needsRecreate = true;
-                newSampleRate = info.Frequency;
-            }
-            else
-            {
-                _logger.LogDebug("Using existing master stream: SampleRate={SampleRate}, Channels={Channels}",
-                    _sampleRate, _channels);
-            }
-        }
-
-        if (needsRecreate)
-        {
-            StopMasterStream();
-            lock (_lock)
-            {
-                _sampleRate = newSampleRate;
-            }
-
-            StartMasterStream();
+            _logger.LogInformation("File info: NativeRate={NativeRate}, Channels={Channels}, ResampledTo={InputRate}",
+                info.Frequency, info.Channels, SampleRate);
         }
 
         lock (_lock)
         {
+            // Create a BassMix mixer to resample from native rate to SampleRate
+            int mixer = BassMix.CreateMixerStream(SampleRate, info.Channels,
+                BassFlags.Decode | BassFlags.Float);
+            if (mixer == 0)
+                throw new Exception($"BASS error creating mixer for '{streamId}': {Bass.LastError}");
+            if (!BassMix.MixerAddChannel(mixer, bassStream, BassFlags.Default))
+                throw new Exception($"BASS error adding channel to mixer for '{streamId}': {Bass.LastError}");
+
             var stream = new RadioStream(_logger)
             {
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = bassStream,
+                BassMixerHandle = mixer,
                 Channels = info.Channels,
                 IsPush = false,
-                RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams,
+                RadioEffect = new RadioEffect(SampleRate, info.Channels, audioParams,
                     _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
                 CurrentParams = audioParams,
@@ -479,15 +464,14 @@ public class RadioPlayback : IDisposable
                 AmbientNoise = ambientNoise
             };
 
-
             // Allocate a ring buffer (5 seconds worth of audio)
-            int ringFrames = info.Frequency * 5;
+            int ringFrames = SampleRate * 5;
             stream.EnsureRingBufferCapacity(ringFrames * Math.Max(1, stream.Channels));
 
-            // Start a background task that pulls decoded floats from the BASS decode stream and pushes them into the ring buffer.
+            // Start a background task that pulls resampled floats from the mixer and pushes them into the ring buffer.
             stream.FileReaderCts = new CancellationTokenSource();
             var token = stream.FileReaderCts.Token;
-            int streamSampleRate = info.Frequency; // Capture for use in lambda
+            int streamSampleRate = SampleRate;
             stream.FileReaderTask = Task.Run(() =>
             {
                 try
@@ -502,7 +486,7 @@ public class RadioPlayback : IDisposable
                     while (!token.IsCancellationRequested)
                     {
                         int bytesRequested = chunkSamples * sizeof(float);
-                        int bytesRead = Bass.ChannelGetData(bassStream, readBuffer, bytesRequested);
+                        int bytesRead = Bass.ChannelGetData(mixer, readBuffer, bytesRequested);
 
                         if (bytesRead <= 0)
                         {
@@ -599,48 +583,26 @@ public class RadioPlayback : IDisposable
             _streams.Add(streamId, stream);
 
             _logger.LogInformation(
-                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, FileRate={FileRate}Hz, MasterRate={MasterRate}Hz, RingBuffer={RingBufferSize} floats",
+                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, NativeRate={NativeRate}Hz, ResampledTo={InputRate}Hz, RingBuffer={RingBufferSize} floats",
                 streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.ReceivedDb, info.Channels, info.Frequency,
-                _sampleRate, stream.RingBuffer.Length);
-
-            if (info.Frequency != _sampleRate)
-            {
-                _logger.LogWarning(
-                    "Sample rate mismatch! File={FileRate}Hz, Master={MasterRate}Hz - this will cause timing issues!",
-                    info.Frequency, _sampleRate);
-            }
+                SampleRate, stream.RingBuffer.Length);
         }
     }
 
     public void StartPushStream(string streamId, int sampleRate, int channels, AudioParams audioParams)
     {
-        bool needsRecreate = false;
-        int newSampleRate = 0;
+        if (sampleRate != SampleRate)
+        {
+            throw new ArgumentException($"Push stream had sample rate of {sampleRate}, expected {SampleRate}");
+        }
 
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) return;
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
                 _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
-
-            // Check if sample rate changed - recreate master stream if needed
-            if (_sampleRate != sampleRate)
-            {
-                needsRecreate = true;
-                newSampleRate = sampleRate;
-            }
         }
 
-        if (needsRecreate)
-        {
-            StopMasterStream();
-            lock (_lock)
-            {
-                _sampleRate = newSampleRate;
-            }
-
-            StartMasterStream();
-        }
 
         lock (_lock)
         {
@@ -805,6 +767,11 @@ public class RadioPlayback : IDisposable
             stream.StopFileReader();
         }
 
+        if (!stream.IsPush && stream.BassMixerHandle != 0)
+        {
+            Bass.StreamFree(stream.BassMixerHandle);
+        }
+
         if (!stream.IsPush && stream.BassStreamHandle != 0)
         {
             Bass.StreamFree(stream.BassStreamHandle);
@@ -854,7 +821,7 @@ public class RadioPlayback : IDisposable
             freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
             {
-                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyKHz);
+                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, _channels, frequencyKHz);
 
                 var bandConfig = FastPathAudioSim.GetBandConfig(frequencyKHz);
 
@@ -988,7 +955,7 @@ public class RadioPlayback : IDisposable
             return length;
         };
 
-        _masterStream = Bass.CreateStream(_sampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
+        _masterStream = Bass.CreateStream(SampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
         if (_masterStream == 0) throw new Exception($"BASS error creating master stream: {Bass.LastError}");
         SetupDSPAndPlay();
     }
@@ -1279,7 +1246,7 @@ public class RadioPlayback : IDisposable
                             {
                                 // θ_k is the phasor that rotates around at each beat frequency k.
                                 double theta = 2.0f * Math.PI * beats[k] *
-                                    (double)(n + _sampleNum) / (double)_sampleRate;
+                                    (double)(n + _sampleNum) / (double)SampleRate;
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
                                 i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
@@ -1295,7 +1262,7 @@ public class RadioPlayback : IDisposable
                             // at their declaration.
                             double tau = _dspScratch[n] > freqConfig.AgcGain ?
                                 RadioConfig.AgcAttack : RadioConfig.AgcDecay;
-                            double alpha = 1 - Math.Exp(-1 / (_sampleRate * tau));
+                            double alpha = 1 - Math.Exp(-1 / (SampleRate * tau));
                             // Update the AGC:
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
 
@@ -1320,7 +1287,7 @@ public class RadioPlayback : IDisposable
                     // Nothing is transmitting except noise, decay AGC back to unity.
                     else
                     {
-                        var alpha = 1 - Math.Exp(-1 / (_sampleRate * RadioConfig.AgcDecay));
+                        var alpha = 1 - Math.Exp(-1 / (SampleRate * RadioConfig.AgcDecay));
                         for (int n = 0; n < samples; ++n)
                         {
                             double i = _dspScratch[n];
@@ -1574,7 +1541,7 @@ public class RadioPlayback : IDisposable
         if (!deviceInfo.IsInitialized)
         {
             // Initialize the new device
-            if (!Bass.Init(newDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+            if (!Bass.Init(newDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
             {
                 _logger.LogError($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
                 return;
