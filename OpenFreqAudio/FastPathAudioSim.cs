@@ -722,7 +722,7 @@ namespace OpenFreqAudio
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
 
-        public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm)
+        public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm = 0f)
         {
             var ap = new AudioParams
             {
