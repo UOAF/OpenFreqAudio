@@ -1070,8 +1070,17 @@ public class RadioPlayback : IDisposable
             int maxReady = samples;
             foreach (var stream in activeStreams.Where(s => s.IsTransmitting && !s.IsBuffering))
             {
-                var (c, _) = stream.GetRingBufferFillLevel();
-                maxReady = Math.Min(maxReady, c);
+                var (count, capacity) = stream.GetRingBufferFillLevel();
+    
+                // Ignore streams with critically low buffers (<10%)
+                // They're finishing transmission and shouldn't throttle other streams
+                float fillPercent = (float)count / capacity * 100f;
+                if (fillPercent < 10f)
+                {
+                    continue;  // Skip this stream - don't let it throttle others
+                }
+    
+                maxReady = Math.Min(maxReady, count);
             }
 
             if (maxReady > 0)
@@ -1312,13 +1321,27 @@ public class RadioPlayback : IDisposable
                 else
                 {
                     Array.Clear(_dspScratch, 0, samples);
-                    foreach (var t in transmittingStreams)
+    
+                    int numTransmitting = transmittingStreams.Count;
+                    if (numTransmitting > 0)
                     {
+                        // Mix all streams with proper normalization
+                        foreach (var t in transmittingStreams)
+                        {
+                            for (int i = 0; i < samples; ++i)
+                            {
+                                _dspScratch[i] += t.Buffer[i];
+                            }
+                        }
+        
+                        // Normalize by number of streams to prevent clipping
+                        float mixGain = 1.0f / (float)Math.Sqrt(numTransmitting);
                         for (int i = 0; i < samples; ++i)
                         {
-                            _dspScratch[i] += t.Buffer[i];
+                            _dspScratch[i] *= mixGain;
                         }
                     }
+    
                     // Set AGC back to unity so there's not sudden jumps
                     // when we turn FX back on.
                     _agcGain = 1;
@@ -1472,7 +1495,6 @@ public class RadioPlayback : IDisposable
 
     public void ChangeOutputDevice(int newDeviceIndex)
     {
-        _logger.LogError("Failed to initialize device {DeviceIndex}: {Error}", newDeviceIndex, Bass.LastError);
         bool hadMasterStream = false;
 
         lock (_lock)
