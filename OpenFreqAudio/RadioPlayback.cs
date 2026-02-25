@@ -1058,25 +1058,31 @@ public class RadioPlayback : IDisposable
                 var (c, _) = stream.GetRingBufferFillLevel();
                 maxReady = Math.Min(maxReady,c);
             }
-            samples = maxReady;
-            stereoOutputSamples = samples * 2;
-            Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
-
-            // 1: Process all streams (read from ring + apply effects)
-            foreach (var stream in activeStreams)
+            // But, if no samples are ready, nobody is talking.
+            // All streams will probably have IsTransmitting == false below,
+            // but we still want to decay the AGC, squelch, etc.
+            if (maxReady > 0)
             {
-                int framesRead = stream.ReadFromRing(stream.Buffer, samples);
-                if (framesRead == 0)
-                {
-                    Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-                    continue;
-                }
+                samples = maxReady;
+                stereoOutputSamples = samples * 2;
 
-                if (Apply3dEffects)
+                // 1: Process all streams (read from ring + apply effects)
+                foreach (var stream in activeStreams)
                 {
-                    stream.RadioEffect.Process(stream.Buffer, 0, samples);
+                    int framesRead = stream.ReadFromRing(stream.Buffer, samples);
+                    if (framesRead == 0)
+                    {
+                        Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
+                        continue;
+                    }
+
+                    if (Apply3dEffects)
+                    {
+                        stream.RadioEffect.Process(stream.Buffer, 0, samples);
+                    }
                 }
             }
+            Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
 
             // 2: Process each frequency (noise + squelch + mixing), AKA radio,
             //    which should have its own AGC, Squelch, etc.
