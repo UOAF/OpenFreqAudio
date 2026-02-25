@@ -310,7 +310,7 @@ public class RadioEffect
                 _filterState[stateBase + 3] = yn1; // y[n-2] = y[n-1]
                 _filterState[stateBase + 2] = y; // y[n-1] = y[n]
                 */
-                buffer[idx] = Math.Clamp(x, -1f, 1f);
+                buffer[idx] = Math.Clamp(x, -2f, 2f);
             }
 
             if (inDrop) _dropoutSamplesLeft--;

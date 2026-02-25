@@ -877,7 +877,15 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
-            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, 0f, 2f); // allow for some boost
+            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, -2f, 2f); // allow for some boost
+        }
+    }
+    
+    public float GetFrequencyVolume(int frequencyKHz)
+    {
+        lock (_lock)
+        {
+            return !_frequencies.TryGetValue(frequencyKHz, out var value) ? 0f : value.Volume;
         }
     }
 
@@ -994,7 +1002,10 @@ public class RadioPlayback : IDisposable
         _dspProc = (_, _, bufferPtr, length, _) =>
         {
             // Output is always stereo, so we can mix left & right ear outputs.
-            Debug.Assert(_channels == 2);
+            if (_channels != 2)
+            {
+                throw new ArgumentException("Only stereo playback supported");
+            }
             int stereoOutputSamples = length / sizeof(float);
             int samples = stereoOutputSamples / 2; 
 
@@ -1039,7 +1050,11 @@ public class RadioPlayback : IDisposable
             var streamsByFrequency = new Dictionary<int, List<RadioStream>>();
             foreach (var stream in activeStreams)
             {
-                Debug.Assert(stream.Channels == 1); // Mono, right?
+                if (stream.Channels != 1)
+                {
+                    throw new ArgumentException("Only mono streams supported");
+                }
+
                 int freq = stream.FrequencyKHz;
                 if (!streamsByFrequency.TryGetValue(freq, out var list))
                 {
@@ -1053,20 +1068,17 @@ public class RadioPlayback : IDisposable
             // Important: Don't process more samples than we can read from all streams
             //            (desync is very bad)
             int maxReady = samples;
-            foreach (var stream in activeStreams)
+            foreach (var stream in activeStreams.Where(s => s.IsTransmitting && !s.IsBuffering))
             {
                 var (c, _) = stream.GetRingBufferFillLevel();
-                maxReady = Math.Min(maxReady,c);
+                maxReady = Math.Min(maxReady, c);
             }
-            // But, if no samples are ready, nobody is talking.
-            // All streams will probably have IsTransmitting == false below,
-            // but we still want to decay the AGC, squelch, etc.
+
             if (maxReady > 0)
             {
                 samples = maxReady;
                 stereoOutputSamples = samples * 2;
 
-                // 1: Process all streams (read from ring + apply effects)
                 foreach (var stream in activeStreams)
                 {
                     int framesRead = stream.ReadFromRing(stream.Buffer, samples);
@@ -1339,7 +1351,7 @@ public class RadioPlayback : IDisposable
             // TODO: We could add peak limiting to prevent hard clipping.
             for (int i = 0; i < stereoOutputSamples; ++i)
             {
-                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i], -1, 1);
+                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i], -2f, 2f);
             }
 
             Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
