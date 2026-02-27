@@ -12,10 +12,13 @@
         Title="BMSAudioSim">
 
     <Grid RowDefinitions="1*,8*,3*">
-        <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="20" VerticalAlignment="Center">
+        <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
             <Button Click="OnLoadClicked">Load Heightmap</Button>
-            <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center" Grid.Column="1">No heightmap loaded</TextBlock>
-            <CheckBox Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
+            <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center">No heightmap loaded</TextBlock>
+            <CheckBox Margin="10,0,5,0" Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
+            <TextBlock VerticalAlignment="Center" Margin="10, 0, 0, 0">Sound Effect Type</TextBlock>
+            <ComboBox ItemsSource="{Binding AmbientNoiseTypes}" SelectedValue="{Binding AmbientNoiseType, Mode=TwoWay}" SelectionChanged="OnUpdateDownsampledAudio"/>
+            <CheckBox Margin="10,0,5,0" Content="Downsampled audio" IsCheckedChanged="OnUpdateDownsampledAudio" IsChecked="{Binding UseDownsampledAudio, Mode=TwoWay}"/>
         </StackPanel>
 
         <!-- Main Content: Heightmap and Graph side by side -->
@@ -190,7 +193,7 @@
                 <Slider Minimum="10" Maximum="50" Value="{Binding TxWatts}" ValueChanged="OnAltSliderChanged"/>
                 <StackPanel Orientation="Horizontal">
                     <RadioButton Name="RadioButtonUhf" IsChecked="True"
-                                 IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF"/>
+                                 IsCheckedChanged="OnUHFVHFChanged" Content="UHF"/>
                     <RadioButton Content="VHF" Margin="5,0"/>
                     <TextBlock VerticalAlignment="Center" Text="Freq " Margin="10,0,0,0"/>
                     <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}"/>

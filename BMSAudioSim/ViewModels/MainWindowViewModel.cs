@@ -1,4 +1,9 @@
-﻿namespace BMSAudioSim.ViewModels;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using OpenFreqAudio;
+
+namespace BMSAudioSim.ViewModels;
 
 using ReactiveUI;
 
@@ -20,6 +25,25 @@ public class MainWindowViewModel : ReactiveObject
     private bool _enable3dEffects = true;
     private float _ppm1 = 0;
     private float _ppm2 = 0;
+
+    private AmbientNoiseType _ambientNoiseType = AmbientNoiseType.None;
+    public IEnumerable<AmbientNoiseType> AmbientNoiseTypes { get; } =
+        Enum.GetValues(typeof(AmbientNoiseType))
+            .Cast<AmbientNoiseType>();
+
+    public AmbientNoiseType AmbientNoiseType
+    {
+        get => _ambientNoiseType;
+        set => this.RaiseAndSetIfChanged(ref _ambientNoiseType, value);
+    }
+
+    private bool _useDownsampledAudio = true;
+
+    public bool UseDownsampledAudio
+    {
+        get => _useDownsampledAudio;
+        set => this.RaiseAndSetIfChanged(ref _useDownsampledAudio, value);
+    }
 
     public float Squelch
     {

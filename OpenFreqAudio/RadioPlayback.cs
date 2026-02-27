@@ -56,6 +56,7 @@ public class RadioPlayback : IDisposable
 
         // Transmission state (separate from stream lifecycle)
         public bool IsTransmitting { get; set; }
+        public AmbientNoiseType AmbientNoise { get; set; } = AmbientNoiseType.None;
         public DateTime TransmissionStartTime { get; set; }
         public DateTime TransmissionEndTime { get; set; }
         public DateTime LastPacketReceived { get; set; } = DateTime.UtcNow;
@@ -402,8 +403,10 @@ public class RadioPlayback : IDisposable
         StartPeerTimeoutMonitoring();
     }
 
-    public void StartStream(string streamId, string filePath, AudioParams audioParams)
+    public void StartStream(string streamId, string filePath, AudioParams audioParams,
+        AmbientNoiseType ambientNoise = AmbientNoiseType.Air)
     {
+        _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
         int bassStream;
         ChannelInfo info;
         bool needsRecreate = false;
@@ -461,11 +464,13 @@ public class RadioPlayback : IDisposable
                 Channels = info.Channels,
                 IsPush = false,
                 RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams,
-                    _loggerFactory.CreateLogger<RadioEffect>()),
+                    _loggerFactory.CreateLogger<RadioEffect>())
+                    { AmbientNoise = ambientNoise },
                 RadioPreFilter = new RadioPreFilter(info.Frequency),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
-                IsTransmitting = true
+                IsTransmitting = true,
+                AmbientNoise = ambientNoise
             };
 
 
@@ -665,8 +670,11 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    // Accepts raw PCM bytes from WebRTC
-    public bool PushAudioData(string streamId, byte[] audioData, bool startMarker = false, bool endMarker = false)
+    // Accepts raw PCM bytes from WebRTC.
+    // ambientNoise describes the acoustic environment of the transmitting platform and
+    // is forwarded to RadioEffect so the correct SFX layer is applied post-demodulation.
+    public bool PushAudioData(string streamId, byte[] audioData, bool startMarker = false, bool endMarker = false,
+        AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
         lock (_lock)
         {
@@ -684,6 +692,14 @@ public class RadioPlayback : IDisposable
 
             // Update packet receipt timestamp for timeout detection
             stream.LastPacketReceived = DateTime.UtcNow;
+
+            // Propagate ambient noise type to the effect processor so the correct
+            // SFX layer (Air / Ground / Stationary) is applied per packet.
+            if (stream.AmbientNoise != ambientNoise)
+            {
+                stream.AmbientNoise = ambientNoise;
+                stream.RadioEffect.AmbientNoise = ambientNoise;
+            }
 
             // Detect implicit transmission start:
             // 1. First audio ever (stream just created)
