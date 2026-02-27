@@ -325,6 +325,7 @@ public class RadioPlayback : IDisposable
 
     private const int MaxBufferSize = 24576;
     private float[] _dspScratch = new float[MaxBufferSize];
+    private float[] _dspScratch2 = new float[MaxBufferSize];
     private float[] _stereoBuffer = new float[MaxBufferSize * 2];
 
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
@@ -1023,6 +1024,7 @@ public class RadioPlayback : IDisposable
                 lock (_lock)
                 {
                     _dspScratch = new float[samples];
+                    _dspScratch2 = new float[samples];
                     _stereoBuffer = new float[stereoOutputSamples];
                 }
             }
@@ -1145,6 +1147,12 @@ public class RadioPlayback : IDisposable
                     // The question is just "how loud compared to the signal?"
                     // (What's the SNR?)
                     freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch, 0, samples, 1.0f);
+                    // We need random I *and* Q values - if we use
+                    // I_noise[n] = Q_noise[n] = -dspScrach[n],
+                    // we wouldn't have random noise,
+                    // we'd have a single signal with a fixed phase (45 deg).
+                    // TODO: Generate this each sample instead of filling buffers of noise?
+                    freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch2, 0, samples, 1.0f);
 
                     if (transmittingStreams.Count > 0)
                     {
@@ -1237,8 +1245,9 @@ public class RadioPlayback : IDisposable
                         // Calculate E[n] for each sample n.
                         for (int n = 0; n < samples; ++n)
                         {
-                            double i = 0;
-                            double q = 0;
+                            // Start with our noise.
+                            double i = _dspScratch[n];
+                            double q = _dspScratch2[n];
                             // Real aircraft radios don't have 100% modulation.
                             // A bunch of the standards are paywalled, but those I've found
                             // suggest minimum specs are 85% modulation, with 90-95% being common.
@@ -1258,8 +1267,8 @@ public class RadioPlayback : IDisposable
                                     Math.Sin(theta);
                             }
 
-                            // Add the envelope to the noise.
-                            _dspScratch[n] += (float)Math.Sqrt(i * i + q * q);
+                            // Take the envelope.
+                            _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             // AGC time: are we attacking or decaying?
                             // See a discussion of the given time constants _agcAttack and _agcDecay
                             // at their declaration.
@@ -1292,6 +1301,9 @@ public class RadioPlayback : IDisposable
                         var alpha = 1 - Math.Exp(-1 / (_sampleRate * _agcDecay));
                         for (int n = 0; n < samples; ++n)
                         {
+                            double i = _dspScratch[n];
+                            double q = _dspScratch2[n];
+                            _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             _agcGain = alpha * _dspScratch[n] + (1 - alpha) * _agcGain;
                             // See above.
                             if (_agcGain >= squelchThreshold)
