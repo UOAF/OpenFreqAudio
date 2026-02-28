@@ -29,7 +29,6 @@ public class RadioPlayback : IDisposable
         public int Channels { get; set; } // 1=mono,2=stereo
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
         public required RadioEffect RadioEffect { get; set; }
-        public required RadioPreFilter RadioPreFilter { get; set; }
         public required AudioParams CurrentParams { get; set; }
 
         // For decoded or pulled audio we reuse Buffer as a temporary buffer
@@ -466,7 +465,6 @@ public class RadioPlayback : IDisposable
                 RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams,
                     _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
-                RadioPreFilter = new RadioPreFilter(info.Frequency),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
                 IsTransmitting = true,
@@ -647,7 +645,6 @@ public class RadioPlayback : IDisposable
                 IsPush = true,
                 RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
                     _loggerFactory.CreateLogger<RadioEffect>()),
-                RadioPreFilter = new RadioPreFilter(sampleRate),
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
             };
