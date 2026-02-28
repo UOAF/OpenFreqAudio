@@ -404,7 +404,7 @@ public class RadioPlayback : IDisposable
     }
 
     public void StartStream(string streamId, string filePath, AudioParams audioParams,
-        AmbientNoiseType ambientNoise = AmbientNoiseType.Air)
+        AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
         _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
         int bassStream;
