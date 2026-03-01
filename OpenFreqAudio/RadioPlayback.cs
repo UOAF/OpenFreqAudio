@@ -283,10 +283,17 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    public class FrequencyConfig
+    /// <summary>
+    /// Represents the parameters of an individual radio.
+    /// Some clients (e.g. GCI) will have many.
+    /// </summary>
+    public class RadioConfig
     {
         // ReSharper disable UnusedAutoPropertyAccessor.Local
         public float Volume { get; set; } = 1.0f;
+        /// <summary>
+        /// Which ears should this radino play into?
+        /// </summary>
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
@@ -313,7 +320,8 @@ public class RadioPlayback : IDisposable
     private readonly Dictionary<string, RadioStream> _streams = new();
 
     // Frequencies we are tuned to
-    private readonly Dictionary<int, FrequencyConfig> _frequencies = new();
+    // TODO: Lots of our logic below assumes only one radio is tuned to a given frequency.
+    private readonly Dictionary<int, RadioConfig> _frequencies = new();
 
     // Frequencies were we are currently transmitting and which are therefore muted
     private readonly HashSet<int> _transmittingFrequencies = new();
@@ -415,7 +423,7 @@ public class RadioPlayback : IDisposable
         {
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
-                _frequencies[audioParams.RadioFrequencyKHz] = new FrequencyConfig();
+                _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
 
             // Create BASS decode stream (float)
             bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
@@ -613,7 +621,7 @@ public class RadioPlayback : IDisposable
         {
             if (_streams.ContainsKey(streamId)) return;
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
-                _frequencies[audioParams.RadioFrequencyKHz] = new FrequencyConfig();
+                _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
 
             // Check if sample rate changed - recreate master stream if needed
             if (_sampleRate != sampleRate)
@@ -839,7 +847,7 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new FrequencyConfig();
+                _frequencies[frequencyKHz] = new RadioConfig();
 
             var freqConfig = _frequencies[frequencyKHz];
 
@@ -877,7 +885,7 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new FrequencyConfig();
+                _frequencies[frequencyKHz] = new RadioConfig();
 
             _frequencies[frequencyKHz].SquelchLevel = squelchLevel;
         }
@@ -898,7 +906,7 @@ public class RadioPlayback : IDisposable
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new FrequencyConfig();
+            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new RadioConfig();
             _frequencies[frequencyKHz].Volume = Math.Clamp(volume, -2f, 2f); // allow for some boost
         }
     }
@@ -916,7 +924,7 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new FrequencyConfig();
+                _frequencies[frequencyKHz] = new RadioConfig();
             _frequencies[frequencyKHz].AudioChannel = channel;
         }
     }
@@ -1044,7 +1052,7 @@ public class RadioPlayback : IDisposable
 
             // Snapshot state for UI consumption
             List<RadioStream> activeStreams;
-            Dictionary<int, FrequencyConfig> frequencySnapshot;
+            Dictionary<int, RadioConfig> frequencySnapshot;
             HashSet<int>? transmittingFrequencies = null;
             lock (_lock)
             {
@@ -1064,7 +1072,7 @@ public class RadioPlayback : IDisposable
                     activeStreams = _streams.Values.ToList();
                 }
 
-                frequencySnapshot = new Dictionary<int, FrequencyConfig>(_frequencies);
+                frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
             }
 
             // Pre-group streams by frequency

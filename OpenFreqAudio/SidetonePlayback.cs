@@ -31,7 +31,7 @@ public class SidetonePlayback : IDisposable
     private readonly Dictionary<string, SidetoneStream> _streams = new();
 
     // Reference to frequency configs (shared with main RadioPlayback)
-    private readonly Func<int, RadioPlayback.FrequencyConfig?> _getFrequencyConfig;
+    private readonly Func<int, RadioPlayback.RadioConfig?> _getFrequencyConfig;
 
     /// <summary>
     /// Individual sidetone stream
@@ -258,7 +258,7 @@ public class SidetonePlayback : IDisposable
         ILogger<SidetonePlayback> logger,
         int sampleRate,
         int channels,
-        Func<int, RadioPlayback.FrequencyConfig?> getFrequencyConfig,
+        Func<int, RadioPlayback.RadioConfig?> getFrequencyConfig,
         int deviceIndex = -1)
     {
         _logger = logger;
