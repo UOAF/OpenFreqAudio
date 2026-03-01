@@ -32,7 +32,7 @@ public class RadioPlayback : IDisposable
         public required AudioParams CurrentParams { get; set; }
         public float BeatDriftHz;        // current instantaneous drift (Hz)
         public float BeatDriftVelocity;  // rate of change
-        public int BeatDriftUpdateCounter;
+        public double BeatPhase;  // accumulate phase to avoid popping when drifting
 
         // For decoded or pulled audio we reuse Buffer as a temporary buffer
         public float[] Buffer { get; set; } = new float[8192];
@@ -1234,6 +1234,7 @@ public class RadioPlayback : IDisposable
                         var numStreams = transmittingStreams.Count;
                         var relativePowers = new List<float>(numStreams);
                         var beats = new List<float>(numStreams);
+                        var phaseIncrements = new double[numStreams];
                         // LO is the receiver's tuned channel, freq is kvp.Key
                         float zeroFreq = freq * 1e3f;  // receiver's nominal tuning frequency
                         for (int i = 0; i < numStreams; ++i)
@@ -1244,24 +1245,29 @@ public class RadioPlayback : IDisposable
                             // and the rest are some fraction of that.
                             // See the comment about squelch - we could replace this with an actual ramp up and down.
                             relativePowers.Add((float)thisSnrLinear);
-                            if (i == 0)
-                            {
-                                beats.Add(0);
-                            }
-                            else
-                            {
-                                var thisFreq = (float)transmittingStreams[i].CurrentParams.RadioFrequencyKHz * 1e3f;
-                                thisFreq += thisFreq * transmittingStreams[i].CurrentParams.TuneOffsetPPM * 1e-6f;
-                                beats.Add(Math.Abs(thisFreq - zeroFreq));
-                            }
+
+                            var thisFreq = (float)transmittingStreams[i].CurrentParams.RadioFrequencyKHz * 1e3f;
+                            thisFreq += thisFreq * transmittingStreams[i].CurrentParams.TuneOffsetPPM * 1e-6f;
+                            beats.Add(Math.Abs(thisFreq - zeroFreq));
+                            
+                            transmittingStreams[i].BeatDriftVelocity += (float)(Random.Shared.NextDouble() - 0.5) * 0.4f;
+                            transmittingStreams[i].BeatDriftVelocity *= 0.6f;
+                            transmittingStreams[i].BeatDriftHz += transmittingStreams[i].BeatDriftVelocity;
+                            transmittingStreams[i].BeatDriftHz = Math.Clamp(transmittingStreams[i].BeatDriftHz, -15f, 15f);
+                            phaseIncrements[i] = 2.0 * Math.PI * (beats[i] + transmittingStreams[i].BeatDriftHz) / _sampleRate;
                         }
+                        
+                        // Find the dominant signal power to normalize noise against
+                        float maxPower = relativePowers.Count > 0 ? relativePowers.Max() : 1f;
+                        float noiseScale = maxPower / (float)Math.Pow(10, transmittingStreams[0].CurrentParams.ReceivedSnrDb / 20.0);
+
 
                         // Calculate E[n] for each sample n.
                         for (int n = 0; n < samples; ++n)
                         {
                             // Start with our noise.
-                            double i = _dspScratch[n];
-                            double q = _dspScratch2[n];
+                            double i = _dspScratch[n] * noiseScale;
+                            double q = _dspScratch2[n] * noiseScale;;
                             // Real aircraft radios don't have 100% modulation.
                             // A bunch of the standards are paywalled, but those I've found
                             // suggest minimum specs are 85% modulation, with 90-95% being common.
@@ -1270,21 +1276,10 @@ public class RadioPlayback : IDisposable
                             const double modIndex = 0.9;
                             for (int k = 0; k < numStreams; ++k)
                             {
-                                // Phase noise: random walk with restoring force
-                                if (++transmittingStreams[k].BeatDriftUpdateCounter >= 100)
-                                {
-                                    transmittingStreams[k].BeatDriftUpdateCounter = 0;
-                                    // Drifts +/- 8 Hz, mean-reverts slowly
-                                    transmittingStreams[k].BeatDriftVelocity += (float)(Random.Shared.NextDouble() - 0.5) * 0.4f;
-                                    transmittingStreams[k].BeatDriftVelocity *= 0.97f; // damping
-                                    transmittingStreams[k].BeatDriftHz += transmittingStreams[k].BeatDriftVelocity;
-                                    transmittingStreams[k].BeatDriftHz = Math.Clamp(transmittingStreams[k].BeatDriftHz, -15f, 15f);
-                                }
+                                transmittingStreams[k].BeatPhase += phaseIncrements[k];
                                 
                                 // θ_k is the phasor that rotates around at each beat frequency k.
-                                double effectiveBeat = beats[k] + transmittingStreams[k].BeatDriftHz;
-                                double theta = 2.0 * Math.PI * effectiveBeat *
-                                    (n + _sampleNum) / (double)_sampleRate;
+                                double theta = transmittingStreams[k].BeatPhase;
                                 
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
@@ -1293,6 +1288,8 @@ public class RadioPlayback : IDisposable
                                 q += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
                                     Math.Sin(theta);
                             }
+                            for (int k = 0; k < numStreams; ++k)
+                                transmittingStreams[k].BeatPhase %= 2.0 * Math.PI;
 
                             // Take the envelope.
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);

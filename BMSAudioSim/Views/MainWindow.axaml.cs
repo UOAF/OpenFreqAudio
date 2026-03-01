@@ -1114,9 +1114,12 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnPpmSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        if (sender == Ppm1Slider)
+        var slider = sender as Slider;
+        
+        if (slider != null && slider.Equals(Ppm1Slider))
             ViewModel.Ppm1 = (float)e.NewValue;
-        else
+        
+        else if (slider != null && slider.Equals(Ppm2Slider))
             ViewModel.Ppm2 = (float)e.NewValue;
         UpdateParameters();
     }
