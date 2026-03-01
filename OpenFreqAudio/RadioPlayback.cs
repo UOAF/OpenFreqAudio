@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +13,46 @@ using Microsoft.Extensions.Logging;
 // ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio;
+
+/// <summary>
+/// A Direct Form II Transposed biquad filter,
+/// used to high-pass output.
+/// (Radios pass ~300+ Hz)
+/// </summary>
+/// <see cref="https://en.wikipedia.org/wiki/Digital_biquad_filter#Direct_form_2"/>
+class Biquad
+{
+    private float B0;
+    private float B1;
+    private float B2;
+    // A0 is always 1
+    private float A1;
+    private float A2;
+
+    // Delays
+    private float D1 = 0;
+    private float D2 = 0;
+
+    public Biquad(float b0, float b1, float b2, float a1, float a2)
+    {
+        B0 = b0;
+        B1 = b1;
+        B2 = b2;
+        A1 = a1;
+        A2 = a2;
+    }
+
+    public float Apply(float x)
+    {
+        // y[n] = b0 * x[n] + d1
+        // d1 = b1 * x[n] - a1 * y[n] + d2
+        // d2 = b2 * x[n] - a2 * y[n]
+        float y = B0 * x + D1;
+        D1 = B1 * x - A1 * y + D2;
+        D2 = B2 * x - A2 * y;
+        return y;
+    }
+}
 
 /// <summary>
 /// RadioPlayback
@@ -307,6 +348,8 @@ public class RadioPlayback : IDisposable
 
         public bool WasSquelchOpen { get; set; }
 
+        public Func<float, float> HighPass { get; } = MakeHighPass();
+
         // AGC gain; varies as a low-pass of the received signal
         // according to attack and decay params below.
         public double AgcGain { get; set; } = 0;
@@ -375,6 +418,102 @@ public class RadioPlayback : IDisposable
     private int _masterDspProcHandle;
 
     public bool Apply3dEffects { get; set; }
+
+    /// <summary>
+    /// Creates a 6th-order Butterworth high-pass filter.
+    /// </summary>
+    /// <remarks>
+    /// Each biquad gives us ~20dB per decade, so a single one has a very gradual dropoff,
+    /// but three is a good compromise - if our cutoff is 300Hz,
+    /// at 200Hz we have -60dB of attenuation.
+    /// </remarks>
+    /// <returns>A lambda that contains the filter state and applies it each call.</returns>
+    private static Func<float, float> MakeHighPass(double cutoff = 300, double sampleRate = SampleRate)
+    {
+        double t = 1.0 / sampleRate;
+        double k = 2.0 / t;
+        double wc = k * Math.Tan(Math.PI * cutoff / sampleRate);
+
+        // 6th-order Butterworth pole angles:
+        // For order n, prototype poles are at angles θ_k = π·(2k + n + 1) / (2n)
+        // for k = 0..n-1 on the unit circle in the s-plane.
+        //
+        // For n=6, the 6 poles are at angles:
+        //   θ = π·(2k+7)/12  for k = 0..5
+        //     = 7π/12, 9π/12, 11π/12, 13π/12, 15π/12, 17π/12
+        //
+        // Conjugate pairs (sharing the same real part):
+        //   Pair 0: k=0,5 → θ = 7π/12, 17π/12  → real part = cos(7π/12)
+        //   Pair 1: k=1,4 → θ = 9π/12, 15π/12  → real part = cos(9π/12)
+        //   Pair 2: k=2,3 → θ = 11π/12, 13π/12 → real part = cos(11π/12)
+        //
+        // Each conjugate pair (σ ± jω) gives a 2nd order section:
+        //   s² + 2|σ|·s + 1  in the normalized prototype
+        //
+        // The coefficient 2|σ| = 2·cos(π·(2k+1)/(2n)) for the kth pair.
+        int n = 6;
+        double k2 = k * k;
+        double wc2 = wc * wc;
+        double overallGain = 1;
+
+        List<(double, double)> pairs = [];
+        for (int pair = 0; pair < n / 2; ++pair)
+        {
+            // Angle of the pole in the upper half-plane
+            double theta = Math.PI * (2 * pair + n + 1) / (2 * n);
+
+            // Prototype 2nd order denominator: s² + alpha·s + 1
+            // where alpha = -2·cos(theta) = 2·|real part|
+            double alpha = -2.0 * Math.Cos(theta);
+
+            // Low to high-pass transform and bilinear transform
+            double aKwc = alpha * k * wc;
+
+            double d0 = k2 + aKwc + wc2;
+            double d1 = -2.0 * k2 + 2.0 * wc2;
+            double d2 = k2 - aKwc + wc2;
+
+            // Normalize coefficients (a0 = 1);
+            double a1 = d1 / d0;
+            double a2 = d2 / d0;
+
+            // Accumulate this section's gain: K²/d0
+            // All zeros are at z=1 (DC), so b is proportional to [1, -2, 1]
+            overallGain *= k2 / d0;
+
+            pairs.Add((a1, a2));
+        }
+
+        // Assemble biquad coefficients
+        // Standard convention: b = [1, -2, 1] for all sections except the first,
+        // which absorbs the overall gain. Sections ordered low-Q to high-Q.
+        pairs.Reverse();
+
+        List<Biquad> biquads = [];
+        for (int i = 0; i < pairs.Count; ++i)
+        {
+            var (a1, a2) = pairs[i];
+            if (i == 0)
+            {
+                float og = (float)overallGain;
+                // First section carries the overall gain
+                biquads.Add(new Biquad(og, -2.0f * og, og, (float)a1, (float)a2));
+            }
+            else
+            {
+                biquads.Add(new Biquad(1.0f, -2.0f, 1.0f, (float)a1, (float)a2));
+            }
+        }
+
+        return x =>
+        {
+            foreach (var b in biquads)
+            {
+                x = b.Apply(x);
+            }
+            return x;
+        };
+    }
 
     public RadioPlayback(ILoggerFactory loggerFactory, int playbackDeviceIndex = -1)
     {
@@ -1266,6 +1405,9 @@ public class RadioPlayback : IDisposable
                             // Update the AGC:
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
 
+                            // High-pass the signal, which removes the DC component and centers us around 0
+                            _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
+
                             // Squelch is driven by the AGC gain.
                             // When it starts attenuating, we know we hear something.
                             // NB: Handle squelch per sample!
@@ -1275,7 +1417,7 @@ public class RadioPlayback : IDisposable
                                 // Apply AGC, then remove our DC component, i.e.,
                                 // shift our envelope from [0, 2] back to [-1, 1].
                                 // Real electronics would use some high-pass filter that notches out 0 Hz.
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
                                 squelchOpened = true;
                             }
                             else
@@ -1294,10 +1436,13 @@ public class RadioPlayback : IDisposable
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+
+                            _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
+
                             // See above.
                             if (freqConfig.AgcGain >= squelchThreshold)
                             {
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
                                 squelchOpened = true;
                             }
                             else
