@@ -543,7 +543,9 @@ namespace OpenFreqAudio
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool txAltitudeIsMSL = false,
-            bool rxAltitudeIsMSL = false)
+            bool rxAltitudeIsMSL = false,
+            (double x, double y, double z)? txVelocity = null,
+            (double x, double y, double z)? rxVelocity = null)
         {
             var ap = GetDefaultAudioParams(frequencyKhz, ppm);
             if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
@@ -770,6 +772,25 @@ namespace OpenFreqAudio
             // twoRayDb < 0: destructive null. Applied before terrain degradation so that
             // over-sea paths already in a null correctly accumulate terrain loss on top.
             ap.ReceivedDb += (float)twoRayDb;
+            
+            // === APPLY TWP-SIDED DOPPLER ===
+            if (txVelocity.HasValue && rxVelocity.HasValue)
+            {
+                double ux = dx / dist, uy = dy / dist, uz = dz / dist;
+
+                // Positive = moving toward receiver, negative = moving away
+                var (tvx, tvy, tvz) = txVelocity.Value;
+                var (rvx, rvy, rvz) = rxVelocity.Value;
+                double txRadial = tvx * ux + tvy * uy + tvz * uz;
+                double rxRadial = rvx * ux + rvy * uy + rvz * uz;
+                
+                // Just be sure to clamp txRadial in case we get weird speed vectors due to BMS lag
+                txRadial = Math.Clamp(txRadial, -10000.0, 10000.0); // max ~Mach 29
+
+                double fReceived = freqHz * (SpeedOfLight + rxRadial) / (SpeedOfLight - txRadial);
+                double shiftPpm = (fReceived - freqHz) / freqHz * 1e6;
+                ap.TuneOffsetPPM = (float)shiftPpm;
+            }
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
             ap.ReceivedDb -= (float)ApplyTerrainDegradation(fresnelClearance, diffLoss, bandConfig);
