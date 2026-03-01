@@ -30,6 +30,9 @@ public class RadioPlayback : IDisposable
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
         public required RadioEffect RadioEffect { get; set; }
         public required AudioParams CurrentParams { get; set; }
+        public float BeatDriftHz;        // current instantaneous drift (Hz)
+        public float BeatDriftVelocity;  // rate of change
+        public int BeatDriftUpdateCounter;
 
         // For decoded or pulled audio we reuse Buffer as a temporary buffer
         public float[] Buffer { get; set; } = new float[8192];
@@ -1231,10 +1234,8 @@ public class RadioPlayback : IDisposable
                         var numStreams = transmittingStreams.Count;
                         var relativePowers = new List<float>(numStreams);
                         var beats = new List<float>(numStreams);
-                        // We can make any of the frequencies "0" and calculate beats off of it.
-                        // Just pick the first transmitter in the list.
-                        float zeroFreq = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
-                        zeroFreq += zeroFreq * transmittingStreams[0].CurrentParams.TuneOffsetPPM * 1e-6f;
+                        // LO is the receiver's tuned channel, freq is kvp.Key
+                        float zeroFreq = freq * 1e3f;  // receiver's nominal tuning frequency
                         for (int i = 0; i < numStreams; ++i)
                         {
                             // We need to convert from dB to linear power when weighing the signals.
@@ -1269,9 +1270,22 @@ public class RadioPlayback : IDisposable
                             const double modIndex = 0.9;
                             for (int k = 0; k < numStreams; ++k)
                             {
+                                // Phase noise: random walk with restoring force
+                                if (++transmittingStreams[k].BeatDriftUpdateCounter >= 100)
+                                {
+                                    transmittingStreams[k].BeatDriftUpdateCounter = 0;
+                                    // Drifts +/- 8 Hz, mean-reverts slowly
+                                    transmittingStreams[k].BeatDriftVelocity += (float)(Random.Shared.NextDouble() - 0.5) * 0.4f;
+                                    transmittingStreams[k].BeatDriftVelocity *= 0.97f; // damping
+                                    transmittingStreams[k].BeatDriftHz += transmittingStreams[k].BeatDriftVelocity;
+                                    transmittingStreams[k].BeatDriftHz = Math.Clamp(transmittingStreams[k].BeatDriftHz, -15f, 15f);
+                                }
+                                
                                 // θ_k is the phasor that rotates around at each beat frequency k.
-                                double theta = 2.0f * Math.PI * beats[k] *
-                                    (double)(n + _sampleNum) / (double)_sampleRate;
+                                double effectiveBeat = beats[k] + transmittingStreams[k].BeatDriftHz;
+                                double theta = 2.0 * Math.PI * effectiveBeat *
+                                    (n + _sampleNum) / (double)_sampleRate;
+                                
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
                                 i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *

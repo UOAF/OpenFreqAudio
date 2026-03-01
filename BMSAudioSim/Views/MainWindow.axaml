@@ -26,7 +26,7 @@
             <!-- Left: Heightmap Image -->
             <Border Grid.Column="0" Margin="0,0,5,0" BorderBrush="Gray" BorderThickness="1">
                 <Grid RowDefinitions="Auto,*">
-                    <TextBlock Text="Click: Sender 1 → Sender 2 → Receiver"
+                    <TextBlock Text="Click: place S1→S2→RX  |  Drag markers or velocity handles"
                                HorizontalAlignment="Left"
                                VerticalAlignment="Top"
                                Margin="10"
@@ -44,23 +44,25 @@
                                     VerticalAlignment="Stretch" HorizontalAlignment="Stretch"
                                     ZoomChanged="ZoomBorder_OnZoomChanged">
                             <Grid>
-                                <!-- Heightmap image -->
+                                <!-- Heightmap image – no pointer handler here; canvas handles everything -->
                                 <Image x:Name="HeightmapImage"
                                        Stretch="Uniform"
-                                       PointerPressed="OnImagePointerPressed"
                                        RenderOptions.BitmapInterpolationMode="HighQuality"
                                        HorizontalAlignment="Stretch"
                                        VerticalAlignment="Stretch" />
 
-                                <!-- Canvas for drawing position markers - must not block clicks -->
+                                <!-- Canvas for markers + velocity vectors.
+                                     IsHitTestVisible="True" so we can drag things on it.
+                                     Clicks that don't hit a marker fall through to the image underneath
+                                     via our manual hit-test logic in code-behind. -->
                                 <Canvas x:Name="MarkerCanvas"
                                         Background="Transparent"
-                                        IsHitTestVisible="False"
+                                        IsHitTestVisible="True"
                                         HorizontalAlignment="Stretch"
-                                        VerticalAlignment="Stretch" />
-
-                                <!-- Instructions overlay -->
-
+                                        VerticalAlignment="Stretch"
+                                        PointerPressed="OnCanvasPointerPressed"
+                                        PointerMoved="OnCanvasPointerMoved"
+                                        PointerReleased="OnCanvasPointerReleased" />
                             </Grid>
                         </ZoomBorder>
                     </ScrollViewer>
@@ -123,6 +125,12 @@
             <StackPanel Grid.Column="0" Margin="5">
                 <TextBlock Text="Sender 1:" FontWeight="Bold" Foreground="LimeGreen"/>
                 <TextBlock Name="Sender1PosText" Text="Not set" />
+                <TextBlock Name="Sender1VelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
+                <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
+                    <Button Name="PlayButton1" Content="▶ Simulate" Click="OnPlay1Clicked"
+                            Background="#33AAFFAA" Foreground="LimeGreen"
+                            Padding="6,2" FontSize="11"/>
+                </StackPanel>
                 <StackPanel Orientation="Horizontal" Spacing="5">
                     <TextBlock Text="Signal 1 Playback" VerticalAlignment="Center" Width="120"/>
                     <RadioButton GroupName="Signal1Playback" Content="Continuous" IsChecked="{Binding Signal1Continuous}"/>
@@ -153,6 +161,12 @@
             <StackPanel Grid.Column="1" Margin="5">
                 <TextBlock Text="Sender 2:" FontWeight="Bold" Foreground="DodgerBlue"/>
                 <TextBlock Name="Sender2PosText" Text="Not set" />
+                <TextBlock Name="Sender2VelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
+                <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
+                    <Button Name="PlayButton2" Content="▶ Simulate" Click="OnPlay2Clicked"
+                            Background="#3366AAFF" Foreground="DodgerBlue"
+                            Padding="6,2" FontSize="11"/>
+                </StackPanel>
                 <StackPanel Orientation="Horizontal" Spacing="5">
                     <TextBlock Text="Signal 2 Playback" VerticalAlignment="Center" Width="120"/>
                     <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
@@ -183,6 +197,12 @@
             <StackPanel Grid.Column="2" Margin="5">
                 <TextBlock Text="Receiver:" FontWeight="Bold" Foreground="Red"/>
                 <TextBlock Name="ReceiverPosText" Text="Not set" />
+                <TextBlock Name="ReceiverVelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
+                <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
+                    <Button Name="PlayButtonReceiver" Content="▶ Simulate" Click="OnPlayReceiverClicked"
+                            Background="#33FF6666" Foreground="OrangeRed"
+                            Padding="6,2" FontSize="11"/>
+                </StackPanel>
                 <TextBlock Text="{Binding RxDbm, StringFormat='{}{0} dBm'}"/>
                 <Slider Minimum="-110" Maximum="-50" Value="{Binding RxDbm}" ValueChanged="OnAltSliderChanged"/>
             </StackPanel>

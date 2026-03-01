@@ -789,7 +789,7 @@ namespace OpenFreqAudio
 
                 double fReceived = freqHz * (SpeedOfLight + rxRadial) / (SpeedOfLight - txRadial);
                 double shiftPpm = (fReceived - freqHz) / freqHz * 1e6;
-                ap.TuneOffsetPPM = (float)shiftPpm;
+                ap.TuneOffsetPPM += (float)shiftPpm;
             }
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
