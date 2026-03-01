@@ -304,6 +304,24 @@ public class RadioPlayback : IDisposable
         // ReSharper restore UnusedAutoPropertyAccessor.Local
 
         public bool WasSquelchOpen { get; set; }
+
+        // AGC gain; varies as a low-pass of the received signal
+        // according to attack and decay params below.
+        public double AgcGain { get; set; } = 0;
+
+        // AGC attack and decay are exponential functions -
+        // for a time constant tau, if Fs is our sample rate,
+        // AGC ramps down each sample at e^(-1/tau * Fs).
+        // This means we ramp about 95% of the way in 3 tau,
+        // 99% of the way in 4.6 tau, etc.
+        // See: https://en.wikipedia.org/wiki/RC_circuit
+        //
+        // Radio specifications I found suggest AGC should attack
+        // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms.
+        // So we should pick time constants about a third of those values
+        // to get the intended effect. (Feel free to tune these by ear!)
+        public const double AgcAttack = 0.003f / 3;
+        public const double AgcDecay = 0.1f / 3;
     }
 
     public enum AudioChannel
@@ -338,24 +356,6 @@ public class RadioPlayback : IDisposable
 
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
     private int _sampleNum = 0;
-
-    // AGC gain; varies as a low-pass of the received signal
-    // according to attack and decay params below.
-    private double _agcGain = 1;
-
-    // AGC attack and decay are exponential functions -
-    // for a time constant tau, if Fs is our sample rate,
-    // AGC ramps down each sample at e^(-1/tau * Fs).
-    // This means we ramp about 95% of the way in 3 tau,
-    // 99% of the way in 4.6 tau, etc.
-    // See: https://en.wikipedia.org/wiki/RC_circuit
-    //
-    // Radio specifications I found suggest AGC should attack
-    // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms.
-    // So we should pick time constants about a third of those values
-    // to get the intended effect. (Feel free to tune these by ear!)
-    private const double _agcAttack = 0.003f / 3;
-    private const double _agcDecay = 0.1f / 3;
 
     private int _sampleRate = 48000;
 
@@ -1293,21 +1293,22 @@ public class RadioPlayback : IDisposable
                             // AGC time: are we attacking or decaying?
                             // See a discussion of the given time constants _agcAttack and _agcDecay
                             // at their declaration.
-                            double tau = _dspScratch[n] > _agcGain ? _agcAttack : _agcDecay;
+                            double tau = _dspScratch[n] > freqConfig.AgcGain ?
+                                RadioConfig.AgcAttack : RadioConfig.AgcDecay;
                             double alpha = 1 - Math.Exp(-1 / (_sampleRate * tau));
                             // Update the AGC:
-                            _agcGain = alpha * _dspScratch[n] + (1 - alpha) * _agcGain;
+                            freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
 
                             // Squelch is driven by the AGC gain.
                             // When it starts attenuating, we know we hear something.
                             // NB: Handle squelch per sample!
                             // We don't want to squelch every sample here (or not!) based on the final AGC value.
-                            if (_agcGain >= squelchThreshold)
+                            if (freqConfig.AgcGain >= squelchThreshold)
                             {
                                 // Apply AGC, then remove our DC component, i.e.,
                                 // shift our envelope from [0, 2] back to [-1, 1].
                                 // Real electronics would use some high-pass filter that notches out 0 Hz.
-                                _dspScratch[n] = _dspScratch[n] / (float)_agcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
                                 squelchOpened = true;
                             }
                             else
@@ -1319,17 +1320,17 @@ public class RadioPlayback : IDisposable
                     // Nothing is transmitting except noise, decay AGC back to unity.
                     else
                     {
-                        var alpha = 1 - Math.Exp(-1 / (_sampleRate * _agcDecay));
+                        var alpha = 1 - Math.Exp(-1 / (_sampleRate * RadioConfig.AgcDecay));
                         for (int n = 0; n < samples; ++n)
                         {
                             double i = _dspScratch[n];
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                            _agcGain = alpha * _dspScratch[n] + (1 - alpha) * _agcGain;
+                            freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
                             // See above.
-                            if (_agcGain >= squelchThreshold)
+                            if (freqConfig.AgcGain >= squelchThreshold)
                             {
-                                _dspScratch[n] = _dspScratch[n] / (float)_agcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
                                 squelchOpened = true;
                             }
                             else
@@ -1375,7 +1376,7 @@ public class RadioPlayback : IDisposable
 #if DEBUG
                         _logger.LogDebug(
                             "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                            squelchOpened ? "OPEN" : "CLOSED", freq, _agcGain);
+                            squelchOpened ? "OPEN" : "CLOSED", freq, freqConfig.AgcGain);
 #endif
 
                         freqConfig.WasSquelchOpen = squelchOpened;
@@ -1408,7 +1409,7 @@ public class RadioPlayback : IDisposable
     
                     // Set AGC back to unity so there's not sudden jumps
                     // when we turn FX back on.
-                    _agcGain = 1;
+                    freqConfig.AgcGain = 1;
                 }
 
                 // Final mix, split to stereo output.
