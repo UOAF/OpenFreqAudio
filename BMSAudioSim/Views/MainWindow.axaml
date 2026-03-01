@@ -12,10 +12,13 @@
         Title="BMSAudioSim">
 
     <Grid RowDefinitions="1*,8*,3*">
-        <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="20" VerticalAlignment="Center">
+        <StackPanel Margin="10,0,5,0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
             <Button Click="OnLoadClicked">Load Heightmap</Button>
-            <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center" Grid.Column="1">No heightmap loaded</TextBlock>
-            <CheckBox Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
+            <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center">No heightmap loaded</TextBlock>
+            <CheckBox Margin="10,0,5,0" Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
+            <TextBlock VerticalAlignment="Center" Margin="10, 0, 0, 0">Sound Effect Type</TextBlock>
+            <ComboBox ItemsSource="{Binding AmbientNoiseTypes}" SelectedValue="{Binding AmbientNoiseType, Mode=TwoWay}" SelectionChanged="OnUpdateDownsampledAudio"/>
+            <CheckBox Margin="10,0,5,0" Content="Downsampled audio" IsCheckedChanged="OnUpdateDownsampledAudio" IsChecked="{Binding UseDownsampledAudio, Mode=TwoWay}"/>
         </StackPanel>
 
         <!-- Main Content: Heightmap and Graph side by side -->
@@ -126,6 +129,12 @@
                     <RadioButton GroupName="Signal1Playback" Content="PTT" IsCheckedChanged="OnSignal1PTTChanged" IsChecked="{Binding !Signal1Continuous}"/>
                     <Button Name="ButtonSignal1Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal1Continuous}"/>
                 </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Tune Frequency Offset (PPM)" VerticalAlignment="Center" Width="200"/>
+                    <TextBlock Text="{Binding Ppm1}" VerticalAlignment="Center" Width="25"/>
+                    <Slider x:Name="Ppm1Slider" Minimum="-2" Maximum="2" TickPlacement="Outside" TickFrequency="0.1"
+                            IsSnapToTickEnabled="True" Value="{Binding Ppm1}" ValueChanged="OnPpmSliderChanged" MinWidth="100" VerticalAlignment="Center"/>
+                </StackPanel>
                 <TextBlock Text="Path S1 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
@@ -149,6 +158,12 @@
                     <RadioButton GroupName="Signal2Playback" Content="Continuous" IsChecked="{Binding Signal2Continuous}"/>
                     <RadioButton GroupName="Signal2Playback" Content="PTT" IsCheckedChanged="OnSignal2PTTChanged" IsChecked="{Binding !Signal2Continuous}"/>
                     <Button Name="ButtonSignal2Ptt" Content="Push and Hold" IsEnabled="{Binding !Signal2Continuous}"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBlock Text="Tune Frequency Offset (PPM)" VerticalAlignment="Center" Width="200"/>
+                    <TextBlock Text="{Binding Ppm2}" VerticalAlignment="Center" Width="25"/>
+                    <Slider x:Name="Ppm2Slider" Minimum="-2" Maximum="2" TickPlacement="Outside" TickFrequency="0.1"
+                            IsSnapToTickEnabled="True" Value="{Binding Ppm2}" ValueChanged="OnPpmSliderChanged" MinWidth="100" VerticalAlignment="Center"/>
                 </StackPanel>
                 <TextBlock Text="Path S2 → RX:" FontWeight="Bold" Margin="0,5,0,0"/>
                 <Grid ColumnDefinitions="6*,4*">
@@ -178,7 +193,7 @@
                 <Slider Minimum="10" Maximum="50" Value="{Binding TxWatts}" ValueChanged="OnAltSliderChanged"/>
                 <StackPanel Orientation="Horizontal">
                     <RadioButton Name="RadioButtonUhf" IsChecked="True"
-                                 IsCheckedChanged="ToggleButton_OnIsCheckedChanged" Content="UHF"/>
+                                 IsCheckedChanged="OnUHFVHFChanged" Content="UHF"/>
                     <RadioButton Content="VHF" Margin="5,0"/>
                     <TextBlock VerticalAlignment="Center" Text="Freq " Margin="10,0,0,0"/>
                     <TextBlock VerticalAlignment="Center" Text="{Binding FrequencyMhz}"/>

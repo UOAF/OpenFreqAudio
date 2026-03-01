@@ -1,4 +1,9 @@
-﻿namespace BMSAudioSim.ViewModels;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using OpenFreqAudio;
+
+namespace BMSAudioSim.ViewModels;
 
 using ReactiveUI;
 
@@ -18,6 +23,27 @@ public class MainWindowViewModel : ReactiveObject
     private int _squelchSliderValue = 10;
     private float _squelch = 1.0f;
     private bool _enable3dEffects = true;
+    private float _ppm1 = 0;
+    private float _ppm2 = 0;
+
+    private AmbientNoiseType _ambientNoiseType = AmbientNoiseType.None;
+    public IEnumerable<AmbientNoiseType> AmbientNoiseTypes { get; } =
+        Enum.GetValues(typeof(AmbientNoiseType))
+            .Cast<AmbientNoiseType>();
+
+    public AmbientNoiseType AmbientNoiseType
+    {
+        get => _ambientNoiseType;
+        set => this.RaiseAndSetIfChanged(ref _ambientNoiseType, value);
+    }
+
+    private bool _useDownsampledAudio = true;
+
+    public bool UseDownsampledAudio
+    {
+        get => _useDownsampledAudio;
+        set => this.RaiseAndSetIfChanged(ref _useDownsampledAudio, value);
+    }
 
     public float Squelch
     {
@@ -88,6 +114,18 @@ public class MainWindowViewModel : ReactiveObject
     {
         get => _enable3dEffects;
         set => this.RaiseAndSetIfChanged(ref _enable3dEffects, value);
+    }
+
+    public float Ppm1
+    {
+        get => _ppm1;
+        set => this.RaiseAndSetIfChanged(ref _ppm1, value);
+    }
+
+    public float Ppm2
+    {
+        get => _ppm2;
+        set => this.RaiseAndSetIfChanged(ref _ppm2, value);
     }
 
     public double FrequencyMhz => FrequencyKhz / 1000d;

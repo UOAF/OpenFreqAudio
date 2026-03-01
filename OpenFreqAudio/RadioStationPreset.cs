@@ -23,7 +23,15 @@ public class RadioStationPreset
     public double TxPower_UHF_W { get; set; }
     public double RxSensitivity_UHF_dBm { get; set; }
 
+    // Frequency stability (parts per million)
+    public double MinPpm { get; set; }
+    public double MaxPpm { get; set; }
+    
+    public double GetRandomPpm() => MinPpm + Random.Shared.NextDouble() * (MaxPpm - MinPpm);
+
     public string? Description { get; set; }
+    
+    public AmbientNoiseType  AmbientNoiseType { get; set; }
     
     
     
@@ -33,6 +41,8 @@ public class RadioStationPreset
     public RadioStationPreset(string name, string category, double antennaElevation,
         double txPowerVhf, double rxSensitivityVhf,
         double txPowerUhf, double rxSensitivityUhf,
+        double minPpm, double maxPpm,
+        AmbientNoiseType ambientNoiseType,
         string description)
     {
         Name = name;
@@ -42,6 +52,8 @@ public class RadioStationPreset
         RxSensitivity_VHF_dBm = rxSensitivityVhf;
         TxPower_UHF_W = txPowerUhf;
         RxSensitivity_UHF_dBm = rxSensitivityUhf;
+        MinPpm = minPpm;
+        MaxPpm = maxPpm;
         Description = description;
     }
     
@@ -80,8 +92,7 @@ public class RadioStationPreset
     
     public static bool IsVHF(int frequencyKhz)
     {
-        return frequencyKhz < 200000;
-  // 200 MHz = 200000 kHz
+        return frequencyKhz < 200000; // 200 MHz = 200000 kHz
     }
 }
 
@@ -99,6 +110,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -110.0,
         txPowerUhf: 25.0, // Lower UHF power
         rxSensitivityUhf: -107.0,
+        minPpm: 0.1, // Exceptional stability - military OCXO
+        maxPpm: 0.5,
+        ambientNoiseType: AmbientNoiseType.Stationary, // We dont want the engine whine there, stationary sounds better for that case
         description: "E-3 Sentry / E-2 Hawkeye - Airborne Early Warning & Control"
     );
 
@@ -110,6 +124,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -110.0,
         txPowerUhf: 10.0, // AN/ARC-210: 10W UHF AM (20W FM handled in GetTxPower)
         rxSensitivityUhf: -107.0,
+        minPpm: 0.1, // Modern avionics with TCXO/OCXO
+        maxPpm: 1.0,
+        ambientNoiseType: AmbientNoiseType.Air,
         description: "F-16/F-15/F/A-18 with AN/ARC-210/220 radios"
     );
 
@@ -121,6 +138,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -110.0,
         txPowerUhf: 10.0,
         rxSensitivityUhf: -107.0,
+        minPpm: 0.5, // Good quality TCXO
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.Air,
         description: "KC-135/KC-10 aerial refueling aircraft"
     );
 
@@ -132,6 +152,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -107.0,
         txPowerUhf: 10.0,
         rxSensitivityUhf: -105.0,
+        minPpm: 0.5, // Standard military TCXO
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.Air,
         description: "C-130/C-17 military transport aircraft"
     );
 
@@ -143,6 +166,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -107.0,
         txPowerUhf: 10.0,
         rxSensitivityUhf: -105.0,
+        minPpm: 1.0, // More vibration, temperature variation
+        maxPpm: 3.0,
+        ambientNoiseType: AmbientNoiseType.Air,
         description: "AH-64/UH-60 attack and utility helicopters"
     );
 
@@ -158,6 +184,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -118.0, 
         txPowerUhf: 100.0, // Lower UHF power
         rxSensitivityUhf: -115.0,
+        minPpm: 0.5, // Fixed installation, climate controlled
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Ground Control Intercept - 50m tower"
     );
 
@@ -169,6 +198,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -118.0,
         txPowerUhf: 100.0,
         rxSensitivityUhf: -115.0,
+        minPpm: 0.1, // Best ground infrastructure, OCXO
+        maxPpm: 0.5,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Ground Control Intercept - 100m tower"
     );
 
@@ -180,6 +212,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -113.0,
         txPowerUhf: 30.0, // Medium power UHF
         rxSensitivityUhf: -110.0,
+        minPpm: 1.0, // Field-deployable, less stable than fixed
+        maxPpm: 4.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Forward Air Control Center - Standard mast"
     );
 
@@ -191,6 +226,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -113.0,
         txPowerUhf: 30.0,
         rxSensitivityUhf: -110.0,
+        minPpm: 0.5, // Better equipment for extended ops
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Forward Air Control Center - Extended telescoping mast"
     );
 
@@ -202,6 +240,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -113.0, // PRC-152
         txPowerUhf: 5.0,
         rxSensitivityUhf: -110.0,
+        minPpm: 2.0, // Handheld, temperature extremes, battery variation
+        maxPpm: 10.0,
+        ambientNoiseType: AmbientNoiseType.Ground, // Make it a bit more messy
         description: "Forward Air Controller with handheld radio"
     );
 
@@ -213,6 +254,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -113.0,
         txPowerUhf: 5.0,
         rxSensitivityUhf: -110.0,
+        minPpm: 2.0, // Field tactical radio, environmental stress
+        maxPpm: 10.0,
+        ambientNoiseType: AmbientNoiseType.Ground, // Make it a bit more messy
         description: "Joint Terminal Attack Controller with tactical radio"
     );
 
@@ -224,6 +268,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -113.0,
         txPowerUhf: 20.0,
         rxSensitivityUhf: -110.0,
+        minPpm: 1.0, // Vehicle-mounted, some vibration
+        maxPpm: 5.0,
+        ambientNoiseType: AmbientNoiseType.Ground,
         description: "Military vehicle with mounted tactical radio"
     );
 
@@ -239,6 +286,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -100.0,
         txPowerUhf: 25.0,
         rxSensitivityUhf: -97.0,
+        minPpm: 2.0, // Budget equipment, standard TCXO
+        maxPpm: 5.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Small airport control tower"
     );
 
@@ -250,6 +300,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -100.0,
         txPowerUhf: 25.0,
         rxSensitivityUhf: -97.0,
+        minPpm: 1.0, // Well-maintained, quality equipment
+        maxPpm: 3.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Major international airport control tower"
     );
 
@@ -261,6 +314,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -95.0, // Basic receiver
         txPowerUhf: 10.0,
         rxSensitivityUhf: -92.0,
+        minPpm: 5.0, // Basic/older equipment, minimal maintenance
+        maxPpm: 15.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "Uncontrolled airport common traffic advisory frequency"
     );
 
@@ -272,6 +328,9 @@ public static class RadioStationPresets
         rxSensitivityVhf: -100.0,
         txPowerUhf: 50.0,
         rxSensitivityUhf: -97.0,
+        minPpm: 1.0, // Professional service, maintained equipment
+        maxPpm: 4.0,
+        ambientNoiseType: AmbientNoiseType.Stationary,
         description: "FSS providing weather briefings and flight plan services"
     );
 

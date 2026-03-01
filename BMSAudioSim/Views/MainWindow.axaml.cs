@@ -47,8 +47,10 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private readonly string _stream1Id = "stream1";
     private readonly string _stream1File = "countdown.ogg";
+    private readonly string _stream1FileDownsampled = "countdown_8khz.ogg";
     private readonly string _stream2Id = "stream2";
     private readonly string _stream2File = "audio2.ogg";
+    private readonly string _stream2FileDownsampled = "audio2_8khz.ogg";
 
 
     // Marker display
@@ -69,18 +71,23 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         InitializeComponent();
         ButtonSignal1Ptt.AddHandler(PointerPressedEvent, (sender, e) =>
         {
-            Console.Out.WriteLine("PointerPressedEvent");
-            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
+            _radioPlayback.StartStream(_stream1Id,
+                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _viewModel.AmbientNoiseType);
         }, handledEventsToo: true);
 
         ButtonSignal1Ptt.AddHandler(PointerReleasedEvent, (sender, e) =>
         {
-            Console.Out.WriteLine("PointerReleasedEvent");
             _radioPlayback.StopStream(_stream1Id).Wait(300);
         }, handledEventsToo: true);
 
         ButtonSignal2Ptt.AddHandler(PointerPressedEvent,
-            (sender, e) => { _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params); },
+            (sender, e) =>
+            {
+                _radioPlayback.StartStream(_stream2Id,
+                    _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                    _viewModel.AmbientNoiseType);
+            },
             handledEventsToo: true);
 
         ButtonSignal2Ptt.AddHandler(PointerReleasedEvent,
@@ -89,11 +96,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     protected override void OnLoaded(RoutedEventArgs e)
     {
-        base.OnLoaded(e); 
+        base.OnLoaded(e);
         _radioPlayback.Initialize();
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
         _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Right);
-        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Left);
+        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Both);
     }
 
     private async void OnLoadClicked(object? sender, RoutedEventArgs e)
@@ -449,7 +456,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX1Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
+            ViewModel.RXAltitude,
+            ViewModel.FrequencyKhz,
+            ViewModel.Ppm1,
+            ViewModel.TxWatts,
+            ViewModel.RxDbm,
             true);
 
         // Path 2: Sender2 -> Receiver
@@ -459,7 +470,11 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.TX2Altitude,
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.x),
             _fastPathAudioSim.PixelsToMeters(_receiverPos.Value.y),
-            ViewModel.RXAltitude, ViewModel.FrequencyKhz, ViewModel.TxWatts, ViewModel.RxDbm,
+            ViewModel.RXAltitude,
+            ViewModel.FrequencyKhz,
+            ViewModel.Ppm2,
+            ViewModel.TxWatts,
+            ViewModel.RxDbm,
             true);
 
         if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
@@ -693,7 +708,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         UpdateMarkers();
     }
 
-    private void ToggleButton_OnIsCheckedChanged(object? sender, RoutedEventArgs e)
+    private void OnUHFVHFChanged(object? sender, RoutedEventArgs e)
     {
         _radioPlayback.UntuneFrequency(ViewModel.FrequencyKhz);
         if (RadioButtonUhf.IsChecked == true)
@@ -709,12 +724,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         UpdateParameters();
         if (ViewModel.Signal1Continuous)
         {
-            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
-        }
+            _radioPlayback.StartStream(_stream1Id,
+                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _viewModel.AmbientNoiseType);        }
 
         if (ViewModel.Signal2Continuous)
         {
-            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
+            _radioPlayback.StartStream(_stream2Id,
+                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _viewModel.AmbientNoiseType);
         }
     }
 
@@ -727,7 +745,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
         else
         {
-            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params);
+            _radioPlayback.StartStream(_stream1Id,
+                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _viewModel.AmbientNoiseType);
         }
     }
 
@@ -740,8 +760,19 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
         else
         {
-            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params);
+            _radioPlayback.StartStream(_stream2Id,
+                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _viewModel.AmbientNoiseType);
         }
+    }
+
+    private void OnPpmSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (sender == Ppm1Slider)
+            ViewModel.Ppm1 = (float)e.NewValue;
+        else
+            ViewModel.Ppm2 = (float)e.NewValue;
+        UpdateParameters();
     }
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
@@ -754,6 +785,30 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         if (sender is CheckBox checkBox)
         {
             _radioPlayback.Apply3dEffects = checkBox.IsChecked.GetValueOrDefault();
+        }
+    }
+
+    private void OnUpdateDownsampledAudio(object? sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox checkBox)
+        {
+            _viewModel.UseDownsampledAudio = checkBox.IsChecked.GetValueOrDefault();
+        }
+        
+        if (ViewModel.Signal1Continuous)
+        {
+           
+            
+            _radioPlayback.StartStream(_stream1Id,
+                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _viewModel.AmbientNoiseType);
+        }
+
+        if (ViewModel.Signal2Continuous)
+        {
+            _radioPlayback.StartStream(_stream2Id,
+                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _viewModel.AmbientNoiseType);
         }
     }
 }

@@ -67,6 +67,8 @@ namespace OpenFreqAudio
         // slow deep fades (events per second, typically 0-0.5). Also a function of SNR, but cached here.
         public float DeepFadeRate;
         public int RadioFrequencyKHz;
+        // Tune offset of the radio in parts per million.
+        public float TuneOffsetPPM;
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
@@ -376,21 +378,23 @@ namespace OpenFreqAudio
         /// </summary>
         private double ApplyTerrainDegradation(double fresnelClearance, double diffLoss, RadioBandConfig bandConfig)
         {
+            #if DEBUG
             _logger.LogDebug($"ApplyTerrainDegradation:");
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
             _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
             _logger.LogDebug($"  Band: {bandConfig.BandName} ({bandConfig.Modulation})");
-
+            #endif
+            
             // === CHECK FOR CLEAR LOS FIRST ===
             // fresnelClearance >= 1.0 means terrain is below Fresnel zone edge (definitely clear)
             // OR fresnelClearance >= 0.6 with low diffraction loss (mostly clear)
             if (fresnelClearance >= 1.0 || (fresnelClearance >= 0.6 && diffLoss < 3.0))
             {
-                _logger.LogDebug($"  → Taking CLEAR LOS path");
+                _logger.LogDebug("  → Taking CLEAR LOS path");
                 return 0;
             }
 
-            _logger.LogDebug($"  → Taking OBSTRUCTED path");
+            _logger.LogDebug("  → Taking OBSTRUCTED path");
 
             // === PHYSICS-INFORMED SMOOTH DEGRADATION ===
             // Based on knife-edge diffraction theory, but applied continuously
@@ -428,8 +432,10 @@ namespace OpenFreqAudio
                 double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
                 wavelengthCorrection *= reductionFactor;
 
+                #if DEBUG
                 _logger.LogDebug(
                     $"Wavelength advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
+                #endif
             }
 
             // Combine theoretical loss with wavelength correction
@@ -455,8 +461,10 @@ namespace OpenFreqAudio
                 // Blend: theoretical * (1 - blend) + measured * blend
                 totalTerrainLoss = totalTerrainLoss * (1.0 - blendFactor) + diffLoss * blendFactor;
 
+                #if DEBUG
                 _logger.LogDebug(
                     $"Blending: theoretical={theoreticalDiffractionLoss + wavelengthCorrection:F1} dB, measured={diffLoss:F1} dB, blend={blendFactor:F3} → final={totalTerrainLoss:F1} dB");
+                #endif
             }
 
             // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
@@ -504,8 +512,10 @@ namespace OpenFreqAudio
 
                     totalTerrainLoss += multiZonePenalty;
 
+                    #if DEBUG
                     _logger.LogDebug(
                         $"Multi-zone blockage: {totalPenetration:F2} Fresnel radii, {additionalZonesBlocked:F2} zones → +{multiZonePenalty:F1} dB penalty");
+                    #endif
                 }
             }
 
@@ -527,19 +537,19 @@ namespace OpenFreqAudio
         public AudioParams CalculateAudioParams(
             double? txX, double? txY, double? txAlt,
             double? rxX, double? rxY, double? rxAlt,
-            int frequencyKhz, double txPowerWatts = 10.0,
+            int frequencyKhz,
+            float ppm = 0.0f,
+            double txPowerWatts = 10.0,
             double? receiverSensitivityDbm = null, // Optional: uses defaults if not provided
             bool includeTerrainProfile = false,
             bool txAltitudeIsMSL = false,
             bool rxAltitudeIsMSL = false)
         {
+            var ap = GetDefaultAudioParams(frequencyKhz, ppm);
             if (txX == null || txY == null || txAlt == null || rxX == null || rxY == null || rxAlt == null)
             {
-                return GetDefaultAudioParams(frequencyKhz);
+                return ap;
             }
-
-            var ap = new AudioParams();
-            ap.RadioFrequencyKHz = frequencyKhz;
 
             // Stupid C# does not recognize null-safety with the early return;
             double txXVal = txX.Value;
@@ -649,6 +659,7 @@ namespace OpenFreqAudio
             // Calculate Fresnel clearance (1.0 = perfect, 0.0 = grazing, negative = blocked)
             double fresnelClearance = F1_radius > 0 ? (1.0 - worstExcess / F1_radius) : 1.0;
 
+            #if DEBUG
             _logger.LogDebug($"Terrain Analysis:");
             _logger.LogDebug($"  distance: {dist:F1}m");
             _logger.LogDebug($"  worstExcess: {worstExcess:F1}m");
@@ -656,6 +667,109 @@ namespace OpenFreqAudio
             _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
             _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
             _logger.LogDebug($"  Profile points: {profile.Count}");
+            #endif
+
+            // === TWO-RAY GROUND REFLECTION (over sea) ===
+            // BMS engine quirk: negative elevation values are ocean tiles.
+            // Count ocean tiles in the terrain profile to determine ocean coverage fraction.
+            int oceanTileCount = 0;
+            foreach (var (_, elev) in profile)
+            {
+                if (elev < 0.0) oceanTileCount++;
+            }
+            double oceanFrac = (double)oceanTileCount / profile.Count;
+
+            double twoRayDb = 0.0;
+            if (oceanFrac > 0.2)
+            {
+                // --- Tunables ---
+                const double seaR0           = 0.95;   // baseline seawater reflection magnitude
+                const double sigmaSeaDefault = 0.05;   // sea surface rms roughness (m), calm sea
+
+                // Antenna MSL altitudes = heights above the sea reflection surface.
+                // BMS ocean tile quirk: tile elevation = -12.5m. Clamp to 0 — below sea level is unphysical here.
+                double txTop = Math.Max(0.0, txAltVal);
+                double rxTop = Math.Max(0.0, rxAltVal);
+
+                // Central surface angle: use horizontal arc (dist2D), not 3D slant (dist).
+                double R_eff = effectiveEarthRadius;
+                double theta = dist2D / R_eff;
+
+                // Direct chord between antenna tops (law of cosines on curved Earth).
+                double Ld = Math.Sqrt(
+                    (R_eff + txTop) * (R_eff + txTop) +
+                    (R_eff + rxTop) * (R_eff + rxTop) -
+                    2.0 * (R_eff + txTop) * (R_eff + rxTop) * Math.Cos(theta));
+
+                // Specular reflection point approximated at arc midpoint.
+                double phi = theta / 2.0;
+
+                double L1 = Math.Sqrt(
+                    (R_eff + txTop) * (R_eff + txTop) + R_eff * R_eff -
+                    2.0 * (R_eff + txTop) * R_eff * Math.Cos(phi));
+
+                double L2 = Math.Sqrt(
+                    (R_eff + rxTop) * (R_eff + rxTop) + R_eff * R_eff -
+                    2.0 * (R_eff + rxTop) * R_eff * Math.Cos(theta - phi));
+
+                // Check that terrain at the specular midpoint does not block the reflected path.
+                // Positive specElev means terrain rising above the sea surface at the bounce point.
+                double specX    = 0.5 * (txXVal + rxXVal);
+                double specY    = 0.5 * (txYVal + rxYVal);
+                // BMS ocean tiles return negative elevation values — clamp to 0 (sea level).
+                double specElev = Math.Max(0.0, SampleElevation(specX, specY));
+
+                if (specElev <= 10.0)
+                {
+                    double Lr = L1 + L2;
+                    double delta = Lr - Ld;
+                    double phiRad = 2.0 * Math.PI * delta / lambda;  // phase difference
+
+                    // Cosine of incidence at TX side = sin(grazing angle).
+                    // Derived from law-of-cosines triangle (O, TX, specular point S):
+                    // Place S at (R_eff, 0), then the component of (T→S) along the surface normal
+                    // at S is: (R_eff+txTop)*cos(phi) - R_eff.
+                    double cosInc = Math.Abs(((R_eff + txTop) * Math.Cos(phi) - R_eff) /
+                                             Math.Max(1e-6, L1));
+
+                    // Debye-Kirchhoff roughness factor (power form, then amplitude).
+                    double debPow = Math.Exp(-Math.Pow(4.0 * Math.PI * sigmaSeaDefault * cosInc / lambda, 2.0));
+                    debPow = Math.Max(1e-8, debPow);
+                    double debAmp = Math.Sqrt(debPow);
+
+                    // Effective reflection amplitude. Sign is negative: Fresnel coefficient
+                    // at grazing incidence over seawater → phase inversion for both polarisations.
+                    // oceanScale reduces effect on mixed land/sea paths.
+                    double oceanScale = Math.Clamp(oceanFrac, 0.0, 1.0);
+                    double ReffMag = seaR0 * debAmp * oceanScale;
+                    double R       = -ReffMag;
+
+                    // Two-ray interference amplitude relative to free-space unit amplitude:
+                    //   |1 + R·exp(j·φ)|  =  sqrt(1 + R² + 2R·cos(φ))
+                    double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
+                    twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
+                    twoRayDb = Math.Clamp(twoRayDb, -20.0, 6.0);
+
+                    #if DEBUG
+                    _logger.LogDebug($"Two-Ray Model:");
+                    _logger.LogDebug($"  oceanFrac={oceanFrac:F3}, specElev={specElev:F1}m");
+                    _logger.LogDebug($"  delta={delta:F2}m, phiRad={phiRad:F3}rad");
+                    _logger.LogDebug($"  cosInc={cosInc:F4}, debAmp={debAmp:F4}");
+                    _logger.LogDebug($"  oceanScale={oceanScale:F3}, R={R:F4}, twoRayDb={twoRayDb:F2} dB");
+                    #endif
+                }
+                else
+                {
+                    #if DEBUG
+                    _logger.LogDebug($"Two-Ray: specular midpoint terrain-blocked (specElev={specElev:F1}m), skipped");
+                    #endif
+                }
+            }
+
+            // twoRayDb > 0: constructive interference (boost above free-space).
+            // twoRayDb < 0: destructive null. Applied before terrain degradation so that
+            // over-sea paths already in a null correctly accumulate terrain loss on top.
+            ap.ReceivedDb += (float)twoRayDb;
 
             // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
             ap.ReceivedDb -= (float)ApplyTerrainDegradation(fresnelClearance, diffLoss, bandConfig);
@@ -720,11 +834,12 @@ namespace OpenFreqAudio
             return (float)Math.Clamp(audioGain, 0.0, 1.0);
         }
 
-        public static AudioParams GetDefaultAudioParams(int frequencyKhz)
+        public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm = 0f)
         {
             var ap = new AudioParams
             {
                 RadioFrequencyKHz = frequencyKhz,
+                TuneOffsetPPM = ppm,
                 ReceivedDb = 0f, // no losses
                 ReceivedSnrDb = 50, // Clear as day.
                 DropoutRate = 0f,

@@ -1,75 +1,56 @@
 // ReSharper disable InconsistentNaming
 
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 
 namespace OpenFreqAudio;
 
 /// <summary>
-/// Modern military radio receiver effects (AN/ARC-210/222 style)
-/// 
-/// Signal chain: Analog AM/FM transmission → Analog AM/FM demodulator → Digital audio processing
-/// 
-/// Receiver-side effects (AFTER demodulation):
-/// - Sharp brick-wall filtering (digital IIR filters)
-/// - RF fading effects (pre-demod phenomena that affect audio)
-/// 
-/// NOTE: Transmissions are ANALOG AM/FM - no digital vocoder, packets, or bit errors!
-/// Digital processing happens ONLY in the receiver's audio backend after demodulation.
-/// 
+/// Military radio receiver signal processor.
+///
+/// Signal chain per buffer:
+///   1. <see cref="IAmbientNoiseEffect.ApplyPreFade"/>  — transmitter-side acoustics
+///      (cockpit noise, oxygen-mask muffling, etc.)
+///   2. <see cref="ApplyFading"/>                       — RF channel fading
+///      (fast flutter 20–80 ms and deep fades 400–2000 ms)
+///   3. <see cref="IAmbientNoiseEffect.ApplyPostFade"/> — receiver-side filtering
+///      (brick-wall IF bandpass, etc.)
+///
+/// The ambient layer (steps 1 + 3) is swapped out atomically when
+/// <see cref="AmbientNoise"/> changes, so it can be updated per-packet.
+///
 /// MULTI-SCALE FADING MODEL:
-/// - Fast flutter (20-80ms): Rapid multipath interference, stays above squelch
-/// - Deep fades (400-2000ms): Severe signal loss, can trigger squelch pops
+/// - Fast flutter (20–80 ms):   Rapid multipath, stays above squelch.
+/// - Deep fades  (400–2000 ms): Severe signal loss, can trigger squelch pops.
 /// </summary>
 public class RadioEffect
 {
-    private ILogger _logger;
+    private readonly ILogger _logger;
     private readonly int _channels;
     private readonly int _sampleRate;
     private readonly Lock _lock = new();
+
     private AudioParams _params;
+    private AmbientNoiseType _ambientNoiseType = AmbientNoiseType.None;
+    private IAmbientNoiseEffect _ambientEffect = NullAmbientEffect.Instance;
 
-    // Pre-calculated filter coefficients (cached per sample rate)
-    private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> FilterCache = new();
-
-    private static readonly Lock FilterCacheLock = new();
-
-    // Filter coefficients for this instance
-    private readonly float _b0, _b1, _b2, _a1, _a2;
-
-    // Digital filter state (2-stage biquad needs 4 states per channel)
-    private readonly float[] _filterState; // [x[n-1], x[n-2], y[n-1], y[n-2]] per channel
-
-    // DC whine state
-    private double _whinePhase;
-    private const float WhineFreq = 520f; // typical avionics inverter whine (400–800 Hz)
-    private const float WhineLevel = 0.003f; // extremely subtle, like cockpit background
-
-    // Deep rumble state
-    private double _rumblePhase;
-    private const float RumbleFreq = 80f;    // Low rumble
-    private const float RumbleLevel = 0.03f; // Subtle but noticeable
-    
-    // Oxygen-mask style muffling
-    private const float MuffleCutoff = 900f; // muffled low-pass
-    private float _muffleA; // filter coefficient
-    private float[] _muffleLPChannels;
-    private float[] _muffleLP2Channels;
-
-    // Fast flutter state (rapid multipath fading, 20-80ms)
+    // --- RF fading state (fast flutter) ---
     private int _dropoutSamplesLeft;
     private int _dropoutFadeSamples;
-    private int _dropoutInitialSamples; // Track initial duration for envelope calculation
+    private int _dropoutInitialSamples;
 
-    // Deep fade state (slow severe fading, 400-2000ms)
+    // --- RF fading state (deep fades) ---
     private int _deepFadeSamplesLeft;
     private int _deepFadeFadeSamples;
     private int _deepFadeInitialSamples;
 
     private static readonly ThreadLocal<Random> ThreadRng =
         new(() => new Random(Environment.TickCount * Thread.CurrentThread.ManagedThreadId));
+
+    // -----------------------------------------------------------------------
+    //  Public properties
+    // -----------------------------------------------------------------------
 
     public AudioParams Params
     {
@@ -79,12 +60,39 @@ public class RadioEffect
         }
         set
         {
+            lock (_lock) _params = value;
+        }
+    }
+
+    /// <summary>
+    /// Acoustic environment of the transmitting platform.
+    /// Setting this replaces the ambient effect instance via the factory;
+    /// changes take effect at the next <see cref="Process"/> call.
+    /// Thread-safe.
+    /// </summary>
+    public AmbientNoiseType AmbientNoise
+    {
+        get
+        {
+            lock (_lock) return _ambientNoiseType;
+        }
+        set
+        {
             lock (_lock)
             {
-                _params = value;
+                if (_ambientNoiseType == value) return;
+                _ambientNoiseType = value;
+                _ambientEffect = AmbientNoiseEffectFactory.Create(value, _sampleRate, _channels);
+#if DEBUG
+                _logger.LogDebug("AmbientNoise changed to {Type} (StreamRate={SampleRate} Hz)", value, _sampleRate);
+#endif
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    //  Construction
+    // -----------------------------------------------------------------------
 
     public RadioEffect(int sampleRate, int channels, AudioParams initial, ILogger logger)
     {
@@ -92,234 +100,137 @@ public class RadioEffect
         _channels = channels;
         _params = initial;
         _logger = logger;
-        _filterState = new float[channels * 4]; // 4 states per channel (x[n-1], x[n-2], y[n-1], y[n-2])
-
-        // Get or calculate filter coefficients (cached per sample rate)
-        lock (FilterCacheLock)
-        {
-            if (!FilterCache.TryGetValue(sampleRate, out var coeffs))
-            {
-                coeffs = CalculateFilterCoefficients(sampleRate);
-                FilterCache[sampleRate] = coeffs;
-                #if DEBUG
-                logger.LogDebug($"Calculated and cached filter coefficients for {sampleRate} Hz");
-                #endif
-            }
-            else
-            {
-                #if DEBUG
-                logger.LogDebug($"Using cached filter coefficients for {sampleRate} Hz");
-                #endif
-            }
-
-            (_b0, _b1, _b2, _a1, _a2) = coeffs;
-        }
-
-        // Precompute one-pole LPF coefficient for muffling (oxygen mask effect)
-        // Lower cutoff = more muffled (typical military masks: 600-700 Hz)
-        _muffleA = MathF.Exp(-2f * MathF.PI * MuffleCutoff / _sampleRate);
-        _muffleLPChannels = new float[_channels];
-        _muffleLP2Channels = new float[_channels];
     }
 
-    /// <summary>
-    /// Calculate digital brick-wall filter coefficients (300Hz - 2700Hz bandpass)
-    /// </summary>
-    private static (float b0, float b1, float b2, float a1, float a2) CalculateFilterCoefficients(int sampleRate)
-    {
-        // Digital brick-wall filter: 300Hz - 2700Hz bandpass
-        // Military radio voice frequency response
-        float lowFreq = 300f;
-        float highFreq = 2700f;
-
-        // Design a 2nd-order Butterworth bandpass filter
-        // Center frequency and bandwidth
-        float centerFreq = (lowFreq + highFreq) / 2f; // 1500 Hz
-        float bandwidth = highFreq - lowFreq; // 2400 Hz
-
-        float w0 = 2f * MathF.PI * centerFreq / sampleRate;
-
-        // Calculate Q from bandwidth
-        // For bandpass: Q = f0 / bandwidth
-        float Q = centerFreq / bandwidth; // ~0.625
-
-        // Biquad bandpass coefficients
-        float alpha = MathF.Sin(w0) / (2f * Q);
-        float cosw0 = MathF.Cos(w0);
-
-        float b0 = alpha;
-        float b1 = 0f;
-        float b2 = -alpha;
-        float a0 = 1f + alpha;
-        float a1 = -2f * cosw0;
-        float a2 = 1f - alpha;
-
-        // Normalize by a0
-        return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
-    }
+    // -----------------------------------------------------------------------
+    //  Public API
+    // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Process buffer through military radio receiver effects
+    /// Process <paramref name="samples"/> samples (frames x channels) starting
+    /// at <paramref name="offset"/> in <paramref name="buffer"/> in-place.
     /// </summary>
     public void Process(float[] buffer, int offset, int samples)
     {
         var rng = ThreadRng.Value!;
         AudioParams p;
+        IAmbientNoiseEffect ambientEffect;
 
         lock (_lock)
         {
             p = _params;
+            ambientEffect = _ambientEffect;
         }
 
         int frames = samples / _channels;
 
-        // === FAST FLUTTER: Rapid multipath fading (20-80ms) ===
-        // This is Poisson process for "picket-fencing" effect
-        // DropoutProb is the rate (events per second)
+        // 1. Transmitter acoustics: mic pickup, mask muffling, cockpit noise.
+        ambientEffect.ApplyPreFade(buffer, offset, frames);
+
+        // 2. RF channel fading: schedule new events, then apply envelopes.
+        ScheduleFadingEvents(rng, frames, p);
+        ApplyFading(buffer, offset, frames);
+
+        // 3. Receiver filtering: brick-wall bandpass, etc.
+        ambientEffect.ApplyPostFade(buffer, offset, frames);
+
+        // Safety clamp — should never fire under normal operation.
+        ClampBuffer(buffer, offset, samples);
+    }
+
+    // -----------------------------------------------------------------------
+    //  RF fading — private
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Rolls the Poisson dice for this buffer and arms new fading events
+    /// if none are currently active.
+    /// </summary>
+    private void ScheduleFadingEvents(Random rng, int frames, AudioParams p)
+    {
+        double bufferSec = (double)frames / _sampleRate;
+
+        // Fast flutter (20–80 ms "picket-fencing")
         if (_dropoutSamplesLeft <= 0 && p.DropoutRate > 0.001f)
         {
-            double bufferDurationSec = (double)frames / _sampleRate;
-            double expectedEvents = p.DropoutRate * bufferDurationSec;
-            double dropoutProbability = 1.0 - Math.Exp(-expectedEvents);
-
-            if (rng.NextDouble() < dropoutProbability)
+            double prob = 1.0 - Math.Exp(-p.DropoutRate * bufferSec);
+            if (rng.NextDouble() < prob)
             {
-                double u = rng.NextDouble();
-                double meanDropMs = 80.0; // Average 80ms (fast flutter)
-                double minDropMs = 20.0; // Minimum 20ms
-                double fadeMs = 8.0; // Fast fade
-                double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
+                double durMs = Math.Max(20.0, -Math.Log(1.0 - rng.NextDouble()) * 80.0);
                 _dropoutSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
-                _dropoutFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
+                _dropoutFadeSamples = (int)(_sampleRate * 8.0 / 1000.0);
                 _dropoutInitialSamples = _dropoutSamplesLeft;
             }
         }
 
-        // === DEEP FADES: Slow severe dropouts (400-2000ms) ===
-        // Independent Poisson process for terrain nulls, severe multipath
-        // These CAN drop signal below squelch threshold → trigger pops
+        // Deep fades (400–2000 ms terrain nulls / severe multipath)
         if (_deepFadeSamplesLeft <= 0 && p.DeepFadeRate > 0.001f)
         {
-            double bufferDurationSec = (double)frames / _sampleRate;
-            double expectedEvents = p.DeepFadeRate * bufferDurationSec;
-            double fadeProbability = 1.0 - Math.Exp(-expectedEvents);
-
-            if (rng.NextDouble() < fadeProbability)
+            double prob = 1.0 - Math.Exp(-p.DeepFadeRate * bufferSec);
+            if (rng.NextDouble() < prob)
             {
-                double u = rng.NextDouble();
-                double meanDropMs = 1200.0; // Average 1.2 seconds (deep fade)
-                double minDropMs = 400.0; // Minimum 400ms
-                double fadeMs = 50.0; // Slower fade (50ms)
-                double durMs = Math.Max(minDropMs, -Math.Log(1.0 - u) * meanDropMs);
+                double durMs = Math.Max(400.0, -Math.Log(1.0 - rng.NextDouble()) * 1200.0);
                 _deepFadeSamplesLeft = (int)(_sampleRate * durMs / 1000.0);
-                _deepFadeFadeSamples = (int)(_sampleRate * fadeMs / 1000.0);
+                _deepFadeFadeSamples = (int)(_sampleRate * 50.0 / 1000.0);
                 _deepFadeInitialSamples = _deepFadeSamplesLeft;
             }
         }
+    }
 
+    /// <summary>
+    /// Applies the fading envelopes frame-by-frame. Both counters are
+    /// decremented here so they remain in sync with the buffer position.
+    /// </summary>
+    private void ApplyFading(float[] buffer, int offset, int frames)
+    {
         for (int frame = 0; frame < frames; frame++)
         {
             bool inDrop = _dropoutSamplesLeft > 0;
             bool inDeepFade = _deepFadeSamplesLeft > 0;
 
-            // Generate subtle DC whine (actually AC tone)
-            double whineIncrement = 2.0 * Math.PI * WhineFreq / _sampleRate;
-            float whineSample = (float)Math.Sin(_whinePhase) * WhineLevel;
-            _whinePhase += whineIncrement;
-            if (_whinePhase > Math.PI * 2) _whinePhase -= Math.PI * 2;
-            
-            // Generate subtle deep rumble
-            double rumbleIncrement = 2.0 * Math.PI * RumbleFreq / _sampleRate;
-            float rumbleSample = (float)Math.Sin(_rumblePhase) * RumbleLevel;
-            _rumblePhase += rumbleIncrement;
-            if (_rumblePhase > Math.PI * 2) _rumblePhase -= Math.PI * 2;
-
-            for (int c = 0; c < _channels; c++)
+            if (inDrop || inDeepFade)
             {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+                float envelope = 1f;
+                if (inDrop) envelope *= ComputeDropoutEnvelope();
+                if (inDeepFade) envelope *= ComputeDeepFadeEnvelope();
 
-                // === RF Fading (both fast flutter and deep fades) ===
-                if (inDrop)
-                {
-                    int fadeIn = _dropoutFadeSamples;
-                    int fadeOut = _dropoutFadeSamples;
-                    int age = _dropoutInitialSamples - _dropoutSamplesLeft;
-
-                    float dropoutEnvelope;
-                    if (age < fadeIn)
-                        dropoutEnvelope = 1f - (float)age / fadeIn;
-                    else if (_dropoutSamplesLeft < fadeOut)
-                        dropoutEnvelope = (float)(fadeOut - _dropoutSamplesLeft) / fadeOut;
-                    else
-                        dropoutEnvelope = 0f;
-
-                    x *= dropoutEnvelope;
-                }
-
-                if (inDeepFade)
-                {
-                    int fadeIn = _deepFadeFadeSamples;
-                    int fadeOut = _deepFadeFadeSamples;
-                    int age = _deepFadeInitialSamples - _deepFadeSamplesLeft;
-
-                    float deepFadeEnvelope;
-                    if (age < fadeIn)
-                        deepFadeEnvelope = 1f - (float)age / fadeIn;
-                    else if (_deepFadeSamplesLeft < fadeOut)
-                        deepFadeEnvelope = (float)(fadeOut - _deepFadeSamplesLeft) / fadeOut;
-                    else
-                        deepFadeEnvelope = 0f;
-
-                    x *= deepFadeEnvelope;
-                }
-
-                // === Oxygen mask (two-pole strong LPF + nasal boost) ===
-                float lp1 = _muffleLPChannels[c];
-                lp1 = _muffleA * lp1 + (1f - _muffleA) * x;
-                _muffleLPChannels[c] = lp1;
-
-                float lp2 = _muffleLP2Channels[c];
-                lp2 = _muffleA * lp2 + (1f - _muffleA) * lp1;
-                _muffleLP2Channels[c] = lp2;
-
-                // Stronger nasal boost for helmet/mask resonance
-                float nasal = x * 0.55f;
-
-                // Blend to final mask sound
-                x = (lp2 * 0.75f) + (nasal * 0.25f);
-
-                // === Digital brick-wall filter (biquad) ===
-                // State indices for this channel: [x[n-1], x[n-2], y[n-1], y[n-2]]
-                int stateBase = c * 4;
-
-                // Direct Form II biquad implementation
-                float xn1 = _filterState[stateBase]; // x[n-1]
-                float xn2 = _filterState[stateBase + 1]; // x[n-2]
-                float yn1 = _filterState[stateBase + 2]; // y[n-1]
-                float yn2 = _filterState[stateBase + 3]; // y[n-2]
-
-                // Compute output
-                float y = _b0 * x + _b1 * xn1 + _b2 * xn2 - _a1 * yn1 - _a2 * yn2;
-
-                // Update state
-                _filterState[stateBase + 1] = xn1; // x[n-2] = x[n-1]
-                _filterState[stateBase] = x; // x[n-1] = x[n]
-                _filterState[stateBase + 3] = yn1; // y[n-2] = y[n-1]
-                _filterState[stateBase + 2] = y; // y[n-1] = y[n]
-
-                float val = Math.Clamp(y, -1f, 1f);
-
-                if (!inDrop)
-                {
-                    val += whineSample + rumbleSample;
-                }
-
-                buffer[idx] = Math.Clamp(val, -1f, 1f);
+                for (int c = 0; c < _channels; c++)
+                    buffer[offset + frame * _channels + c] *= envelope;
             }
 
             if (inDrop) _dropoutSamplesLeft--;
             if (inDeepFade) _deepFadeSamplesLeft--;
         }
+    }
+
+    private float ComputeDropoutEnvelope()
+    {
+        int age = _dropoutInitialSamples - _dropoutSamplesLeft;
+        if (age < _dropoutFadeSamples) // signal dropping
+            return 1f - (float)age / _dropoutFadeSamples;
+        if (_dropoutSamplesLeft < _dropoutFadeSamples) // signal returning
+            return (float)_dropoutSamplesLeft / _dropoutFadeSamples;
+        return 0f; // fully attenuated
+    }
+
+    private float ComputeDeepFadeEnvelope()
+    {
+        int age = _deepFadeInitialSamples - _deepFadeSamplesLeft;
+        if (age < _deepFadeFadeSamples)
+            return 1f - (float)age / _deepFadeFadeSamples;
+        if (_deepFadeSamplesLeft < _deepFadeFadeSamples)
+            return (float)_deepFadeSamplesLeft / _deepFadeFadeSamples;
+        return 0f;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Utilities
+    // -----------------------------------------------------------------------
+
+    private static void ClampBuffer(float[] buffer, int offset, int samples)
+    {
+        int end = offset + samples;
+        for (int i = offset; i < end; i++)
+            buffer[i] = Math.Clamp(buffer[i], -2f, 2f);
     }
 }
