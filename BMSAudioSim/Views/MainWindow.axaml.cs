@@ -109,7 +109,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         ButtonSignal1Ptt.AddHandler(PointerPressedEvent, (sender, e) =>
         {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
         }, handledEventsToo: true);
 
@@ -122,7 +122,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             (sender, e) =>
             {
                 _radioPlayback.StartStream(_stream2Id,
-                    _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                    _stream2File, _signal2Params,
                     _viewModel.AmbientNoiseType);
             },
             handledEventsToo: true);
@@ -136,7 +136,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         base.OnLoaded(e);
         _radioPlayback.Initialize();
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
-        _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Right);
+        _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Both);
         _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Both);
 
         // Simulation timer — always running; only advances markers that are "playing"
@@ -722,19 +722,25 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             StatusText.Text = "Loading heightmap...";
 
+            // Load the raw heightmap data
             var cellSizeM = 1024d * 1000d / HEIGHTMAP_SIZE;
             if (_demReader != null)
                 _fastPathAudioSim = new FastPathAudioSim(_demReader, originX: 0, originY: 0, cellSizeMeters: cellSizeM,
                     _loggerFactory.CreateLogger<FastPathAudioSim>());
 
             StatusText.Text = "Creating preview image (this can take a minute)...";
+            // Generate preview image path
             var fileDir = Path.GetDirectoryName(filePath) ?? Environment.CurrentDirectory;
             var fileName = Path.GetFileNameWithoutExtension(filePath);
             _previewImagePath = Path.Combine(fileDir, $"{fileName}_preview.jpg");
 
+            // Create preview if it doesn't exist
             if (!File.Exists(_previewImagePath))
+            {
                 await Task.Run(() => CreatePreviewImage(_previewImagePath));
+            }
 
+            // Load and display the preview
             await LoadPreviewImage(_previewImagePath);
 
             StatusText.Text = $"Heightmap loaded: {HEIGHTMAP_SIZE}x{HEIGHTMAP_SIZE}";
@@ -797,13 +803,15 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
 
         using var image = SKImage.FromBitmap(bitmap);
-        using var data  = image.Encode(SKEncodedImageFormat.Jpeg, 90);
+        using var data = image.Encode(SKEncodedImageFormat.Jpeg, 90);
         using var stream = File.OpenWrite(outputPath);
         data.SaveTo(stream);
     }
 
     private SKColor GetHeightColor(float value)
     {
+        // Create a color gradient from low to high elevation
+        // Blue (0) -> Cyan -> Green -> Yellow -> Red (1)
         value = Math.Clamp(value, 0, 1);
         byte r, g, b;
 
@@ -873,20 +881,18 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.Ppm2,
             ViewModel.TxWatts,
             ViewModel.RxDbm,
-            true,
-            txVelocity: _sender1Vel, 
-            rxVelocity: _receiverVel);
+            true);
 
         if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
 
         UpdateProfileGraph(audioParams1, audioParams2);
 
-        Power1Text.Text    = audioParams1.ReceivedDb.ToString("F1");
-        Dropout1Text.Text  = audioParams1.DropoutRate.ToString();
+        Power1Text.Text = audioParams1.ReceivedDb.ToString("F1");
+        Dropout1Text.Text = audioParams1.DropoutRate.ToString();
         DeepFade1Text.Text = audioParams1.DeepFadeRate.ToString();
 
-        Power2Text.Text    = audioParams2.ReceivedDb.ToString("F1");
-        Dropout2Text.Text  = audioParams2.DropoutRate.ToString();
+        Power2Text.Text = audioParams2.ReceivedDb.ToString("F1");
+        Dropout2Text.Text = audioParams2.DropoutRate.ToString();
         DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();
 
         _signal1Params = audioParams1;
@@ -973,12 +979,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             yValues[i] = audioParams.TerrainProfile[i].elev;
         }
 
+        // Terrain fill
         var scatter = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
         scatter.Color     = terrainColor.WithAlpha(0.2);
         scatter.LineWidth = 0;
         scatter.FillY     = true;
         scatter.FillYValue = yValues.Min();
 
+        // Terrain line
         var line = HeightProfilePlot.Plot.Add.ScatterLine(xValues, yValues);
         line.Color      = terrainColor;
         line.LineWidth  = 2.5f;
@@ -998,17 +1006,20 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         receiverMarker.Size  = 12;
         receiverMarker.Shape = MarkerShape.FilledCircle;
 
+        // ==================== CURVED LOS PATH WITH EARTH CURVATURE ====================
         double totalDistance = xValues[xValues.Length - 1] - xValues[0];
         const double earthRadius = 6378000.0;
         double kAvg = FastPathAudioSim.CalculateKAvg(txAbsoluteHeight, rxAbsoluteHeight);
         double effectiveEarthRadius = kAvg * earthRadius;
 
+        // Calculate LOS curve
         int losPoints = 200;
         double[] losDist      = new double[losPoints];
         double[] losHeight    = new double[losPoints];
         double[] fresnelUpper = new double[losPoints];
         double[] fresnelLower = new double[losPoints];
 
+        // Wavelength for Fresnel zone
         double lambda = 299792458.0 / (audioParams.RadioFrequencyKHz * 1e3);
 
         for (int i = 0; i < losPoints; i++)
@@ -1017,9 +1028,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             double d  = totalDistance * t;
             losDist[i] = d + xOffset;
 
+            // Distance from TX and RX
             double d1 = d;
             double d2 = totalDistance - d;
+
+            // Earth curvature at this point
             double curvature = (d1 * d2) / (2.0 * effectiveEarthRadius);
+
+            // LOS height (linear interpolation minus curvature)
             double straightLOS = txAbsoluteHeight + (rxAbsoluteHeight - txAbsoluteHeight) * t;
             losHeight[i] = straightLOS - curvature;
 
@@ -1028,12 +1044,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             fresnelLower[i] = losHeight[i] - F1;
         }
 
+        // Plot curved LOS line
         var losLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, losHeight);
         losLine.Color       = losColor.WithAlpha(0.8);
         losLine.LineWidth   = 2.0f;
         losLine.LinePattern = LinePattern.Dashed;
         losLine.LegendText  = $"{label} LOS";
 
+        // Plot Fresnel zone boundaries
         var fresnelUpperLine = HeightProfilePlot.Plot.Add.ScatterLine(losDist, fresnelUpper);
         fresnelUpperLine.Color       = fresnelColor.WithAlpha(0.4);
         fresnelUpperLine.LineWidth   = 1.0f;
@@ -1045,10 +1063,12 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         fresnelLowerLine.LineWidth   = 1.0f;
         fresnelLowerLine.LinePattern = LinePattern.Dotted;
 
+        // Fill between Fresnel zone boundaries
         var fresnelFill = HeightProfilePlot.Plot.Add.FillY(losDist, fresnelLower, fresnelUpper);
         fresnelFill.FillColor = fresnelColor.WithAlpha(0.1);
         fresnelFill.LineWidth = 0;
 
+        // ==================== TX ALTITUDE REFERENCE LINE ====================
         var lineTXAlt = HeightProfilePlot.Plot.Add.HorizontalLine(txAbsoluteHeight);
         lineTXAlt.Text           = $"{label}: {txAbsoluteHeight:0} m";
         lineTXAlt.LabelAlignment = Alignment.LowerLeft;
@@ -1080,46 +1100,54 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         UpdateParameters();
 
         if (ViewModel.Signal1Continuous)
+        {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
-                _viewModel.AmbientNoiseType);
+                _stream1File, _signal1Params,
+                _viewModel.AmbientNoiseType);        }
 
         if (ViewModel.Signal2Continuous)
+        {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
+        }
     }
 
     private void OnSignal1PTTChanged(object? sender, RoutedEventArgs e)
     {
-        if (sender is not RadioButton) return;
+        if (sender is not RadioButton radioButton) return;
         if (((RadioButton)sender).IsChecked.GetValueOrDefault())
+        {
             _radioPlayback.StopStream(_stream1Id).Wait(100);
+        }
         else
+        {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
+        }
     }
 
     private void OnSignal2PTTChanged(object? sender, RoutedEventArgs e)
     {
-        if (sender is not RadioButton) return;
+        if (sender is not RadioButton radioButton) return;
         if (((RadioButton)sender).IsChecked.GetValueOrDefault())
+        {
             _radioPlayback.StopStream(_stream2Id).Wait(100);
+        }
         else
+        {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
+        }
     }
 
     private void OnPpmSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        var slider = sender as Slider;
-        
-        if (slider != null && slider.Equals(Ppm1Slider))
+        if (sender.Equals(Ppm1Slider))
             ViewModel.Ppm1 = (float)e.NewValue;
-        
-        else if (slider != null && slider.Equals(Ppm2Slider))
+        else if (sender.Equals(Ppm2Slider))
             ViewModel.Ppm2 = (float)e.NewValue;
         UpdateParameters();
     }
@@ -1135,19 +1163,20 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             _radioPlayback.Apply3dEffects = checkBox.IsChecked.GetValueOrDefault();
     }
 
-    private void OnUpdateDownsampledAudio(object? sender, RoutedEventArgs e)
+    private void OnAmbientNoiseTypeChanged(object? sender, RoutedEventArgs e)
     {
-        if (sender is CheckBox checkBox)
-            _viewModel.UseDownsampledAudio = checkBox.IsChecked.GetValueOrDefault();
-
         if (ViewModel.Signal1Continuous)
+        {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
+        }
 
         if (ViewModel.Signal2Continuous)
+        {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
+        }
     }
 }

@@ -14,8 +14,6 @@ namespace OpenFreqAudio;
 ///      (cockpit noise, oxygen-mask muffling, etc.)
 ///   2. <see cref="ApplyFading"/>                       — RF channel fading
 ///      (fast flutter 20–80 ms and deep fades 400–2000 ms)
-///   3. <see cref="IAmbientNoiseEffect.ApplyPostFade"/> — receiver-side filtering
-///      (brick-wall IF bandpass, etc.)
 ///
 /// The ambient layer (steps 1 + 3) is swapped out atomically when
 /// <see cref="AmbientNoise"/> changes, so it can be updated per-packet.
@@ -130,9 +128,6 @@ public class RadioEffect
         // 2. RF channel fading: schedule new events, then apply envelopes.
         ScheduleFadingEvents(rng, frames, p);
         ApplyFading(buffer, offset, frames);
-
-        // 3. Receiver filtering: brick-wall bandpass, etc.
-        ambientEffect.ApplyPostFade(buffer, offset, frames);
 
         // Safety clamp — should never fire under normal operation.
         ClampBuffer(buffer, offset, samples);

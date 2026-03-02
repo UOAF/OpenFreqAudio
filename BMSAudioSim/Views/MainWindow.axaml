@@ -17,8 +17,7 @@
             <TextBlock Name="StatusText" HorizontalAlignment="Right" VerticalAlignment="Center">No heightmap loaded</TextBlock>
             <CheckBox Margin="10,0,5,0" Content="Enable audio effects" IsCheckedChanged="OnEnable3dEffectsChanged" IsChecked="{Binding Enable3dEffects}"/>
             <TextBlock VerticalAlignment="Center" Margin="10, 0, 0, 0">Sound Effect Type</TextBlock>
-            <ComboBox ItemsSource="{Binding AmbientNoiseTypes}" SelectedValue="{Binding AmbientNoiseType, Mode=TwoWay}" SelectionChanged="OnUpdateDownsampledAudio"/>
-            <CheckBox Margin="10,0,5,0" Content="Downsampled audio" IsCheckedChanged="OnUpdateDownsampledAudio" IsChecked="{Binding UseDownsampledAudio, Mode=TwoWay}"/>
+            <ComboBox ItemsSource="{Binding AmbientNoiseTypes}" SelectedValue="{Binding AmbientNoiseType, Mode=TwoWay}" SelectionChanged="OnAmbientNoiseTypeChanged"/>
         </StackPanel>
 
         <!-- Main Content: Heightmap and Graph side by side -->
@@ -127,7 +126,7 @@
                 <TextBlock Name="Sender1PosText" Text="Not set" />
                 <TextBlock Name="Sender1VelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
                 <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
-                    <Button Name="PlayButton1" Content="▶ Simulate" Click="OnPlay1Clicked"
+                    <Button Name="PlayButton1" Content="▶ Move" Click="OnPlay1Clicked"
                             Background="#33AAFFAA" Foreground="LimeGreen"
                             Padding="6,2" FontSize="11"/>
                 </StackPanel>
@@ -163,7 +162,7 @@
                 <TextBlock Name="Sender2PosText" Text="Not set" />
                 <TextBlock Name="Sender2VelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
                 <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
-                    <Button Name="PlayButton2" Content="▶ Simulate" Click="OnPlay2Clicked"
+                    <Button Name="PlayButton2" Content="▶ Move" Click="OnPlay2Clicked"
                             Background="#3366AAFF" Foreground="DodgerBlue"
                             Padding="6,2" FontSize="11"/>
                 </StackPanel>
@@ -199,7 +198,7 @@
                 <TextBlock Name="ReceiverPosText" Text="Not set" />
                 <TextBlock Name="ReceiverVelText" Text="Speed: —" FontSize="11" Foreground="#AAFFFFFF"/>
                 <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3,0,3">
-                    <Button Name="PlayButtonReceiver" Content="▶ Simulate" Click="OnPlayReceiverClicked"
+                    <Button Name="PlayButtonReceiver" Content="▶ Move" Click="OnPlayReceiverClicked"
                             Background="#33FF6666" Foreground="OrangeRed"
                             Padding="6,2" FontSize="11"/>
                 </StackPanel>
