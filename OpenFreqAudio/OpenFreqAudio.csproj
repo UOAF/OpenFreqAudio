@@ -15,12 +15,6 @@
         <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
     </ItemGroup>
 
-    <ItemGroup>
-        <EmbeddedResource Include="Assets/stepped-on.ogg">
-            <CopyToOutputDirectory>Never</CopyToOutputDirectory>
-        </EmbeddedResource>
-    </ItemGroup>
-
     <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' OR '$(RuntimeIdentifier)' == 'win-x86' OR '$(RuntimeIdentifier)' == 'win-arm64'">
         <Content Include="../OpenFreqAudio/Assets/windows/**/*">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
@@ -37,5 +31,9 @@
             <TargetPath>%(Filename)%(Extension)</TargetPath>
             <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
         </Content>
+    </ItemGroup>
+
+    <ItemGroup>
+      <Folder Include="Models\" />
     </ItemGroup>
 </Project>

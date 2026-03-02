@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -378,7 +379,7 @@ public class RadioPlayback : IDisposable
 
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RadioPlayback> _logger;
-
+    
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
 
@@ -416,6 +417,7 @@ public class RadioPlayback : IDisposable
     private Task? _timeoutMonitorTask;
 
     private int _masterDspProcHandle;
+    
 
     public bool Apply3dEffects { get; set; }
 
@@ -547,6 +549,12 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.PlaybackBufferLength, 40);
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 2);
+            
+            #if !WINDOWS
+            // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
+            // We don't need to free it explicitly, this is covered by BASS 
+            NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
+            #endif
         }
 
         // Start peer timeout monitoring
