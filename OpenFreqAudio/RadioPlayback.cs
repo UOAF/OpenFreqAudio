@@ -25,7 +25,9 @@ class Biquad
 {
     private float B0;
     private float B1;
+
     private float B2;
+
     // A0 is always 1
     private float A1;
     private float A2;
@@ -335,10 +337,12 @@ public class RadioPlayback : IDisposable
     {
         // ReSharper disable UnusedAutoPropertyAccessor.Local
         public float Volume { get; set; } = 1.0f;
+
         /// <summary>
         /// Which ears should this radino play into?
         /// </summary>
         public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
+
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
         public bool WasHearableLastFrame { get; set; }
@@ -379,7 +383,7 @@ public class RadioPlayback : IDisposable
 
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RadioPlayback> _logger;
-    
+
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
 
@@ -417,7 +421,7 @@ public class RadioPlayback : IDisposable
     private Task? _timeoutMonitorTask;
 
     private int _masterDspProcHandle;
-    
+
 
     public bool Apply3dEffects { get; set; }
 
@@ -513,6 +517,7 @@ public class RadioPlayback : IDisposable
             {
                 x = b.Apply(x);
             }
+
             return x;
         };
     }
@@ -550,11 +555,12 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 2);
             
-            #if !WINDOWS
-            // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
-            // We don't need to free it explicitly, this is covered by BASS 
-            NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
-            #endif
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
+                // We don't need to free it explicitly, this is covered by BASS
+                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
+            }
         }
 
         // Start peer timeout monitoring
@@ -603,7 +609,7 @@ public class RadioPlayback : IDisposable
                 Channels = info.Channels,
                 IsPush = false,
                 RadioEffect = new RadioEffect(SampleRate, info.Channels, audioParams,
-                    _loggerFactory.CreateLogger<RadioEffect>())
+                        _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
                 CurrentParams = audioParams,
                 Buffer = new float[MaxBufferSize],
@@ -862,12 +868,12 @@ public class RadioPlayback : IDisposable
 
             // Get buffer status after push
             var (fillCount, capacity) = stream.GetRingBufferFillLevel();
-            #if DEBUG
+#if DEBUG
             float fillPercent = (float)fillCount / capacity * 100f;
             _logger.LogDebug(
                 "Pushed {Frames} frames ({Bytes} bytes, {BitsPerSample}-bit), buffer now {FillPercent:F1}% full ({FillCount}/{Capacity}) (StreamId: {StreamId})",
                 frames, audioData.Length, bytesPerSample * 8, fillPercent, fillCount, capacity, streamId);
-            #endif
+#endif
 
             // Handle transmission end marker
             // Process AFTER pushing audio so this final packet's audio is included
@@ -1015,7 +1021,7 @@ public class RadioPlayback : IDisposable
 
         return 1.0f; // Default
     }
-    
+
     public void SetFrequencyVolume(int frequencyKHz, float volume)
     {
         lock (_lock)
@@ -1024,7 +1030,7 @@ public class RadioPlayback : IDisposable
             _frequencies[frequencyKHz].Volume = Math.Clamp(volume, -2f, 2f); // allow for some boost
         }
     }
-    
+
     public float GetFrequencyVolume(int frequencyKHz)
     {
         lock (_lock)
@@ -1150,8 +1156,9 @@ public class RadioPlayback : IDisposable
             {
                 throw new ArgumentException("Only stereo playback supported");
             }
+
             int stereoOutputSamples = length / sizeof(float);
-            int samples = stereoOutputSamples / 2; 
+            int samples = stereoOutputSamples / 2;
 
             // Ensure buffers are large enough
             if (samples > MaxBufferSize)
@@ -1216,15 +1223,15 @@ public class RadioPlayback : IDisposable
             foreach (var stream in activeStreams.Where(s => s.IsTransmitting && !s.IsBuffering))
             {
                 var (count, capacity) = stream.GetRingBufferFillLevel();
-    
+
                 // Ignore streams with critically low buffers (<10%)
                 // They're finishing transmission and shouldn't throttle other streams
                 float fillPercent = (float)count / capacity * 100f;
                 if (fillPercent < 10f)
                 {
-                    continue;  // Skip this stream - don't let it throttle others
+                    continue; // Skip this stream - don't let it throttle others
                 }
-    
+
                 maxReady = Math.Min(maxReady, count);
             }
 
@@ -1248,6 +1255,7 @@ public class RadioPlayback : IDisposable
                     }
                 }
             }
+
             Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
 
             // 2: Process each frequency (noise + squelch + mixing), AKA radio,
@@ -1394,9 +1402,9 @@ public class RadioPlayback : IDisposable
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
                                 i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
-                                    Math.Cos(theta);
+                                     Math.Cos(theta);
                                 q += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
-                                    Math.Sin(theta);
+                                     Math.Sin(theta);
                             }
 
                             // Take the envelope.
@@ -1404,8 +1412,9 @@ public class RadioPlayback : IDisposable
                             // AGC time: are we attacking or decaying?
                             // See a discussion of the given time constants _agcAttack and _agcDecay
                             // at their declaration.
-                            double tau = _dspScratch[n] > freqConfig.AgcGain ?
-                                RadioConfig.AgcAttack : RadioConfig.AgcDecay;
+                            double tau = _dspScratch[n] > freqConfig.AgcGain
+                                ? RadioConfig.AgcAttack
+                                : RadioConfig.AgcDecay;
                             double alpha = 1 - Math.Exp(-1 / (SampleRate * tau));
                             // Update the AGC:
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
@@ -1474,9 +1483,9 @@ public class RadioPlayback : IDisposable
 
                     // Force-end stale transmissions (ONLY for push streams)
                     foreach (var s in freqStreams.Where(s =>
-                                s.IsPush &&
-                                s.IsTransmitting &&
-                                (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
+                                 s.IsPush &&
+                                 s.IsTransmitting &&
+                                 (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
                     {
 #if DEBUG
                         _logger.LogDebug("Force-ending stale transmission for {StreamId}", s.StreamId);
@@ -1503,7 +1512,7 @@ public class RadioPlayback : IDisposable
                 else
                 {
                     Array.Clear(_dspScratch, 0, samples);
-    
+
                     int numTransmitting = transmittingStreams.Count;
                     if (numTransmitting > 0)
                     {
@@ -1515,7 +1524,7 @@ public class RadioPlayback : IDisposable
                                 _dspScratch[i] += t.Buffer[i];
                             }
                         }
-        
+
                         // Normalize by number of streams to prevent clipping
                         float mixGain = 1.0f / (float)Math.Sqrt(numTransmitting);
                         for (int i = 0; i < samples; ++i)
@@ -1523,7 +1532,7 @@ public class RadioPlayback : IDisposable
                             _dspScratch[i] *= mixGain;
                         }
                     }
-    
+
                     // Set AGC back to unity so there's not sudden jumps
                     // when we turn FX back on.
                     freqConfig.AgcGain = 1;
