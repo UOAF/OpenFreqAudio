@@ -47,10 +47,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private readonly string _stream1Id = "stream1";
     private readonly string _stream1File = "countdown.ogg";
-    private readonly string _stream1FileDownsampled = "countdown_8khz.ogg";
     private readonly string _stream2Id = "stream2";
     private readonly string _stream2File = "audio2.ogg";
-    private readonly string _stream2FileDownsampled = "audio2_8khz.ogg";
 
 
     // Marker display
@@ -72,7 +70,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         ButtonSignal1Ptt.AddHandler(PointerPressedEvent, (sender, e) =>
         {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
         }, handledEventsToo: true);
 
@@ -85,7 +83,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             (sender, e) =>
             {
                 _radioPlayback.StartStream(_stream2Id,
-                    _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                    _stream2File, _signal2Params,
                     _viewModel.AmbientNoiseType);
             },
             handledEventsToo: true);
@@ -725,13 +723,13 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         if (ViewModel.Signal1Continuous)
         {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);        }
 
         if (ViewModel.Signal2Continuous)
         {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
         }
     }
@@ -746,7 +744,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         else
         {
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
         }
     }
@@ -761,7 +759,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         else
         {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
         }
     }
@@ -788,26 +786,19 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         }
     }
 
-    private void OnUpdateDownsampledAudio(object? sender, RoutedEventArgs e)
+    private void OnAmbientNoiseTypeChanged(object? sender, RoutedEventArgs e)
     {
-        if (sender is CheckBox checkBox)
-        {
-            _viewModel.UseDownsampledAudio = checkBox.IsChecked.GetValueOrDefault();
-        }
-        
         if (ViewModel.Signal1Continuous)
         {
-           
-            
             _radioPlayback.StartStream(_stream1Id,
-                _viewModel.UseDownsampledAudio ? _stream1FileDownsampled : _stream1File, _signal1Params,
+                _stream1File, _signal1Params,
                 _viewModel.AmbientNoiseType);
         }
 
         if (ViewModel.Signal2Continuous)
         {
             _radioPlayback.StartStream(_stream2Id,
-                _viewModel.UseDownsampledAudio ? _stream2FileDownsampled : _stream2File, _signal2Params,
+                _stream2File, _signal2Params,
                 _viewModel.AmbientNoiseType);
         }
     }

@@ -2,15 +2,58 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using ManagedBass;
+using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
 
 // ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio;
+
+/// <summary>
+/// A Direct Form II Transposed biquad filter,
+/// used to high-pass output.
+/// (Radios pass ~300+ Hz)
+/// </summary>
+/// <see cref="https://en.wikipedia.org/wiki/Digital_biquad_filter#Direct_form_2"/>
+class Biquad
+{
+    private float B0;
+    private float B1;
+    private float B2;
+    // A0 is always 1
+    private float A1;
+    private float A2;
+
+    // Delays
+    private float D1 = 0;
+    private float D2 = 0;
+
+    public Biquad(float b0, float b1, float b2, float a1, float a2)
+    {
+        B0 = b0;
+        B1 = b1;
+        B2 = b2;
+        A1 = a1;
+        A2 = a2;
+    }
+
+    public float Apply(float x)
+    {
+        // y[n] = b0 * x[n] + d1
+        // d1 = b1 * x[n] - a1 * y[n] + d2
+        // d2 = b2 * x[n] - a2 * y[n]
+        float y = B0 * x + D1;
+        D1 = B1 * x - A1 * y + D2;
+        D2 = B2 * x - A2 * y;
+        return y;
+    }
+}
 
 /// <summary>
 /// RadioPlayback
@@ -26,6 +69,7 @@ public class RadioPlayback : IDisposable
         public string StreamId { get; set; } = "";
         public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
+        public int BassMixerHandle { get; set; } // 0 if no mixer (push streams)
         public int Channels { get; set; } // 1=mono,2=stereo
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
         public required RadioEffect RadioEffect { get; set; }
@@ -305,6 +349,8 @@ public class RadioPlayback : IDisposable
 
         public bool WasSquelchOpen { get; set; }
 
+        public Func<float, float> HighPass { get; } = MakeHighPass();
+
         // AGC gain; varies as a low-pass of the received signal
         // according to attack and decay params below.
         public double AgcGain { get; set; } = 0;
@@ -333,7 +379,7 @@ public class RadioPlayback : IDisposable
 
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RadioPlayback> _logger;
-
+    
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
 
@@ -357,7 +403,9 @@ public class RadioPlayback : IDisposable
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
     private int _sampleNum = 0;
 
-    private int _sampleRate = 48000;
+    // Baseband is 8 kHz (4kHz Nyquist)
+    // NB: Opus only accepts 8000, 12000, 16000, 24000, or 48000 Hz
+    public const int SampleRate = 8000;
 
     private readonly int _channels = 2; // Always use Stereo output
 
@@ -369,8 +417,105 @@ public class RadioPlayback : IDisposable
     private Task? _timeoutMonitorTask;
 
     private int _masterDspProcHandle;
+    
 
     public bool Apply3dEffects { get; set; }
+
+    /// <summary>
+    /// Creates a 6th-order Butterworth high-pass filter.
+    /// </summary>
+    /// <remarks>
+    /// Each biquad gives us ~20dB per decade, so a single one has a very gradual dropoff,
+    /// but three is a good compromise - if our cutoff is 300Hz,
+    /// at 200Hz we have -60dB of attenuation.
+    /// </remarks>
+    /// <returns>A lambda that contains the filter state and applies it each call.</returns>
+    private static Func<float, float> MakeHighPass(double cutoff = 300, double sampleRate = SampleRate)
+    {
+        double t = 1.0 / sampleRate;
+        double k = 2.0 / t;
+        double wc = k * Math.Tan(Math.PI * cutoff / sampleRate);
+
+        // 6th-order Butterworth pole angles:
+        // For order n, prototype poles are at angles θ_k = π·(2k + n + 1) / (2n)
+        // for k = 0..n-1 on the unit circle in the s-plane.
+        //
+        // For n=6, the 6 poles are at angles:
+        //   θ = π·(2k+7)/12  for k = 0..5
+        //     = 7π/12, 9π/12, 11π/12, 13π/12, 15π/12, 17π/12
+        //
+        // Conjugate pairs (sharing the same real part):
+        //   Pair 0: k=0,5 → θ = 7π/12, 17π/12  → real part = cos(7π/12)
+        //   Pair 1: k=1,4 → θ = 9π/12, 15π/12  → real part = cos(9π/12)
+        //   Pair 2: k=2,3 → θ = 11π/12, 13π/12 → real part = cos(11π/12)
+        //
+        // Each conjugate pair (σ ± jω) gives a 2nd order section:
+        //   s² + 2|σ|·s + 1  in the normalized prototype
+        //
+        // The coefficient 2|σ| = 2·cos(π·(2k+1)/(2n)) for the kth pair.
+        int n = 6;
+        double k2 = k * k;
+        double wc2 = wc * wc;
+        double overallGain = 1;
+
+        List<(double, double)> pairs = [];
+        for (int pair = 0; pair < n / 2; ++pair)
+        {
+            // Angle of the pole in the upper half-plane
+            double theta = Math.PI * (2 * pair + n + 1) / (2 * n);
+
+            // Prototype 2nd order denominator: s² + alpha·s + 1
+            // where alpha = -2·cos(theta) = 2·|real part|
+            double alpha = -2.0 * Math.Cos(theta);
+
+            // Low to high-pass transform and bilinear transform
+            double aKwc = alpha * k * wc;
+
+            double d0 = k2 + aKwc + wc2;
+            double d1 = -2.0 * k2 + 2.0 * wc2;
+            double d2 = k2 - aKwc + wc2;
+
+            // Normalize coefficients (a0 = 1);
+            double a1 = d1 / d0;
+            double a2 = d2 / d0;
+
+            // Accumulate this section's gain: K²/d0
+            // All zeros are at z=1 (DC), so b is proportional to [1, -2, 1]
+            overallGain *= k2 / d0;
+
+            pairs.Add((a1, a2));
+        }
+
+        // Assemble biquad coefficients
+        // Standard convention: b = [1, -2, 1] for all sections except the first,
+        // which absorbs the overall gain. Sections ordered low-Q to high-Q.
+        pairs.Reverse();
+
+        List<Biquad> biquads = [];
+        for (int i = 0; i < pairs.Count; ++i)
+        {
+            var (a1, a2) = pairs[i];
+            if (i == 0)
+            {
+                float og = (float)overallGain;
+                // First section carries the overall gain
+                biquads.Add(new Biquad(og, -2.0f * og, og, (float)a1, (float)a2));
+            }
+            else
+            {
+                biquads.Add(new Biquad(1.0f, -2.0f, 1.0f, (float)a1, (float)a2));
+            }
+        }
+
+        return x =>
+        {
+            foreach (var b in biquads)
+            {
+                x = b.Apply(x);
+            }
+            return x;
+        };
+    }
 
     public RadioPlayback(ILoggerFactory loggerFactory, int playbackDeviceIndex = -1)
     {
@@ -389,7 +534,7 @@ public class RadioPlayback : IDisposable
                 if (!deviceInfo.IsInitialized)
                 {
                     // Initialize the new device
-                    if (!Bass.Init(playbackDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+                    if (!Bass.Init(playbackDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
                     {
                         _logger.LogError($"Failed to initialize device {playbackDeviceIndex}: {Bass.LastError}");
                         return;
@@ -404,6 +549,12 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.PlaybackBufferLength, 40);
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 2);
+            
+            #if !WINDOWS
+            // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
+            // We don't need to free it explicitly, this is covered by BASS 
+            NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
+            #endif
         }
 
         // Start peer timeout monitoring
@@ -416,8 +567,6 @@ public class RadioPlayback : IDisposable
         _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
         int bassStream;
         ChannelInfo info;
-        bool needsRecreate = false;
-        int newSampleRate = 0;
 
         lock (_lock)
         {
@@ -431,46 +580,29 @@ public class RadioPlayback : IDisposable
 
             info = Bass.ChannelGetInfo(bassStream);
 
-            _logger.LogInformation("File info: SampleRate={SampleRate}, Channels={Channels}", info.Frequency,
-                info.Channels);
-
-            // Check if sample rate changed - recreate master stream if needed
-            if (_sampleRate != info.Frequency)
-            {
-                _logger.LogWarning(
-                    "Sample rate mismatch! File={FileSampleRate}, Master={MasterSampleRate}. Recreating master stream.",
-                    info.Frequency, _sampleRate);
-                needsRecreate = true;
-                newSampleRate = info.Frequency;
-            }
-            else
-            {
-                _logger.LogDebug("Using existing master stream: SampleRate={SampleRate}, Channels={Channels}",
-                    _sampleRate, _channels);
-            }
-        }
-
-        if (needsRecreate)
-        {
-            StopMasterStream();
-            lock (_lock)
-            {
-                _sampleRate = newSampleRate;
-            }
-
-            StartMasterStream();
+            _logger.LogInformation("File info: NativeRate={NativeRate}, Channels={Channels}, ResampledTo={InputRate}",
+                info.Frequency, info.Channels, SampleRate);
         }
 
         lock (_lock)
         {
+            // Create a BassMix mixer to resample from native rate to SampleRate
+            int mixer = BassMix.CreateMixerStream(SampleRate, info.Channels,
+                BassFlags.Decode | BassFlags.Float);
+            if (mixer == 0)
+                throw new Exception($"BASS error creating mixer for '{streamId}': {Bass.LastError}");
+            if (!BassMix.MixerAddChannel(mixer, bassStream, BassFlags.Default))
+                throw new Exception($"BASS error adding channel to mixer for '{streamId}': {Bass.LastError}");
+
             var stream = new RadioStream(_logger)
             {
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = bassStream,
+                BassMixerHandle = mixer,
                 Channels = info.Channels,
                 IsPush = false,
-                RadioEffect = new RadioEffect(info.Frequency, info.Channels, audioParams,
+                RadioEffect = new RadioEffect(SampleRate, info.Channels, audioParams,
                     _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
                 CurrentParams = audioParams,
@@ -479,15 +611,14 @@ public class RadioPlayback : IDisposable
                 AmbientNoise = ambientNoise
             };
 
-
             // Allocate a ring buffer (5 seconds worth of audio)
-            int ringFrames = info.Frequency * 5;
+            int ringFrames = SampleRate * 5;
             stream.EnsureRingBufferCapacity(ringFrames * Math.Max(1, stream.Channels));
 
-            // Start a background task that pulls decoded floats from the BASS decode stream and pushes them into the ring buffer.
+            // Start a background task that pulls resampled floats from the mixer and pushes them into the ring buffer.
             stream.FileReaderCts = new CancellationTokenSource();
             var token = stream.FileReaderCts.Token;
-            int streamSampleRate = info.Frequency; // Capture for use in lambda
+            int streamSampleRate = SampleRate;
             stream.FileReaderTask = Task.Run(() =>
             {
                 try
@@ -502,7 +633,7 @@ public class RadioPlayback : IDisposable
                     while (!token.IsCancellationRequested)
                     {
                         int bytesRequested = chunkSamples * sizeof(float);
-                        int bytesRead = Bass.ChannelGetData(bassStream, readBuffer, bytesRequested);
+                        int bytesRead = Bass.ChannelGetData(mixer, readBuffer, bytesRequested);
 
                         if (bytesRead <= 0)
                         {
@@ -599,48 +730,26 @@ public class RadioPlayback : IDisposable
             _streams.Add(streamId, stream);
 
             _logger.LogInformation(
-                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, FileRate={FileRate}Hz, MasterRate={MasterRate}Hz, RingBuffer={RingBufferSize} floats",
+                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, NativeRate={NativeRate}Hz, ResampledTo={InputRate}Hz, RingBuffer={RingBufferSize} floats",
                 streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.ReceivedDb, info.Channels, info.Frequency,
-                _sampleRate, stream.RingBuffer.Length);
-
-            if (info.Frequency != _sampleRate)
-            {
-                _logger.LogWarning(
-                    "Sample rate mismatch! File={FileRate}Hz, Master={MasterRate}Hz - this will cause timing issues!",
-                    info.Frequency, _sampleRate);
-            }
+                SampleRate, stream.RingBuffer.Length);
         }
     }
 
     public void StartPushStream(string streamId, int sampleRate, int channels, AudioParams audioParams)
     {
-        bool needsRecreate = false;
-        int newSampleRate = 0;
+        if (sampleRate != SampleRate)
+        {
+            throw new ArgumentException($"Push stream had sample rate of {sampleRate}, expected {SampleRate}");
+        }
 
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) return;
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
                 _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
-
-            // Check if sample rate changed - recreate master stream if needed
-            if (_sampleRate != sampleRate)
-            {
-                needsRecreate = true;
-                newSampleRate = sampleRate;
-            }
         }
 
-        if (needsRecreate)
-        {
-            StopMasterStream();
-            lock (_lock)
-            {
-                _sampleRate = newSampleRate;
-            }
-
-            StartMasterStream();
-        }
 
         lock (_lock)
         {
@@ -805,6 +914,11 @@ public class RadioPlayback : IDisposable
             stream.StopFileReader();
         }
 
+        if (!stream.IsPush && stream.BassMixerHandle != 0)
+        {
+            Bass.StreamFree(stream.BassMixerHandle);
+        }
+
         if (!stream.IsPush && stream.BassStreamHandle != 0)
         {
             Bass.StreamFree(stream.BassStreamHandle);
@@ -854,7 +968,7 @@ public class RadioPlayback : IDisposable
             freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
             {
-                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(_sampleRate, _channels, frequencyKHz);
+                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, _channels, frequencyKHz);
 
                 var bandConfig = FastPathAudioSim.GetBandConfig(frequencyKHz);
 
@@ -988,7 +1102,7 @@ public class RadioPlayback : IDisposable
             return length;
         };
 
-        _masterStream = Bass.CreateStream(_sampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
+        _masterStream = Bass.CreateStream(SampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
         if (_masterStream == 0) throw new Exception($"BASS error creating master stream: {Bass.LastError}");
         SetupDSPAndPlay();
     }
@@ -1276,7 +1390,7 @@ public class RadioPlayback : IDisposable
                             {
                                 // θ_k is the phasor that rotates around at each beat frequency k.
                                 double theta = 2.0f * Math.PI * beats[k] *
-                                    (double)(n + _sampleNum) / (double)_sampleRate;
+                                    (double)(n + _sampleNum) / (double)SampleRate;
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
                                 i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
@@ -1292,9 +1406,12 @@ public class RadioPlayback : IDisposable
                             // at their declaration.
                             double tau = _dspScratch[n] > freqConfig.AgcGain ?
                                 RadioConfig.AgcAttack : RadioConfig.AgcDecay;
-                            double alpha = 1 - Math.Exp(-1 / (_sampleRate * tau));
+                            double alpha = 1 - Math.Exp(-1 / (SampleRate * tau));
                             // Update the AGC:
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+
+                            // High-pass the signal, which removes the DC component and centers us around 0
+                            _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
 
                             // Squelch is driven by the AGC gain.
                             // When it starts attenuating, we know we hear something.
@@ -1305,7 +1422,7 @@ public class RadioPlayback : IDisposable
                                 // Apply AGC, then remove our DC component, i.e.,
                                 // shift our envelope from [0, 2] back to [-1, 1].
                                 // Real electronics would use some high-pass filter that notches out 0 Hz.
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
                                 squelchOpened = true;
                             }
                             else
@@ -1317,17 +1434,20 @@ public class RadioPlayback : IDisposable
                     // Nothing is transmitting except noise, decay AGC back to unity.
                     else
                     {
-                        var alpha = 1 - Math.Exp(-1 / (_sampleRate * RadioConfig.AgcDecay));
+                        var alpha = 1 - Math.Exp(-1 / (SampleRate * RadioConfig.AgcDecay));
                         for (int n = 0; n < samples; ++n)
                         {
                             double i = _dspScratch[n];
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+
+                            _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
+
                             // See above.
                             if (freqConfig.AgcGain >= squelchThreshold)
                             {
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain - 1.0f;
+                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
                                 squelchOpened = true;
                             }
                             else
@@ -1571,7 +1691,7 @@ public class RadioPlayback : IDisposable
         if (!deviceInfo.IsInitialized)
         {
             // Initialize the new device
-            if (!Bass.Init(newDeviceIndex, _sampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+            if (!Bass.Init(newDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
             {
                 _logger.LogError($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
                 return;

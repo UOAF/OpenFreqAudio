@@ -37,14 +37,6 @@ public class MainWindowViewModel : ReactiveObject
         set => this.RaiseAndSetIfChanged(ref _ambientNoiseType, value);
     }
 
-    private bool _useDownsampledAudio = true;
-
-    public bool UseDownsampledAudio
-    {
-        get => _useDownsampledAudio;
-        set => this.RaiseAndSetIfChanged(ref _useDownsampledAudio, value);
-    }
-
     public float Squelch
     {
         get => _squelch;

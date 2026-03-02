@@ -31,9 +31,6 @@ internal interface IAmbientNoiseEffect
 {
     /// <summary>Transmitter-side acoustics. Called on clean PCM before RF fading.</summary>
     void ApplyPreFade(float[] buffer, int offset, int frames);
-
-    /// <summary>Receiver-side filtering. Called after RF fading.</summary>
-    void ApplyPostFade(float[] buffer, int offset, int frames);
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +59,6 @@ internal sealed class NullAmbientEffect : IAmbientNoiseEffect
     private NullAmbientEffect() { }
 
     public void ApplyPreFade(float[] buffer, int offset, int frames) { }
-    public void ApplyPostFade(float[] buffer, int offset, int frames) { }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,18 +73,11 @@ internal sealed class NullAmbientEffect : IAmbientNoiseEffect
 ///   → [PreFade]  engine roar: noise → one-pole LPF 350 Hz (additive)
 ///   → [PreFade]  oxygen-mask two-pole LPF 900 Hz + nasal cavity blend
 ///   → RF fading  (handled by RadioEffect)
-///   → [PostFade] 300–2700 Hz brick-wall biquad bandpass
 /// </summary>
 internal sealed class AirAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
     private readonly int _channels;
-
-    // Biquad bandpass — post-fade receiver IF filter, per-channel state [x1, x2, y1, y2]
-    private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> BiquadCache = new();
-    private static readonly object BiquadCacheLock = new();
-    private readonly float _b0, _b1, _b2, _a1, _a2;
-    private readonly float[] _biquadState;
 
     // Oxygen-mask LPF — two cascaded one-pole stages at 900 Hz
     private const float MuffleCutoff = 900f;
@@ -125,17 +114,6 @@ internal sealed class AirAmbientEffect : IAmbientNoiseEffect
     {
         _sampleRate = sampleRate;
         _channels   = channels;
-
-        _biquadState = new float[channels * 4];
-        lock (BiquadCacheLock)
-        {
-            if (!BiquadCache.TryGetValue(sampleRate, out var c))
-            {
-                c = CalculateBiquadCoefficients(sampleRate);
-                BiquadCache[sampleRate] = c;
-            }
-            (_b0, _b1, _b2, _a1, _a2) = c;
-        }
 
         _muffleA   = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
         _muffleLP1 = new float[channels];
@@ -197,49 +175,6 @@ internal sealed class AirAmbientEffect : IAmbientNoiseEffect
             }
         }
     }
-
-    public void ApplyPostFade(float[] buffer, int offset, int frames)
-    {
-        for (int frame = 0; frame < frames; frame++)
-        {
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx       = offset + frame * _channels + c;
-                int stateBase = c * 4;
-
-                float xn1 = _biquadState[stateBase];
-                float xn2 = _biquadState[stateBase + 1];
-                float yn1 = _biquadState[stateBase + 2];
-                float yn2 = _biquadState[stateBase + 3];
-
-                float x = buffer[idx];
-                float y = _b0 * x + _b1 * xn1 + _b2 * xn2 - _a1 * yn1 - _a2 * yn2;
-
-                _biquadState[stateBase + 1] = xn1;
-                _biquadState[stateBase]     = x;
-                _biquadState[stateBase + 3] = yn1;
-                _biquadState[stateBase + 2] = y;
-
-                buffer[idx] = y;
-            }
-        }
-    }
-
-    /// <summary>2nd-order Butterworth bandpass: 300–2700 Hz.</summary>
-    private static (float b0, float b1, float b2, float a1, float a2) CalculateBiquadCoefficients(int sampleRate)
-    {
-        const float LowFreq  = 300f;
-        const float HighFreq = 2700f;
-        float centerFreq = (LowFreq + HighFreq) / 2f;
-        float bandwidth  = HighFreq - LowFreq;
-        float w0     = 2f * MathF.PI * centerFreq / sampleRate;
-        float Q      = centerFreq / bandwidth;
-        float alpha  = MathF.Sin(w0) / (2f * Q);
-        float cosw0  = MathF.Cos(w0);
-        float b0 = alpha;  float b1 = 0f;  float b2 = -alpha;
-        float a0 = 1f + alpha;  float a1 = -2f * cosw0;  float a2 = 1f - alpha;
-        return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,18 +190,11 @@ internal sealed class AirAmbientEffect : IAmbientNoiseEffect
 ///   → [PreFade]  chassis clatter: noise → LPF 450 Hz (track/suspension impacts)
 ///   → [PreFade]  crew compartment coloration: LPF 2000 Hz (sealed metal hull)
 ///   → RF fading  (handled by RadioEffect)
-///   → [PostFade] 300–2700 Hz brick-wall biquad bandpass
 /// </summary>
 internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
     private readonly int _channels;
-
-    // Biquad bandpass — post-fade, same receiver spec as Air
-    private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> BiquadCache = new();
-    private static readonly object BiquadCacheLock = new();
-    private readonly float _b0, _b1, _b2, _a1, _a2;
-    private readonly float[] _biquadState;
 
     // Diesel AM — firing frequency + hull resonance beating for organic lope.
     // Higher depths than jet: no acoustic isolation between engine and crew.
@@ -309,17 +237,6 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
     {
         _sampleRate = sampleRate;
         _channels   = channels;
-
-        _biquadState = new float[channels * 4];
-        lock (BiquadCacheLock)
-        {
-            if (!BiquadCache.TryGetValue(sampleRate, out var c))
-            {
-                c = CalculateBiquadCoefficients(sampleRate);
-                BiquadCache[sampleRate] = c;
-            }
-            (_b0, _b1, _b2, _a1, _a2) = c;
-        }
 
         _roarLpA    = MathF.Exp(-2f * MathF.PI * 500f / sampleRate);
         _driveHpA   = MathF.Exp(-2f * MathF.PI * 350f / sampleRate);
@@ -384,49 +301,6 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
             }
         }
     }
-
-    public void ApplyPostFade(float[] buffer, int offset, int frames)
-    {
-        for (int frame = 0; frame < frames; frame++)
-        {
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx       = offset + frame * _channels + c;
-                int stateBase = c * 4;
-
-                float xn1 = _biquadState[stateBase];
-                float xn2 = _biquadState[stateBase + 1];
-                float yn1 = _biquadState[stateBase + 2];
-                float yn2 = _biquadState[stateBase + 3];
-
-                float x = buffer[idx];
-                float y = _b0 * x + _b1 * xn1 + _b2 * xn2 - _a1 * yn1 - _a2 * yn2;
-
-                _biquadState[stateBase + 1] = xn1;
-                _biquadState[stateBase]     = x;
-                _biquadState[stateBase + 3] = yn1;
-                _biquadState[stateBase + 2] = y;
-
-                buffer[idx] = y;
-            }
-        }
-    }
-
-    /// <summary>2nd-order Butterworth bandpass: 300–2700 Hz.</summary>
-    private static (float b0, float b1, float b2, float a1, float a2) CalculateBiquadCoefficients(int sampleRate)
-    {
-        const float LowFreq  = 300f;
-        const float HighFreq = 2700f;
-        float centerFreq = (LowFreq + HighFreq) / 2f;
-        float bandwidth  = HighFreq - LowFreq;
-        float w0    = 2f * MathF.PI * centerFreq / sampleRate;
-        float Q     = centerFreq / bandwidth;
-        float alpha = MathF.Sin(w0) / (2f * Q);
-        float cosw0 = MathF.Cos(w0);
-        float b0 = alpha;  float b1 = 0f;  float b2 = -alpha;
-        float a0 = 1f + alpha;  float a1 = -2f * cosw0;  float a2 = 1f - alpha;
-        return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,18 +315,11 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
 ///   → [PreFade]  electronics hiss: noise → bandpass 300–1500 Hz (rack equipment + fans)
 ///   → [PreFade]  room coloration: LPF 3500 Hz (open desk mic in enclosed ops room)
 ///   → RF fading  (handled by RadioEffect)
-///   → [PostFade] 300–2700 Hz brick-wall biquad bandpass
 /// </summary>
 internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
     private readonly int _channels;
-
-    // Biquad bandpass — post-fade, shared receiver spec with AirAmbientEffect
-    private static readonly Dictionary<int, (float b0, float b1, float b2, float a1, float a2)> BiquadCache = new();
-    private static readonly object BiquadCacheLock = new();
-    private readonly float _b0, _b1, _b2, _a1, _a2;
-    private readonly float[] _biquadState;
 
     // Mains hum — 50 Hz fundamental + 2nd harmonic (rectifier ripple) + 3rd (odd distortion)
     private const float MainsFreq        = 50f;
@@ -487,17 +354,6 @@ internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
     {
         _sampleRate = sampleRate;
         _channels   = channels;
-
-        _biquadState = new float[channels * 4];
-        lock (BiquadCacheLock)
-        {
-            if (!BiquadCache.TryGetValue(sampleRate, out var c))
-            {
-                c = CalculateBiquadCoefficients(sampleRate);
-                BiquadCache[sampleRate] = c;
-            }
-            (_b0, _b1, _b2, _a1, _a2) = c;
-        }
 
         _hvacLpA     = MathF.Exp(-2f * MathF.PI * 220f  / sampleRate);
         _hissLpHighA = MathF.Exp(-2f * MathF.PI * 1500f / sampleRate);
@@ -551,48 +407,5 @@ internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
                 buffer[idx] = lp;
             }
         }
-    }
-
-    public void ApplyPostFade(float[] buffer, int offset, int frames)
-    {
-        for (int frame = 0; frame < frames; frame++)
-        {
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx       = offset + frame * _channels + c;
-                int stateBase = c * 4;
-
-                float xn1 = _biquadState[stateBase];
-                float xn2 = _biquadState[stateBase + 1];
-                float yn1 = _biquadState[stateBase + 2];
-                float yn2 = _biquadState[stateBase + 3];
-
-                float x = buffer[idx];
-                float y = _b0 * x + _b1 * xn1 + _b2 * xn2 - _a1 * yn1 - _a2 * yn2;
-
-                _biquadState[stateBase + 1] = xn1;
-                _biquadState[stateBase]     = x;
-                _biquadState[stateBase + 3] = yn1;
-                _biquadState[stateBase + 2] = y;
-
-                buffer[idx] = y;
-            }
-        }
-    }
-
-    /// <summary>2nd-order Butterworth bandpass: 300–2700 Hz.</summary>
-    private static (float b0, float b1, float b2, float a1, float a2) CalculateBiquadCoefficients(int sampleRate)
-    {
-        const float LowFreq  = 300f;
-        const float HighFreq = 2700f;
-        float centerFreq = (LowFreq + HighFreq) / 2f;
-        float bandwidth  = HighFreq - LowFreq;
-        float w0    = 2f * MathF.PI * centerFreq / sampleRate;
-        float Q     = centerFreq / bandwidth;
-        float alpha = MathF.Sin(w0) / (2f * Q);
-        float cosw0 = MathF.Cos(w0);
-        float b0 = alpha;  float b1 = 0f;  float b2 = -alpha;
-        float a0 = 1f + alpha;  float a1 = -2f * cosw0;  float a2 = 1f - alpha;
-        return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
     }
 }

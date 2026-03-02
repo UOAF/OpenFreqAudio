@@ -22,15 +22,6 @@
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
             <TargetPath>%(Filename)%(Extension)</TargetPath>
         </Content>
-
-        <Content Include="Assets/audio2_8khz.ogg">
-            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-            <TargetPath>%(Filename)%(Extension)</TargetPath>
-        </Content>
-        <Content Include="Assets/countdown_8khz.ogg">
-            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-            <TargetPath>%(Filename)%(Extension)</TargetPath>
-        </Content>
     </ItemGroup>
 
     <ItemGroup>
