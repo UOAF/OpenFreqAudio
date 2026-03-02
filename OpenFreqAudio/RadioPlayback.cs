@@ -1247,9 +1247,6 @@ public class RadioPlayback : IDisposable
                         {
                             // We need to convert from dB to linear power when weighing the signals.
                             var thisSnrLinear = Math.Pow(10, transmittingStreams[i].CurrentParams.ReceivedSnrDb / 20.0);
-                            // This is essentially doing AGC - the loudest transmitter goes from [0, 2]
-                            // and the rest are some fraction of that.
-                            // See the comment about squelch - we could replace this with an actual ramp up and down.
                             relativePowers.Add((float)thisSnrLinear);
                             if (i == 0)
                             {
