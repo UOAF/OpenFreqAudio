@@ -881,7 +881,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             ViewModel.Ppm2,
             ViewModel.TxWatts,
             ViewModel.RxDbm,
-            true);
+            true,
+            txVelocity: _sender2Vel,
+            rxVelocity: _receiverVel);
 
         if (audioParams1 == null || audioParams2 == null) throw new Exception("audioParams is null");
 
