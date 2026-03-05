@@ -290,18 +290,21 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
             case DragTarget.Sender1Vel:
                 _sender1Vel = UpdateVelocityFromDrag(_sender1Vel, delta);
                 UpdateVelocityLabels();
+                UpdateParameters();  
                 UpdateMarkers();
                 break;
 
             case DragTarget.Sender2Vel:
                 _sender2Vel = UpdateVelocityFromDrag(_sender2Vel, delta);
                 UpdateVelocityLabels();
+                UpdateParameters();  
                 UpdateMarkers();
                 break;
 
             case DragTarget.ReceiverVel:
                 _receiverVel = UpdateVelocityFromDrag(_receiverVel, delta);
                 UpdateVelocityLabels();
+                UpdateParameters();  
                 UpdateMarkers();
                 break;
         }
