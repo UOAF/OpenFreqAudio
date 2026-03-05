@@ -78,6 +78,12 @@ namespace OpenFreqAudio
 
         // Debug/visualization data
         public List<(double dist, double elev)>? TerrainProfile;
+
+        public override string ToString()
+        {
+            return $"ReceivedDb: {ReceivedDb}, ReceivedSnrDb: {ReceivedSnrDb}, DropoutRate : {DropoutRate}, DeepFadeRate: {DeepFadeRate}, TuneOffsetPPM: {TuneOffsetPPM}";
+        }
+        
     }
 
     // ================================================================
