@@ -1440,25 +1440,28 @@ public class RadioPlayback : IDisposable
                             }
                         }
                     }
-                    // Nothing is transmitting except noise, decay AGC back to unity.
+                    // Nothing is transmitting — generate background noise at output-calibrated levels,
+                    // bypassing AGC normalization entirely.
                     else
                     {
+                        // Regenerate noise at perceptual output levels, independent of IQ/SNR calibration.
+                        freqConfig.NoiseGenerator?.GenerateBackgroundNoise(_dspScratch, 0, samples);
+                        freqConfig.NoiseGenerator?.GenerateBackgroundNoise(_dspScratch2, 0, samples);
+
+                        // Decay AGC toward zero independently of noise output.
                         var alpha = 1 - Math.Exp(-1 / (SampleRate * RadioConfig.AgcDecay));
                         for (int n = 0; n < samples; ++n)
                         {
+                            freqConfig.AgcGain = (1 - alpha) * freqConfig.AgcGain;
+
                             double i = _dspScratch[n];
                             double q = _dspScratch2[n];
-                            _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                            freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+                            _dspScratch[n] = freqConfig.HighPass((float)Math.Sqrt(i * i + q * q));
 
-                            _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
-
+                            // Only pass noise while squelch is still open (AGC tail from previous TX).
+                            // Once AGC decays below threshold — or if there was never a TX — output silence.
                             if (freqConfig.AgcGain >= squelchThreshold)
                             {
-                                // Don't normalize by AgcGain here — it's still inflated from the
-                                // just-finished transmission and would cause the noise to ramp up
-                                // as the gain decays. Output at a fixed level instead.
-                                _dspScratch[n] /= squelchThreshold;
                                 squelchOpened = true;
                             }
                             else

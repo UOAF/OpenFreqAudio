@@ -225,4 +225,13 @@ public class BackgroundNoiseGenerator
         // Normalize by number of dice for consistent amplitude
         return _pinkNoiseSum / _pinkNoiseDice.Length;
     }
+    
+    /// <summary>
+    /// Generate background noise for direct audio output (idle state, no transmission).
+    /// Amplitude is calibrated for perceptual loudness, not for IQ/SNR computation.
+    /// </summary>
+    public void GenerateBackgroundNoise(float[] buffer, int offset, int samples, float gain = 0.05f)
+    {
+        GenerateNoise(buffer, offset, samples, gain);
+    }
 }
