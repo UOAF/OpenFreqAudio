@@ -1453,10 +1453,12 @@ public class RadioPlayback : IDisposable
 
                             _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
 
-                            // See above.
                             if (freqConfig.AgcGain >= squelchThreshold)
                             {
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
+                                // Don't normalize by AgcGain here — it's still inflated from the
+                                // just-finished transmission and would cause the noise to ramp up
+                                // as the gain decays. Output at a fixed level instead.
+                                _dspScratch[n] /= squelchThreshold;
                                 squelchOpened = true;
                             }
                             else
