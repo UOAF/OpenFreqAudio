@@ -1,0 +1,134 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        include:
+          # Self-contained builds
+          - os: win-x64
+            runtime: win-x64
+            self-contained: true
+            archive-name: openfreq-windows-x64-selfcontained
+            archive-ext: zip
+          - os: linux-x64
+            runtime: linux-x64
+            self-contained: true
+            archive-name: openfreq-linux-x64-selfcontained
+            archive-ext: tar.gz
+          # Framework-dependent builds
+          - os: win-x64
+            runtime: win-x64
+            self-contained: false
+            archive-name: openfreq-windows-x64-framework
+            archive-ext: zip
+          - os: linux-x64
+            runtime: linux-x64
+            self-contained: false
+            archive-name: openfreq-linux-x64-framework
+            archive-ext: tar.gz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'ga'
+
+      - name: Restore dependencies
+        run: dotnet restore OpenFreqAudio.sln
+
+      - name: Build OpenFreqAudio
+        run: |
+          dotnet publish OpenFreqAudio/OpenFreqAudio.csproj \
+            -c Release \
+            -r ${{ matrix.runtime }} \
+            --self-contained ${{ matrix.self-contained }} \
+            -p:PublishSingleFile=false \
+            -o ./publish/OpenFreqAudio
+
+      - name: Build BMSAudioSim
+        run: |
+          dotnet publish BMSAudioSim/BMSAudioSim.csproj \
+            -c Release \
+            -r ${{ matrix.runtime }} \
+            --self-contained ${{ matrix.self-contained }} \
+            -p:PublishSingleFile=false \
+            -o ./publish/BMSAudioSim
+
+      - name: Copy native libraries (Windows)
+        if: matrix.os == 'win-x64'
+        run: |
+          # Copy BASS libraries for OpenFreqAudio
+          cp OpenFreqAudio/Assets/windows/bass.dll ./publish/OpenFreqAudio/
+          cp OpenFreqAudio/Assets/windows/bassmix.dll ./publish/OpenFreqAudio/
+          # Copy BASS libraries for BMSAudioSim
+          cp OpenFreqAudio/Assets/windows/bass.dll ./publish/BMSAudioSim/
+          cp OpenFreqAudio/Assets/windows/bassmix.dll ./publish/BMSAudioSim/
+
+      - name: Copy native libraries (Linux)
+        if: matrix.os == 'linux-x64'
+        run: |
+          # Copy BASS libraries for OpenFreqAudio
+          cp OpenFreqAudio/Assets/linux/libbass.so ./publish/OpenFreqAudio/
+          cp OpenFreqAudio/Assets/linux/libbassmix.so ./publish/OpenFreqAudio/
+          # Copy BASS libraries for BMSAudioSim
+          cp OpenFreqAudio/Assets/linux/libbass.so ./publish/BMSAudioSim/
+          cp OpenFreqAudio/Assets/linux/libbassmix.so ./publish/BMSAudioSim/
+
+      - name: Create release structure
+        run: |
+          mkdir -p ./release/${{ matrix.archive-name }}
+          cp -r ./publish/OpenFreqAudio ./release/${{ matrix.archive-name }}/
+          cp -r ./publish/BMSAudioSim ./release/${{ matrix.archive-name }}/
+
+      - name: Create archive (Windows)
+        if: matrix.archive-ext == 'zip'
+        run: |
+          cd ./release
+          zip -r ${{ matrix.archive-name }}.zip ${{ matrix.archive-name }}
+
+      - name: Create archive (Linux)
+        if: matrix.archive-ext == 'tar.gz'
+        run: |
+          cd ./release
+          tar -czf ${{ matrix.archive-name }}.tar.gz ${{ matrix.archive-name }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive-name }}
+          path: ./release/${{ matrix.archive-name }}.${{ matrix.archive-ext }}
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
