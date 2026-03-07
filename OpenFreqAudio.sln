@@ -4,6 +4,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BMSAudioSim", "BMSAudioSim\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenFreqAudio", "OpenFreqAudio\OpenFreqAudio.csproj", "{7DDA9339-1E4B-44D5-A55C-FC22FC7313E5}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = ".gitlab", ".gitlab", "{05C3AD76-69C5-4A17-B9F2-242514A7AF30}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
