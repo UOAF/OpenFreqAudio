@@ -105,7 +105,7 @@ Allows testing of Doppler effects, terrain fading, multipath interference, and d
 
 ### Prerequisites
 - .NET 10.0 SDK
-- BASS audio library (native DLLs/SOs included in Assets/)
+- [BASS v2.4](https://www.un4seen.com/) audio library (native DLLs/SOs included in Assets/)  
 
 ### Windows
 ```bash
