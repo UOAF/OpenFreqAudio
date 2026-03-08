@@ -559,7 +559,10 @@ public class RadioPlayback : IDisposable
             {
                 // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
                 // We don't need to free it explicitly, this is covered by BASS
-                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
+                string libraryName = RuntimeInformation.IsOSPlatform(OSPlatform.OSX) 
+                    ? "libbassmix.dylib" 
+                    : "libbassmix.so";
+                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, libraryName));
             }
         }
 
