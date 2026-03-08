@@ -1,12 +1,4 @@
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
-using System.Reflection;
-using System.Reflection.Emit;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
 using ManagedBass;
 using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
@@ -14,6 +6,31 @@ using Microsoft.Extensions.Logging;
 // ReSharper disable InconsistentNaming
 
 namespace OpenFreqAudio;
+
+public class FirstOrderFilter
+{
+    private float Attack;
+    private float Decay;
+
+    /// <summary>
+    /// The delay tap - i.e. the current value of the filter
+    /// </summary>
+    public float D1;
+
+    public FirstOrderFilter(float a, float d, float init)
+    {
+        Attack = a;
+        Decay = d;
+        D1 = init;
+    }
+
+    public float Apply(float x)
+    {
+        float alpha = x > D1 ? Attack : Decay;
+        D1 = alpha * x + (1 - alpha) * D1;
+        return D1;
+    }
+}
 
 /// <summary>
 /// A Direct Form II Transposed biquad filter,
@@ -86,6 +103,19 @@ public class RadioPlayback : IDisposable
         private int _ringReadPos;
         private int _ringCount; // number of floats in buffer
         private readonly object _ringLock = new();
+
+        // Automatic level control - boost the signal to unityish.
+        // For a time constant tau, if Fs is our sample rate,
+        // AGC ramps down each sample at e^(-1/tau * Fs).
+        // This means we ramp about 95% of the way in 3 tau,
+        // 99% of the way in 4.6 tau, etc.
+        // See: https://en.wikipedia.org/wiki/RC_circuit
+        //
+        // Aggressive attack to avoid clipping, but decay slowly
+        // so we don't pump while people think about what to say next.
+        private const double AlcAttack = 0.003f / 3;
+        private const double AlcDecay = 1f / 3;
+        private FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, RadioPlayback.SampleRate);
 
         public RadioStream(ILogger logger)
         {
@@ -186,7 +216,9 @@ public class RadioPlayback : IDisposable
                 {
                     for (int c = 0; c < Channels; c++)
                     {
-                        RingBuffer[_ringWritePos] = frames[src++];
+                        // Apply auto level control as we push to the ring
+                        Alc.Apply(frames[src]);
+                        RingBuffer[_ringWritePos] = frames[src++] / Alc.D1;
                         _ringWritePos = (_ringWritePos + 1) % RingBuffer.Length;
                     }
 
@@ -357,7 +389,7 @@ public class RadioPlayback : IDisposable
 
         // AGC gain; varies as a low-pass of the received signal
         // according to attack and decay params below.
-        public double AgcGain { get; set; } = 0;
+        public FirstOrderFilter Agc = MakeFirstOrderFilter(AgcAttack, AgcDecay, SampleRate);
 
         // AGC attack and decay are exponential functions -
         // for a time constant tau, if Fs is our sample rate,
@@ -426,6 +458,18 @@ public class RadioPlayback : IDisposable
     public bool Apply3dEffects { get; set; }
 
     /// <summary>
+    /// Create a first-order filter from attack and decay time constants
+    /// </summary>
+    /// <returns>The filter - not lifted into a closure so that you can query the previous value</returns>
+    public static FirstOrderFilter MakeFirstOrderFilter(double attackTau, double decayTau, double sampleRate)
+    {
+        double attackApha = 1 - Math.Exp(-1 / (sampleRate * attackTau));
+        double decayAlpha = 1 - Math.Exp(-1 / (sampleRate * decayTau));
+        // Assume we're using this for an AGC or something similar where the initial gain should be 1.
+        return new FirstOrderFilter((float)attackApha, (float)decayAlpha, 1.0f);
+    }
+
+    /// <summary>
     /// Creates a 6th-order Butterworth high-pass filter.
     /// </summary>
     /// <remarks>
@@ -434,7 +478,7 @@ public class RadioPlayback : IDisposable
     /// at 200Hz we have -60dB of attenuation.
     /// </remarks>
     /// <returns>A lambda that contains the filter state and applies it each call.</returns>
-    private static Func<float, float> MakeHighPass(double cutoff = 300, double sampleRate = SampleRate)
+    public static Func<float, float> MakeHighPass(double cutoff = 300, double sampleRate = SampleRate)
     {
         double t = 1.0 / sampleRate;
         double k = 2.0 / t;
@@ -1182,7 +1226,7 @@ public class RadioPlayback : IDisposable
                     activeStreams = _streams.Values.Where(s =>
                     {
                         var bc = FastPathAudioSim.GetBandConfig(s.FrequencyKHz);
-                        return s.CurrentParams.ReceivedSnrDb > 0;
+                        return s.CurrentParams.ReceivedSnrDb > -200;
                     }).ToList();
 
                     // Snapshot transmitting frequencies - but only when we are in 3D Mode
@@ -1409,15 +1453,8 @@ public class RadioPlayback : IDisposable
 
                             // Take the envelope.
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                            // AGC time: are we attacking or decaying?
-                            // See a discussion of the given time constants _agcAttack and _agcDecay
-                            // at their declaration.
-                            double tau = _dspScratch[n] > freqConfig.AgcGain
-                                ? RadioConfig.AgcAttack
-                                : RadioConfig.AgcDecay;
-                            double alpha = 1 - Math.Exp(-1 / (SampleRate * tau));
                             // Update the AGC:
-                            freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+                            freqConfig.Agc.Apply(_dspScratch[n]);
 
                             // High-pass the signal, which removes the DC component and centers us around 0
                             _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
@@ -1426,12 +1463,12 @@ public class RadioPlayback : IDisposable
                             // When it starts attenuating, we know we hear something.
                             // NB: Handle squelch per sample!
                             // We don't want to squelch every sample here (or not!) based on the final AGC value.
-                            if (freqConfig.AgcGain >= squelchThreshold)
+                            if (freqConfig.Agc.D1 >= squelchThreshold)
                             {
                                 // Apply AGC, then remove our DC component, i.e.,
                                 // shift our envelope from [0, 2] back to [-1, 1].
                                 // Real electronics would use some high-pass filter that notches out 0 Hz.
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
+                                _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                                 squelchOpened = true;
                             }
                             else
@@ -1449,14 +1486,14 @@ public class RadioPlayback : IDisposable
                             double i = _dspScratch[n];
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                            freqConfig.AgcGain = alpha * _dspScratch[n] + (1 - alpha) * freqConfig.AgcGain;
+                            freqConfig.Agc.Apply(_dspScratch[n]);
 
                             _dspScratch[n] = freqConfig.HighPass(_dspScratch[n]);
 
                             // See above.
-                            if (freqConfig.AgcGain >= squelchThreshold)
+                            if (freqConfig.Agc.D1 >= squelchThreshold)
                             {
-                                _dspScratch[n] = _dspScratch[n] / (float)freqConfig.AgcGain;
+                                _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                                 squelchOpened = true;
                             }
                             else
@@ -1502,7 +1539,7 @@ public class RadioPlayback : IDisposable
 #if DEBUG
                         _logger.LogDebug(
                             "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                            squelchOpened ? "OPEN" : "CLOSED", freq, freqConfig.AgcGain);
+                            squelchOpened ? "OPEN" : "CLOSED", freq, freqConfig.Agc.D1);
 #endif
 
                         freqConfig.WasSquelchOpen = squelchOpened;
@@ -1535,7 +1572,7 @@ public class RadioPlayback : IDisposable
 
                     // Set AGC back to unity so there's not sudden jumps
                     // when we turn FX back on.
-                    freqConfig.AgcGain = 1;
+                    freqConfig.Agc.D1 = 1;
                 }
 
                 // Final mix, split to stereo output.
