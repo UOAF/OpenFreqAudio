@@ -31,7 +31,7 @@ public class RadioStationPreset
 
     public string? Description { get; set; }
     
-    public AmbientNoiseType  AmbientNoiseType { get; set; }
+    public AmbientNoiseType AmbientNoiseType { get; set; }
     
     
     
@@ -54,6 +54,7 @@ public class RadioStationPreset
         RxSensitivity_UHF_dBm = rxSensitivityUhf;
         MinPpm = minPpm;
         MaxPpm = maxPpm;
+        AmbientNoiseType = ambientNoiseType;
         Description = description;
     }
     
