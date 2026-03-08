@@ -673,10 +673,16 @@ public class RadioPlayback : IDisposable
                             {
                                 float[] tmp = new float[samplesRead];
                                 Array.Copy(readBuffer, tmp, samplesRead);
+                                
+                                // Compress/normalize the PCM audio before playback
+                                AudioUtil.CompressAudio(tmp, targetLevel: 0.8f);
+                                
                                 stream.PushToRing(tmp, framesRead);
                             }
                             else
                             {
+                                // Compress/normalize the PCM audio before playback
+                                AudioUtil.CompressAudio(readBuffer, targetLevel: 0.8f);
                                 stream.PushToRing(readBuffer, framesRead);
                             }
 
