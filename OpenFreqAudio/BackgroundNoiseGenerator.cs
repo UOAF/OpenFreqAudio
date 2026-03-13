@@ -14,7 +14,6 @@ namespace OpenFreqAudio;
 public class BackgroundNoiseGenerator
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly Random _rng;
 
     // Pink noise using Voss-McCartney dice-rolling algorithm
@@ -40,10 +39,9 @@ public class BackgroundNoiseGenerator
 
     private RadioType _radioType;
 
-    public BackgroundNoiseGenerator(int sampleRate, int channels, int frequencyKhz)
+    public BackgroundNoiseGenerator(int sampleRate, int frequencyKhz)
     {
         _sampleRate = sampleRate;
-        _channels = channels;
         _rng = new Random(Environment.TickCount);
 
         // Initialize pink noise dice with random values
