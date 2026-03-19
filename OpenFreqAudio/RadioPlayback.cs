@@ -479,7 +479,7 @@ public class RadioPlayback : IDisposable
     // Accepts raw PCM bytes from WebRTC.
     // ambientNoise describes the acoustic environment of the transmitting platform and
     // is forwarded to RadioEffect so the correct SFX layer is applied post-demodulation.
-    public bool PushAudioData(string streamId, byte[] audioData, AmbientNoiseType ambientNoise = AmbientNoiseType.None)
+    public bool PushAudioData(string streamId, Memory<short> audioData, AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
         lock (_lock)
         {
@@ -503,19 +503,15 @@ public class RadioPlayback : IDisposable
                 stream.RadioEffect.AmbientNoise = ambientNoise;
             }
 
-            int bytesPerSample = 2; // assume 16-bit PCM
-            int frameBytes = bytesPerSample;
-            if (frameBytes == 0) return false;
-            int frames = audioData.Length / frameBytes;
-            if (frames == 0) return false;
+            if (audioData.IsEmpty) return false;
 
-            float[] floatFrames = new float[frames];
+            float[] floatFrames = new float[audioData.Length];
 
             // 16-bit PCM little-endian
-            for (int i = 0, o = 0; i < audioData.Length; i += 2)
+            for (int i = 0; i < audioData.Length; ++i)
             {
-                short s = (short)(audioData[i] | (audioData[i + 1] << 8));
-                floatFrames[o++] = s / 32768f;
+                float pcm16 = audioData.Span[i];
+                floatFrames[i] = pcm16 / short.MaxValue;
             }
 
             // Push into ring buffer
