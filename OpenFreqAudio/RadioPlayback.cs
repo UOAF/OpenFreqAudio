@@ -52,20 +52,17 @@ public class RadioPlayback : IDisposable
         public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
         public int BassMixerHandle { get; set; } // 0 if no mixer (push streams)
-        public int Channels { get; set; } // 1=mono,2=stereo
         public bool IsPush { get; set; } // true for WebRTC / pushed audio
         public required RadioEffect RadioEffect { get; set; }
         public required AudioParams CurrentParams { get; set; }
 
-        // For decoded or pulled audio we reuse Buffer as a temporary buffer
-        public float[] Buffer { get; set; } = new float[8192];
-
-        // Ring buffer used by both push streams and file-reader task
-        public float[] RingBuffer { get; set; } = Array.Empty<float>();
-        private int _ringWritePos;
-        private int _ringReadPos;
-        private int _ringCount; // number of floats in buffer
-        private readonly object _ringLock = new();
+        // Audio to play is pushed here and pulled by playback.
+        public SyncRope<float> Buffer { get; } = new();
+        // Scratch space for decoding and FX application
+        public float[] Scratch { get; set; } = [];
+        // A view of Scratch that contains valid samples.
+        // (Should we have some method fill scratch and set this?)
+        public Memory<float> Samples { get; set; }
 
         // Automatic level control - boost the signal to unityish.
         // For a time constant tau, if Fs is our sample rate,
@@ -78,7 +75,7 @@ public class RadioPlayback : IDisposable
         // so we don't pump while people think about what to say next.
         private const double AlcAttack = 0.003f / 3;
         private const double AlcDecay = 1f / 3;
-        private FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, RadioPlayback.SampleRate);
+        public readonly FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, RadioPlayback.SampleRate);
 
         public RadioStream(ILogger logger)
         {
@@ -89,210 +86,8 @@ public class RadioPlayback : IDisposable
         public CancellationTokenSource? FileReaderCts { get; set; }
         public Task? FileReaderTask { get; set; }
 
-        public bool HasReceivedAudio { get; set; }
-        public DateTime LastAudioReceived { get; set; } = DateTime.MinValue;
-
         // Transmission state (separate from stream lifecycle)
-        public bool IsTransmitting { get; set; }
         public AmbientNoiseType AmbientNoise { get; set; } = AmbientNoiseType.None;
-        public DateTime TransmissionStartTime { get; set; }
-        public DateTime TransmissionEndTime { get; set; }
-        public DateTime LastPacketReceived { get; set; } = DateTime.UtcNow;
-        public TimeSpan PeerTimeoutThreshold { get; set; } = TimeSpan.FromSeconds(5);
-
-        // Prebuffering state
-        public bool IsBuffering { get; set; } = true;
-        public int MinBufferFrames { get; set; } // Minimum frames before playback starts
-
-        public void EnsureRingBufferCapacity(int floats)
-        {
-            lock (_ringLock)
-            {
-                if (RingBuffer.Length < floats)
-                {
-                    RingBuffer = new float[floats];
-                    _ringWritePos = _ringReadPos = _ringCount = 0;
-                }
-            }
-        }
-
-        // Get current ring buffer fill level (thread-safe)
-        public (int count, int capacity) GetRingBufferFillLevel()
-        {
-            lock (_ringLock)
-            {
-                return (_ringCount, RingBuffer.Length);
-            }
-        }
-
-        // Push raw interleaved float frames into ring buffer.
-        // frames.Length == frameCount * Channels
-        public void PushToRing(float[] frames, int frameCount)
-        {
-            lock (_ringLock)
-            {
-                if (RingBuffer.Length == 0)
-                    return;
-
-                int needed = frameCount * Channels; // floats
-                int available = RingBuffer.Length - _ringCount;
-
-                // If incoming chunk is larger than ring buffer, truncate oldest entirely
-                if (needed >= RingBuffer.Length)
-                {
-                    // keep only the last portion that fits
-                    int start = frames.Length - RingBuffer.Length;
-                    Array.Copy(frames, start, RingBuffer, 0, RingBuffer.Length);
-                    _ringWritePos = 0;
-                    _ringReadPos = 0;
-                    _ringCount = RingBuffer.Length;
-                    HasReceivedAudio = true;
-                    LastAudioReceived = DateTime.UtcNow;
-                    return;
-                }
-
-                // If not enough space, drop oldest frames until there's room
-                int framesDropped = 0;
-                while (available < needed)
-                {
-                    // drop one frame (Channels floats)
-                    _ringReadPos = (_ringReadPos + Channels) % RingBuffer.Length;
-                    _ringCount -= Channels;
-                    available = RingBuffer.Length - _ringCount;
-                    framesDropped++;
-                }
-
-                // Only log significant overflows (>1000 frames = ~23ms at 44.1kHz)
-                // Small overflows during RadioEffect processing are normal
-#if DEBUG
-                if (framesDropped > 1000)
-                {
-                    float fillPercent = (float)_ringCount / RingBuffer.Length * 100f;
-                    _logger.LogWarning(
-                        "OVERFLOW! Dropped {DroppedFrames} frames to make room. Buffer was {FillPercent:F1}% full (StreamId: {StreamId})",
-                        framesDropped, fillPercent, StreamId);
-                }
-#endif
-
-                int src = 0;
-                for (int f = 0; f < frameCount; f++)
-                {
-                    for (int c = 0; c < Channels; c++)
-                    {
-                        // Apply auto level control as we push to the ring
-                        Alc.Apply(frames[src]);
-                        RingBuffer[_ringWritePos] = frames[src++] / Alc.D1;
-                        _ringWritePos = (_ringWritePos + 1) % RingBuffer.Length;
-                    }
-
-                    _ringCount += Channels;
-                }
-
-                HasReceivedAudio = true;
-                LastAudioReceived = DateTime.UtcNow;
-
-                // Check if we've buffered enough to start playback
-                if (IsBuffering && _ringCount >= MinBufferFrames * Channels)
-                {
-                    IsBuffering = false;
-#if DEBUG
-                    _logger.LogDebug(
-                        "Buffering complete! {FrameCount} frames buffered ({FillPercent:F1}% full) (StreamId: {StreamId})",
-                        _ringCount / Channels, (float)_ringCount / RingBuffer.Length * 100f, StreamId);
-#endif
-                }
-            }
-        }
-
-        // Read up to frameCount frames from ring into dest in the stream's NATIVE channel format
-        // Channel conversion will happen later during mixing
-        // Returns frames read (in frames, not samples)
-        public int ReadFromRing(float[] dest, int frameCount)
-        {
-            lock (_ringLock)
-            {
-                int availableFrames = _ringCount / Channels;
-                float fillPercent = (float)_ringCount / RingBuffer.Length * 100f;
-
-                // If still buffering, check if we should exit buffering mode
-                if (IsBuffering)
-                {
-                    // Primary exit condition: reached target buffer level
-                    if (availableFrames >= MinBufferFrames)
-                    {
-                        IsBuffering = false;
-#if DEBUG
-                        _logger.LogDebug(
-                            "Buffering complete! {AvailableFrames} frames buffered ({FillPercent:F1}% full) (StreamId: {StreamId})",
-                            availableFrames, fillPercent, StreamId);
-#endif
-                    }
-                    // Fallback exit condition: stream stopped but we have substantial data (>60% of target)
-                    // Wait 200ms after last packet to ensure stream truly stopped
-                    else if (HasReceivedAudio &&
-                             availableFrames >= (MinBufferFrames * 60) / 100 &&
-                             (DateTime.UtcNow - LastAudioReceived).TotalMilliseconds > 200)
-                    {
-                        IsBuffering = false;
-#if DEBUG
-                        _logger.LogDebug(
-                            "Buffering timeout! Stream inactive, using {AvailableFrames} frames ({FillPercent:F1}% full) (StreamId: {StreamId})",
-                            availableFrames, fillPercent, StreamId);
-#endif
-                    }
-                    // Still buffering - log progress and return silence
-                    else
-                    {
-                        // Return silence while buffering
-                        int destSamples = frameCount * Channels;
-                        Array.Clear(dest, 0, destSamples);
-                        return 0;
-                    }
-                }
-
-                // Check buffer health and enter rebuffering if critically low
-                // With 85% target and ~80% DSP consumption, steady state is 75-85%
-                // After one DSP call: 85% + packets - 80% = ~5-15% depending on timing
-                // Rebuffer only at < 5% to avoid false triggers during normal operation
-                if (availableFrames < frameCount && HasReceivedAudio)
-                {
-                    if (fillPercent < 25f)
-                    {
-                        _logger.LogWarning(
-                            "UNDERRUN! Requested {RequestedFrames} frames, only {AvailableFrames} available ({FillPercent:F1}% full, {Count}/{Capacity}) (StreamId: {StreamId})",
-                            frameCount, availableFrames, fillPercent, _ringCount, RingBuffer.Length, StreamId);
-                    }
-
-                    // Enter rebuffering mode if buffer critically low (< 5%)
-                    if (fillPercent < 5f && !IsBuffering)
-                    {
-                        IsBuffering = true;
-                        _logger.LogWarning(
-                            "Buffer critically low ({FillPercent:F1}%) - entering rebuffering mode (StreamId: {StreamId})",
-                            fillPercent, StreamId);
-                    }
-                }
-
-                int toReadFrames = Math.Min(availableFrames, frameCount);
-                int samplesToRead = toReadFrames * Channels;
-
-                // Simple copy - keep native channel format
-                for (int i = 0; i < samplesToRead; i++)
-                {
-                    dest[i] = RingBuffer[_ringReadPos];
-                    _ringReadPos = (_ringReadPos + 1) % RingBuffer.Length;
-                }
-
-                _ringCount -= samplesToRead;
-
-                // Clear remainder
-                int destSamples2 = frameCount * Channels;
-                if (samplesToRead < destSamples2)
-                    Array.Clear(dest, samplesToRead, destSamples2 - samplesToRead);
-
-                return toReadFrames;
-            }
-        }
 
         public void StopFileReader()
         {
@@ -315,12 +110,7 @@ public class RadioPlayback : IDisposable
         // Clear ring buffer (used for timeout/crash cleanup)
         public void ClearRingBuffer()
         {
-            lock (_ringLock)
-            {
-                _ringCount = 0;
-                _ringReadPos = 0;
-                _ringWritePos = 0;
-            }
+            Buffer.Clear();
         }
     }
 
@@ -340,7 +130,6 @@ public class RadioPlayback : IDisposable
 
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
-        public bool WasHearableLastFrame { get; set; }
 
         public bool IsNoiseMuted { get; set; }
         public float SquelchLevel { get; set; } = 1.0f;
@@ -419,14 +208,9 @@ public class RadioPlayback : IDisposable
     // NB: Opus only accepts 8000, 12000, 16000, 24000, or 48000 Hz
     public const int SampleRate = 48000;
 
-    private readonly int _channels = 2; // Always use Stereo output
-
     private const int NoiseFadeSamples = 2400;
 
     private static readonly Lock _bassInitLock = new();
-    private bool _timeoutMonitoringStarted;
-    private CancellationTokenSource? _timeoutMonitorCts;
-    private Task? _timeoutMonitorTask;
 
     private int _masterDspProcHandle;
 
@@ -474,9 +258,9 @@ public class RadioPlayback : IDisposable
 
             // Configure BASS for low-latency operation
             Bass.Configure(Configuration.UpdatePeriod, 5);
-            Bass.Configure(Configuration.PlaybackBufferLength, 40);
+            Bass.Configure(Configuration.PlaybackBufferLength, 10);
             Bass.Configure(Configuration.DeviceBufferLength, 10);
-            Bass.Configure(Configuration.UpdateThreads, 2);
+            Bass.Configure(Configuration.UpdateThreads, 1);
             
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -485,9 +269,6 @@ public class RadioPlayback : IDisposable
                 NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
             }
         }
-
-        // Start peer timeout monitoring
-        StartPeerTimeoutMonitoring();
     }
 
     public void StartStream(string streamId, string filePath, AudioParams audioParams,
@@ -522,6 +303,8 @@ public class RadioPlayback : IDisposable
                 throw new Exception($"BASS error creating mixer for '{streamId}': {Bass.LastError}");
             if (!BassMix.MixerAddChannel(mixer, bassStream, BassFlags.Default))
                 throw new Exception($"BASS error adding channel to mixer for '{streamId}': {Bass.LastError}");
+            if (info.Channels != 1)
+                throw new Exception($"BASS error: expected mono, got {info.Channels} channels");
 
             var stream = new RadioStream(_logger)
             {
@@ -529,20 +312,13 @@ public class RadioPlayback : IDisposable
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = bassStream,
                 BassMixerHandle = mixer,
-                Channels = info.Channels,
                 IsPush = false,
                 RadioEffect = new RadioEffect(SampleRate, info.Channels, audioParams,
                         _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
                 CurrentParams = audioParams,
-                Buffer = new float[MaxBufferSize],
-                IsTransmitting = true,
                 AmbientNoise = ambientNoise
             };
-
-            // Allocate a ring buffer (5 seconds worth of audio)
-            int ringFrames = SampleRate * 5;
-            stream.EnsureRingBufferCapacity(ringFrames * Math.Max(1, stream.Channels));
 
             // Start a background task that pulls resampled floats from the mixer and pushes them into the ring buffer.
             stream.FileReaderCts = new CancellationTokenSource();
@@ -554,13 +330,13 @@ public class RadioPlayback : IDisposable
                 {
                     // Read in larger chunks for better throughput (8192 frames = ~185ms at 44.1kHz)
                     int chunkFrames = 8192;
-                    int chunkSamples = chunkFrames * stream.Channels;
-                    float[] readBuffer = new float[chunkSamples];
+                    int chunkSamples = chunkFrames;
                     int consecutiveNoData = 0;
                     int totalFramesRead = 0;
 
                     while (!token.IsCancellationRequested)
                     {
+                        float[] readBuffer = new float[chunkSamples];
                         int bytesRequested = chunkSamples * sizeof(float);
                         int bytesRead = Bass.ChannelGetData(mixer, readBuffer, bytesRequested);
 
@@ -586,33 +362,21 @@ public class RadioPlayback : IDisposable
                         consecutiveNoData = 0;
 
                         int samplesRead = bytesRead / sizeof(float);
-                        int framesRead = samplesRead / stream.Channels;
-                        totalFramesRead += framesRead;
+                        totalFramesRead += samplesRead;
 
-                        if (framesRead > 0)
+                        if (samplesRead > 0)
                         {
-                            // If fewer samples returned than buffer, copy to a trimmed array
-                            if (samplesRead != readBuffer.Length)
-                            {
-                                float[] tmp = new float[samplesRead];
-                                Array.Copy(readBuffer, tmp, samplesRead);
-                                stream.PushToRing(tmp, framesRead);
-                            }
-                            else
-                            {
-                                stream.PushToRing(readBuffer, framesRead);
-                            }
+                            stream.Buffer.Fill(readBuffer.AsMemory()[..samplesRead]);
 
                             // Throttle reading to prevent flooding the ring buffer
                             // Dynamically adjust sleep time based on how full the buffer is
 
-                            // Check current buffer fill level
-                            var (currentFill, bufferCapacity) = stream.GetRingBufferFillLevel();
-
-                            float fillPercent = (float)currentFill / bufferCapacity;
+                            var currentFill = stream.Buffer.Available;
+                            // Fill up to a second
+                            var fillPercent = (float)currentFill / streamSampleRate;
 
                             // Calculate base sleep time (80% of audio duration)
-                            int baseSleepMs = (int)((float)framesRead / streamSampleRate * 1000 * 0.8);
+                            int baseSleepMs = (int)((float)currentFill / streamSampleRate * 1000 * 0.8);
 
                             // Adjust sleep based on buffer fill level:
                             // - If buffer is >70% full, sleep extra to let DSP catch up
@@ -659,9 +423,9 @@ public class RadioPlayback : IDisposable
             _streams.Add(streamId, stream);
 
             _logger.LogInformation(
-                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, NativeRate={NativeRate}Hz, ResampledTo={InputRate}Hz, RingBuffer={RingBufferSize} floats",
+                "Added file stream {StreamId}: Freq={Frequency:F3}MHz, Power={Power}dBm, Channels={Channels}, NativeRate={NativeRate}Hz, ResampledTo={InputRate}Hz",
                 streamId, audioParams.RadioFrequencyKHz / 1000.0, audioParams.ReceivedDb, info.Channels, info.Frequency,
-                SampleRate, stream.RingBuffer.Length);
+                SampleRate);
         }
     }
 
@@ -670,6 +434,10 @@ public class RadioPlayback : IDisposable
         if (sampleRate != SampleRate)
         {
             throw new ArgumentException($"Push stream had sample rate of {sampleRate}, expected {SampleRate}");
+        }
+        if (channels != 1)
+        {
+            throw new ArgumentException($"Expected mono, got {channels} channels");
         }
 
         lock (_lock)
@@ -687,20 +455,15 @@ public class RadioPlayback : IDisposable
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
                 BassStreamHandle = 0,
-                Channels = channels,
                 IsPush = true,
                 RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
                     _loggerFactory.CreateLogger<RadioEffect>()),
                 CurrentParams = audioParams,
-                Buffer = new float[MaxBufferSize],
             };
 
             int ringFrames = (sampleRate * 150) / 1000; // 150ms
             int minBufferFrames = (sampleRate * 120) / 1000; // 120ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
-            stream.EnsureRingBufferCapacity(ringCapacity);
-            stream.MinBufferFrames = minBufferFrames;
-            stream.IsBuffering = true;
 
             _logger.LogInformation("Stream '{StreamId}' on {Frequency:F3} MHz", streamId,
                 audioParams.RadioFrequencyKHz / 1000.0);
@@ -716,8 +479,7 @@ public class RadioPlayback : IDisposable
     // Accepts raw PCM bytes from WebRTC.
     // ambientNoise describes the acoustic environment of the transmitting platform and
     // is forwarded to RadioEffect so the correct SFX layer is applied post-demodulation.
-    public bool PushAudioData(string streamId, byte[] audioData, bool startMarker = false, bool endMarker = false,
-        AmbientNoiseType ambientNoise = AmbientNoiseType.None)
+    public bool PushAudioData(string streamId, byte[] audioData, AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
         lock (_lock)
         {
@@ -733,9 +495,6 @@ public class RadioPlayback : IDisposable
                 return false;
             }
 
-            // Update packet receipt timestamp for timeout detection
-            stream.LastPacketReceived = DateTime.UtcNow;
-
             // Propagate ambient noise type to the effect processor so the correct
             // SFX layer (Air / Ground / Stationary) is applied per packet.
             if (stream.AmbientNoise != ambientNoise)
@@ -744,39 +503,13 @@ public class RadioPlayback : IDisposable
                 stream.RadioEffect.AmbientNoise = ambientNoise;
             }
 
-            // Detect implicit transmission start:
-            // 1. First audio ever (stream just created)
-            // 2. Transmission gap (>500ms since last audio and not currently transmitting)
-            bool isFirstAudio = !stream.HasReceivedAudio;
-            bool hasGapAfterEnd = stream.HasReceivedAudio &&
-                                  !stream.IsTransmitting &&
-                                  (DateTime.UtcNow - stream.LastAudioReceived).TotalMilliseconds > 500;
-            bool implicitStart = isFirstAudio || hasGapAfterEnd;
-
-            // Handle transmission start marker (explicit or implicit)
-            if ((startMarker || implicitStart) && !stream.IsTransmitting)
-            {
-                stream.IsTransmitting = true;
-                stream.TransmissionStartTime = DateTime.UtcNow;
-                stream.IsBuffering = true;
-
-                string reason = startMarker ? "marker" : (isFirstAudio ? "first-audio" : "gap-restart");
-                _logger.LogDebug("Transmission START ({Reason}) (StreamId: {StreamId})", reason, streamId);
-            }
-
-            // Sanity check: both markers set (shouldn't happen but handle gracefully)
-            if (startMarker && endMarker)
-            {
-                _logger.LogWarning("Both start and end markers set! (StreamId: {StreamId})", streamId);
-            }
-
             int bytesPerSample = 2; // assume 16-bit PCM
-            int frameBytes = bytesPerSample * stream.Channels;
+            int frameBytes = bytesPerSample;
             if (frameBytes == 0) return false;
             int frames = audioData.Length / frameBytes;
             if (frames == 0) return false;
 
-            float[] floatFrames = new float[frames * stream.Channels];
+            float[] floatFrames = new float[frames];
 
             // 16-bit PCM little-endian
             for (int i = 0, o = 0; i < audioData.Length; i += 2)
@@ -785,30 +518,8 @@ public class RadioPlayback : IDisposable
                 floatFrames[o++] = s / 32768f;
             }
 
-
             // Push into ring buffer
-            stream.PushToRing(floatFrames, frames);
-
-            // Get buffer status after push
-            var (fillCount, capacity) = stream.GetRingBufferFillLevel();
-#if DEBUG
-            float fillPercent = (float)fillCount / capacity * 100f;
-            _logger.LogDebug(
-                "Pushed {Frames} frames ({Bytes} bytes, {BitsPerSample}-bit), buffer now {FillPercent:F1}% full ({FillCount}/{Capacity}) (StreamId: {StreamId})",
-                frames, audioData.Length, bytesPerSample * 8, fillPercent, fillCount, capacity, streamId);
-#endif
-
-            // Handle transmission end marker
-            // Process AFTER pushing audio so this final packet's audio is included
-            if (endMarker && stream.IsTransmitting)
-            {
-                var duration = DateTime.UtcNow - stream.TransmissionStartTime;
-                stream.IsTransmitting = false;
-                stream.TransmissionEndTime = DateTime.UtcNow;
-                _logger.LogInformation("Transmission END (marker) - duration: {Duration:F2}s (StreamId: {StreamId})",
-                    duration.TotalSeconds, streamId);
-            }
-
+            stream.Buffer.Fill(new Memory<float>(floatFrames));
             return true;
         }
     }
@@ -885,8 +596,6 @@ public class RadioPlayback : IDisposable
 
     public void TuneFrequency(int frequencyKHz)
     {
-        bool needsStart = false;
-
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz))
@@ -897,7 +606,7 @@ public class RadioPlayback : IDisposable
             freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
             {
-                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, _channels, frequencyKHz);
+                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, frequencyKHz);
 
                 var bandConfig = FastPathAudioSim.GetBandConfig(frequencyKHz);
 
@@ -1031,7 +740,7 @@ public class RadioPlayback : IDisposable
             return length;
         };
 
-        _masterStream = Bass.CreateStream(SampleRate, _channels, BassFlags.Float, streamProc, IntPtr.Zero);
+        _masterStream = Bass.CreateStream(SampleRate, 2, BassFlags.Float, streamProc, IntPtr.Zero);
         if (_masterStream == 0) throw new Exception($"BASS error creating master stream: {Bass.LastError}");
         SetupDSPAndPlay();
     }
@@ -1074,12 +783,6 @@ public class RadioPlayback : IDisposable
         // we need to provide length bytes of stereo audio samples.
         _dspProc = (_, _, bufferPtr, length, _) =>
         {
-            // Output is always stereo, so we can mix left & right ear outputs.
-            if (_channels != 2)
-            {
-                throw new ArgumentException("Only stereo playback supported");
-            }
-
             int stereoOutputSamples = length / sizeof(float);
             int samples = stereoOutputSamples / 2;
 
@@ -1094,42 +797,31 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // Snapshot state for UI consumption
-            List<RadioStream> activeStreams;
+            // Snapshot current streams and frequencies
+            List<RadioStream> streams;
             Dictionary<int, RadioConfig> frequencySnapshot;
-            HashSet<int>? transmittingFrequencies = null;
+            // What should we mute because we're talking on it?
+            HashSet<int> transmittingFrequencies;
             lock (_lock)
             {
                 if (Apply3dEffects)
                 {
-                    activeStreams = _streams.Values.Where(s =>
-                    {
-                        var bc = FastPathAudioSim.GetBandConfig(s.FrequencyKHz);
-                        return s.CurrentParams.ReceivedSnrDb > -200;
-                    }).ToList();
-
                     // Snapshot transmitting frequencies - but only when we are in 3D Mode
-                    transmittingFrequencies = new HashSet<int>(_transmittingFrequencies);
+                    transmittingFrequencies = new (_transmittingFrequencies);
                 }
                 else
                 {
-                    activeStreams = _streams.Values.ToList();
+                    transmittingFrequencies = [];
                 }
-
+                streams = _streams.Values.ToList();
                 frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
             }
 
-            // Pre-group streams by frequency
-            // TODO: Process each frequency in-line here,
-            //       instead of creating the intermediate dict?
+            // Group streams by frequency - we're treating each as its own radio,
+            // with its own AGC, squelch, etc.
             var streamsByFrequency = new Dictionary<int, List<RadioStream>>();
-            foreach (var stream in activeStreams)
+            foreach (var stream in streams)
             {
-                if (stream.Channels != 1)
-                {
-                    throw new ArgumentException("Only mono streams supported");
-                }
-
                 int freq = stream.FrequencyKHz;
                 if (!streamsByFrequency.TryGetValue(freq, out var list))
                 {
@@ -1140,46 +832,63 @@ public class RadioPlayback : IDisposable
                 list.Add(stream);
             }
 
-            // Important: Don't process more samples than we can read from all streams
-            //            (desync is very bad)
-            int maxReady = samples;
-            foreach (var stream in activeStreams.Where(s => s.IsTransmitting && !s.IsBuffering))
+            // If anyone has anything to play,
+            // limit this round to the shortest length.
+            // If all is quiet, just use the provided length.
+            int? maxReady = null;
+            foreach (var stream in streams)
             {
-                var (count, capacity) = stream.GetRingBufferFillLevel();
-
-                // Ignore streams with critically low buffers (<10%)
-                // They're finishing transmission and shouldn't throttle other streams
-                float fillPercent = (float)count / capacity * 100f;
-                if (fillPercent < 10f)
+                var avail = stream.Buffer.Available;
+                if (avail > 0)
                 {
-                    continue; // Skip this stream - don't let it throttle others
-                }
-
-                maxReady = Math.Min(maxReady, count);
-            }
-
-            if (maxReady > 0)
-            {
-                samples = maxReady;
-                stereoOutputSamples = samples * 2;
-
-                foreach (var stream in activeStreams)
-                {
-                    int framesRead = stream.ReadFromRing(stream.Buffer, samples);
-                    if (framesRead == 0)
-                    {
-                        Array.Clear(stream.Buffer, 0, stream.Buffer.Length);
-                        continue;
-                    }
-
-                    if (Apply3dEffects)
-                    {
-                        stream.RadioEffect.Process(stream.Buffer, 0, samples);
-                    }
+                    if (!maxReady.HasValue) maxReady = avail;
+                    else maxReady = Math.Min(maxReady.Value, avail);
+                    // No matter how much we have ready,
+                    // we can only handle `samples` at most.
+                    maxReady = Math.Min(samples, maxReady.Value);
                 }
             }
-
+            // TODO: If we have nothing to play (maxReady is null)
+            // we could limit the number of samples returned to a small duration
+            // so that we're more responsive as soon as new ones arrive.
+            samples = maxReady ?? samples;
+            stereoOutputSamples = samples * 2;
             Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
+
+            // No matter what else we do, keep the samples moving.
+            foreach (var stream in streams)
+            {
+                if (maxReady.HasValue)
+                {
+                    var mr = maxReady.Value;
+                    if (stream.Scratch.Length < mr)
+                    {
+                        stream.Scratch = new float[mr];
+                    }
+                    int drained = stream.Buffer.DrainTo(stream.Scratch.AsSpan()[..mr])!.Value;
+                    if (drained > 0 && drained != mr)
+                    {
+                        throw new Exception($"Expected {mr} samples, got {drained}");
+                    }
+                    // Automatic level control (ALC)
+                    for (int i = 0; i < drained; ++i)
+                    {
+                        stream.Alc.Apply(Math.Abs(stream.Scratch[i]));
+                        // Avoid ALC asymptotes as measured volume drops to 0
+                        // (unlikely for users to give us a perfectly silent signal,
+                        // but for file playback/test tones...)
+                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.01f);
+                    }
+                    for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
+                    stream.Samples = stream.Scratch.AsMemory()[..drained];
+                }
+                else
+                {
+                    // Decay ALC
+                    for (int i = 0; i < samples; ++i) stream.Alc.Apply(0f);
+                    stream.Samples = new Memory<float>();
+                }
+            }
 
             // 2: Process each frequency (noise + squelch + mixing), AKA radio,
             //    which should have its own AGC, Squelch, etc.
@@ -1187,19 +896,22 @@ public class RadioPlayback : IDisposable
             {
                 int freq = kvp.Key;
                 var freqConfig = kvp.Value;
-                if (!freqConfig.IsTuned || freqConfig.IsNoiseMuted) continue;
+
+                // If we're not tuned or we're muted, we don't need to process anything,
+                // but we should make sure to drain any buffered samples.
+                if (!freqConfig.IsTuned || freqConfig.IsNoiseMuted ||
+                    transmittingFrequencies.Contains(freq))
+                {
+                    continue;
+                }
 
                 // Get pre-grouped streams for this frequency
                 // Don't bail early if these are empty;
                 // still want to apply squelch sound and other FX.
-                var freqStreams = streamsByFrequency.TryGetValue(freq, out var streams)
-                    ? streams
-                    : new List<RadioStream>();
+                var freqStreams = streamsByFrequency.GetValueOrDefault(freq, []);
 
                 // --- PER-FREQUENCY RF PARAMETERS ---
                 var bandConfig = FastPathAudioSim.GetBandConfig(freq);
-
-                var transmittingStreams = freqStreams.Where(s => s.IsTransmitting).ToList();
 
                 // True if squelch opened at any point in this set of samples
                 bool squelchOpened = false;
@@ -1219,6 +931,15 @@ public class RadioPlayback : IDisposable
                     // we'd have a single signal with a fixed phase (45 deg).
                     // TODO: Generate this each sample instead of filling buffers of noise?
                     freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch2, 0, samples, 1.0f);
+
+                    var transmittingStreams = freqStreams.Where(s => s.Samples.Length > 0).ToList();
+                    // Sanity check:
+                    // By our maxReady logic above, any streams _with_ samples should be the same length,
+                    // and that lengh should be `samples`.
+                    if (!transmittingStreams.Select(s => s.Samples.Length).All(l => l == samples))
+                    {
+                        throw new Exception("Active streams have different lengths");
+                    }
 
                     if (transmittingStreams.Count > 0)
                     {
@@ -1324,10 +1045,9 @@ public class RadioPlayback : IDisposable
                                     (double)(n + _sampleNum) / (double)SampleRate;
                                 // Sum IQ components _before_ taking the length of the vector,
                                 // as that's a nonlinear operation.
-                                i += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
-                                     Math.Cos(theta);
-                                q += relativePowers[k] * (1 + transmittingStreams[k].Buffer[n] * modIndex) *
-                                     Math.Sin(theta);
+                                float samp = transmittingStreams[k].Samples.Span[n];
+                                i += relativePowers[k] * (1 + samp * modIndex) * Math.Cos(theta);
+                                q += relativePowers[k] * (1 + samp * modIndex) * Math.Sin(theta);
                             }
 
                             // Take the envelope.
@@ -1342,9 +1062,6 @@ public class RadioPlayback : IDisposable
                             // We don't want to squelch every sample here (or not!) based on the final AGC value.
                             if (freqConfig.Agc.D1 >= squelchThreshold)
                             {
-                                // Apply AGC, then remove our DC component, i.e.,
-                                // shift our envelope from [0, 2] back to [-1, 1].
-                                // Real electronics would use some high-pass filter that notches out 0 Hz.
                                 _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                                 squelchOpened = true;
                             }
@@ -1383,37 +1100,6 @@ public class RadioPlayback : IDisposable
                             freqConfig.HighPass.Process(_dspScratch[n]));
                     }
 
-                    // Was previously above, but is all downstream of squelch, so:
-                    lock (_lock)
-                    {
-                        if (_frequencies.TryGetValue(freq, out var fc))
-                            fc.WasHearableLastFrame = squelchOpened;
-                    }
-
-                    // Use explicit transmission state from RTP markers
-                    bool hasActiveTransmission = freqStreams.Any(s => s.IsTransmitting);
-
-                    // Check packet freshness ONLY for push streams (network-based)
-                    bool hasRecentPackets = freqStreams.Any(s =>
-                        s.IsTransmitting &&
-                        (s.IsPush == false || (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds < 200));
-
-                    // Force-end stale transmissions (ONLY for push streams)
-                    foreach (var s in freqStreams.Where(s =>
-                                 s.IsPush &&
-                                 s.IsTransmitting &&
-                                 (DateTime.UtcNow - s.LastPacketReceived).TotalMilliseconds >= 200))
-                    {
-#if DEBUG
-                        _logger.LogDebug("Force-ending stale transmission for {StreamId}", s.StreamId);
-#endif
-
-                        s.IsTransmitting = false;
-                        s.TransmissionEndTime = DateTime.UtcNow;
-                    }
-
-                    bool isActiveTransmission = hasActiveTransmission && hasRecentPackets;
-
                     if (squelchOpened != freqConfig.WasSquelchOpen)
                     {
 #if DEBUG
@@ -1430,15 +1116,15 @@ public class RadioPlayback : IDisposable
                 {
                     Array.Clear(_dspScratch, 0, samples);
 
-                    int numTransmitting = transmittingStreams.Count;
+                    int numTransmitting = freqStreams.Count;
                     if (numTransmitting > 0)
                     {
                         // Mix all streams with proper normalization
-                        foreach (var t in transmittingStreams)
+                        foreach (var t in freqStreams)
                         {
-                            for (int i = 0; i < samples; ++i)
+                            for (int i = 0; i < t.Samples.Length; ++i)
                             {
-                                _dspScratch[i] += t.Buffer[i];
+                                _dspScratch[i] += t.Samples.Span[i];
                             }
                         }
 
@@ -1495,30 +1181,6 @@ public class RadioPlayback : IDisposable
     public async Task StopAll()
     {
         _logger.LogInformation("Stopping all streams and cleaning up resources...");
-        // 1. Stop timeout monitor first
-        try
-        {
-            _timeoutMonitorCts?.Cancel();
-            if (_timeoutMonitorTask != null)
-            {
-                await _timeoutMonitorTask.WaitAsync(TimeSpan.FromSeconds(1));
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error stopping timeout monitor");
-        }
-        finally
-        {
-            _timeoutMonitorCts?.Dispose();
-            _timeoutMonitorCts = null;
-            _timeoutMonitorTask = null;
-
-            lock (_lock)
-            {
-                _timeoutMonitoringStarted = false;
-            }
-        }
 
         // 2. Stop all streams
         List<string> ids;
@@ -1647,97 +1309,6 @@ public class RadioPlayback : IDisposable
             // Just log for validation - RTP start marker will trigger actual transmission start
             _logger.LogDebug("PTT pressed - expecting RTP start marker (StreamId: {StreamId})", streamId);
         }
-    }
-
-    /// <summary>
-    /// Called when WebSocket signals PTT release (optional - RTP markers are primary)
-    /// Acts as a backup timeout mechanism if RTP end marker is lost
-    /// </summary>
-    public void OnWebSocketPTTRelease(string streamId)
-    {
-        lock (_lock)
-        {
-            if (!_streams.TryGetValue(streamId, out var stream)) return;
-
-            if (stream.IsTransmitting)
-            {
-                // Start a sanity check timer - if RTP end marker doesn't arrive within 1s, force end
-                Task.Delay(1000).ContinueWith(_ =>
-                {
-                    lock (_lock)
-                    {
-                        if (_streams.TryGetValue(streamId, out var s) && s.IsTransmitting)
-                        {
-                            var stallTime = DateTime.UtcNow - s.LastPacketReceived;
-                            _logger.LogWarning(
-                                "Force-ending transmission - RTP end marker missing (last packet {StallTime:F0}ms ago) (StreamId: {StreamId})",
-                                stallTime.TotalMilliseconds, streamId);
-                            s.IsTransmitting = false;
-                            s.TransmissionEndTime = DateTime.UtcNow;
-                        }
-                    }
-                });
-            }
-
-            _logger.LogDebug("PTT released - expecting RTP end marker (StreamId: {StreamId})", streamId);
-        }
-    }
-
-    /// <summary>
-    /// Monitors push streams for peer timeouts during active transmissions
-    /// </summary>
-    public void StartPeerTimeoutMonitoring()
-    {
-        lock (_lock)
-        {
-            if (_timeoutMonitoringStarted)
-            {
-                _logger.LogWarning("Already started");
-                return;
-            }
-
-            _timeoutMonitoringStarted = true;
-            _timeoutMonitorCts = new CancellationTokenSource();
-        }
-
-        _timeoutMonitorTask = Task.Run(async () =>
-        {
-            _logger.LogInformation("Starting peer timeout monitoring");
-
-            try
-            {
-                while (!_timeoutMonitorCts.Token.IsCancellationRequested)
-                {
-                    await Task.Delay(500, _timeoutMonitorCts.Token);
-
-                    lock (_lock)
-                    {
-                        var now = DateTime.UtcNow;
-                        var timedOutStreams = _streams.Values
-                            .Where(s => s.IsPush &&
-                                        s.IsTransmitting &&
-                                        (now - s.LastPacketReceived) > s.PeerTimeoutThreshold)
-                            .ToList();
-
-                        foreach (var stream in timedOutStreams)
-                        {
-                            var stallTime = now - stream.LastPacketReceived;
-                            _logger.LogWarning(
-                                "Peer timeout during transmission (no packets for {StallTime:F1}s) (StreamId: {StreamId})",
-                                stallTime.TotalSeconds, stream.StreamId);
-
-                            stream.IsTransmitting = false;
-                            stream.TransmissionEndTime = now;
-                            stream.ClearRingBuffer();
-                        }
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogInformation("Stopped");
-            }
-        }, _timeoutMonitorCts.Token);
     }
 
     public void Dispose()
