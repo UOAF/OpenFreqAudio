@@ -875,6 +875,13 @@ public class RadioPlayback : IDisposable
                         // but for file playback/test tones...)
                         stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.01f);
                     }
+                    
+                    // Apply radio effects
+                    if (Apply3dEffects)
+                    {
+                        stream.RadioEffect.Process(stream.Scratch, 0, drained);
+                    }
+                    
                     for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
                     stream.Samples = stream.Scratch.AsMemory()[..drained];
                 }
