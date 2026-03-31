@@ -58,8 +58,10 @@ public class RadioPlayback : IDisposable
 
         // Audio to play is pushed here and pulled by playback.
         public SyncRope<float> Buffer { get; } = new();
+
         // Scratch space for decoding and FX application
         public float[] Scratch { get; set; } = [];
+
         // A view of Scratch that contains valid samples.
         // (Should we have some method fill scratch and set this?)
         public Memory<float> Samples { get; set; }
@@ -149,6 +151,7 @@ public class RadioPlayback : IDisposable
         // - An equivalent FIR filter needs > 512 taps, adding delays of 5ms and up.
         public NWaves.Filters.Butterworth.HighPassFilter HighPass { get; } =
             new NWaves.Filters.Butterworth.HighPassFilter(300.0 / SampleRate, 3);
+
         public NWaves.Filters.Butterworth.LowPassFilter LowPass { get; } =
             new NWaves.Filters.Butterworth.LowPassFilter(3000.0 / SampleRate, 6);
 
@@ -261,7 +264,7 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.PlaybackBufferLength, 10);
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 1);
-            
+
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
@@ -274,12 +277,12 @@ public class RadioPlayback : IDisposable
     public void StartStream(string streamId, string filePath, AudioParams audioParams,
         AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
-        _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
         int bassStream;
         ChannelInfo info;
 
         lock (_lock)
         {
+            _logger.LogInformation($"Starting stream '{streamId} with Ambient {ambientNoise}");
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
                 _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
@@ -435,6 +438,7 @@ public class RadioPlayback : IDisposable
         {
             throw new ArgumentException($"Push stream had sample rate of {sampleRate}, expected {SampleRate}");
         }
+
         if (channels != 1)
         {
             throw new ArgumentException($"Expected mono, got {channels} channels");
@@ -479,7 +483,8 @@ public class RadioPlayback : IDisposable
     // Accepts raw PCM bytes from WebRTC.
     // ambientNoise describes the acoustic environment of the transmitting platform and
     // is forwarded to RadioEffect so the correct SFX layer is applied post-demodulation.
-    public bool PushAudioData(string streamId, Memory<short> audioData, AmbientNoiseType ambientNoise = AmbientNoiseType.None)
+    public bool PushAudioData(string streamId, Memory<short> audioData,
+        AmbientNoiseType ambientNoise = AmbientNoiseType.None)
     {
         lock (_lock)
         {
@@ -803,12 +808,13 @@ public class RadioPlayback : IDisposable
                 if (Apply3dEffects)
                 {
                     // Snapshot transmitting frequencies - but only when we are in 3D Mode
-                    transmittingFrequencies = new (_transmittingFrequencies);
+                    transmittingFrequencies = new(_transmittingFrequencies);
                 }
                 else
                 {
                     transmittingFrequencies = [];
                 }
+
                 streams = _streams.Values.ToList();
                 frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
             }
@@ -844,6 +850,7 @@ public class RadioPlayback : IDisposable
                     maxReady = Math.Min(samples, maxReady.Value);
                 }
             }
+
             // TODO: If we have nothing to play (maxReady is null)
             // we could limit the number of samples returned to a small duration
             // so that we're more responsive as soon as new ones arrive.
@@ -861,11 +868,13 @@ public class RadioPlayback : IDisposable
                     {
                         stream.Scratch = new float[mr];
                     }
+
                     int drained = stream.Buffer.DrainTo(stream.Scratch.AsSpan()[..mr])!.Value;
                     if (drained > 0 && drained != mr)
                     {
                         throw new Exception($"Expected {mr} samples, got {drained}");
                     }
+
                     // Automatic level control (ALC)
                     for (int i = 0; i < drained; ++i)
                     {
@@ -875,13 +884,13 @@ public class RadioPlayback : IDisposable
                         // but for file playback/test tones...)
                         stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.01f);
                     }
-                    
+
                     // Apply radio effects
                     if (Apply3dEffects)
                     {
                         stream.RadioEffect.Process(stream.Scratch, 0, drained);
                     }
-                    
+
                     for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
                     stream.Samples = stream.Scratch.AsMemory()[..drained];
                 }
@@ -1096,6 +1105,7 @@ public class RadioPlayback : IDisposable
                             }
                         }
                     }
+
                     for (int n = 0; n < samples; ++n)
                     {
                         // Bandpass the signal, which removes the DC component and centers us around 0
@@ -1137,11 +1147,22 @@ public class RadioPlayback : IDisposable
                         {
                             _dspScratch[i] *= mixGain;
                         }
-                    }
 
-                    // Set AGC back to unity so there's not sudden jumps
-                    // when we turn FX back on.
-                    freqConfig.Agc.D1 = 1;
+                        // Apply AGC for proper normalization (we want to apply AGC in 3d and non-3d mode!)
+                        for (int i = 0; i < samples; ++i)
+                        {
+                            freqConfig.Agc.Apply(Math.Abs(_dspScratch[i]));
+                            _dspScratch[i] /= Math.Max(freqConfig.Agc.D1, 0.01f);
+                        }
+                    }
+                    else
+                    {
+                        // Decay AGC when no signal
+                        for (int i = 0; i < samples; ++i)
+                        {
+                            freqConfig.Agc.Apply(0f);
+                        }
+                    }
                 }
 
                 // Final mix, split to stereo output.
