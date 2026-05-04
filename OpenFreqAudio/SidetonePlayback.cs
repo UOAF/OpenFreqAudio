@@ -487,60 +487,38 @@ public class SidetonePlayback : IDisposable
                 var freqConfig = _getFrequencyConfig(stream.FrequencyKHz);
                 if (freqConfig == null) continue;
 
-                // Calculate effective volume
+                // Calculate effective volume and pan gains
                 float effectiveVolume = stream.Volume * freqConfig.Volume;
-                var audioChannel = freqConfig.AudioChannel;
+                float leftGain  = effectiveVolume * Math.Clamp((100 - freqConfig.Pan) / 100f, 0f, 1f);
+                float rightGain = effectiveVolume * Math.Clamp((100 + freqConfig.Pan) / 100f, 0f, 1f);
 
                 // Convert stream format to output format and mix
                 if (stream.Channels == 1 && _channels == 2)
                 {
-                    // Mono → Stereo with volume and channel routing
+                    // Mono → Stereo with volume and pan
                     for (int frame = 0; frame < framesRead; frame++)
                     {
-                        float sample = stream.Buffer[frame] * effectiveVolume;
+                        float sample = stream.Buffer[frame];
                         int leftIdx = frame * 2;
                         int rightIdx = leftIdx + 1;
-
-                        switch (audioChannel)
-                        {
-                            case RadioPlayback.AudioChannel.Left:
-                                _dspScratch[leftIdx] += sample;
-                                break;
-                            case RadioPlayback.AudioChannel.Right:
-                                _dspScratch[rightIdx] += sample;
-                                break;
-                            case RadioPlayback.AudioChannel.Both:
-                                _dspScratch[leftIdx] += sample;
-                                _dspScratch[rightIdx] += sample;
-                                break;
-                        }
+                        _dspScratch[leftIdx]  += leftGain  * sample;
+                        _dspScratch[rightIdx] += rightGain * sample;
                     }
                 }
                 else if (stream.Channels == 2 && _channels == 2)
                 {
-                    // Stereo → Stereo with volume and channel routing
+                    // Stereo → Stereo with volume and pan
                     for (int frame = 0; frame < framesRead; frame++)
                     {
                         int srcIdx = frame * 2;
-                        float left = stream.Buffer[srcIdx] * effectiveVolume;
-                        float right = stream.Buffer[srcIdx + 1] * effectiveVolume;
-
+                        float left  = stream.Buffer[srcIdx];
+                        float right = stream.Buffer[srcIdx + 1];
                         int leftIdx = frame * 2;
                         int rightIdx = leftIdx + 1;
-
-                        switch (audioChannel)
-                        {
-                            case RadioPlayback.AudioChannel.Left:
-                                _dspScratch[leftIdx] += left + right;
-                                break;
-                            case RadioPlayback.AudioChannel.Right:
-                                _dspScratch[rightIdx] += left + right;
-                                break;
-                            case RadioPlayback.AudioChannel.Both:
-                                _dspScratch[leftIdx] += left;
-                                _dspScratch[rightIdx] += right;
-                                break;
-                        }
+                        // Mix both source channels then apply gain so pan works on summed mono
+                        float mono = (left + right) * 0.5f;
+                        _dspScratch[leftIdx]  += leftGain  * mono;
+                        _dspScratch[rightIdx] += rightGain * mono;
                     }
                 }
                 else if (stream.Channels == 1 && _channels == 1)

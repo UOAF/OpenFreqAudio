@@ -126,7 +126,8 @@ public class RadioPlayback : IDisposable
         /// <summary>
         /// Which ears should this radino play into?
         /// </summary>
-        public AudioChannel AudioChannel { get; set; } = AudioChannel.Both;
+        /// <summary>Pan position: -100 = full left, 0 = center (both), +100 = full right.</summary>
+        public int Pan { get; set; } = 0;
 
         public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
@@ -171,12 +172,6 @@ public class RadioPlayback : IDisposable
         public const double AgcDecay = 0.1f / 3;
     }
 
-    public enum AudioChannel
-    {
-        Left,
-        Right,
-        Both
-    }
 
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RadioPlayback> _logger;
@@ -667,13 +662,13 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    public void SetFrequencyAudioChannel(int frequencyKHz, AudioChannel channel)
+    public void SetFrequencyPan(int frequencyKHz, int pan)
     {
         lock (_lock)
         {
             if (!_frequencies.ContainsKey(frequencyKHz))
                 _frequencies[frequencyKHz] = new RadioConfig();
-            _frequencies[frequencyKHz].AudioChannel = channel;
+            _frequencies[frequencyKHz].Pan = Math.Clamp(pan, -100, 100);
         }
     }
 
@@ -1146,20 +1141,16 @@ public class RadioPlayback : IDisposable
 
                 // Final mix, split to stereo output.
                 // Note that we _sum_, not set stereo buffer so that we can combine multiple radios.
+                // Pan: -100=full left, 0=center (both at full), +100=full right.
                 float volume = freqConfig.Volume;
+                float leftGain  = volume * Math.Clamp((100 - freqConfig.Pan) / 100f, 0f, 1f);
+                float rightGain = volume * Math.Clamp((100 + freqConfig.Pan) / 100f, 0f, 1f);
                 for (int frame = 0; frame < samples; frame++)
                 {
                     int leftIdx = frame * 2;
                     int rightIdx = leftIdx + 1;
-                    switch (freqConfig.AudioChannel)
-                    {
-                        case AudioChannel.Left: _stereoBuffer[leftIdx] += volume * _dspScratch[frame]; break;
-                        case AudioChannel.Right: _stereoBuffer[rightIdx] += volume * _dspScratch[frame]; break;
-                        case AudioChannel.Both:
-                            _stereoBuffer[leftIdx] += volume * _dspScratch[frame];
-                            _stereoBuffer[rightIdx] += volume * _dspScratch[frame];
-                            break;
-                    }
+                    _stereoBuffer[leftIdx]  += leftGain  * _dspScratch[frame];
+                    _stereoBuffer[rightIdx] += rightGain * _dspScratch[frame];
                 }
             }
 
