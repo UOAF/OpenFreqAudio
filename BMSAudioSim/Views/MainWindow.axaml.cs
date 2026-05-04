@@ -136,8 +136,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         base.OnLoaded(e);
         _radioPlayback.Initialize();
         _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
-        _radioPlayback.SetFrequencyAudioChannel(85000, RadioPlayback.AudioChannel.Both);
-        _radioPlayback.SetFrequencyAudioChannel(513750, RadioPlayback.AudioChannel.Both);
 
         // Simulation timer — always running; only advances markers that are "playing"
         _simTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SIMULATION_TICK_MS) };
