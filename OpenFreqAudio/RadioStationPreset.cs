@@ -1,7 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-
 namespace OpenFreqAudio;
 
 /// <summary>
@@ -62,6 +58,8 @@ public class RadioStationPreset
     {
         return obj is RadioStationPreset other && Name == other.Name;
     }
+
+    public override int GetHashCode() => Name?.GetHashCode() ?? 0;
 
     /// <summary>
     /// Get TX power for the specified radio type

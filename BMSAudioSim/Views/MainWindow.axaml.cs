@@ -50,8 +50,6 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private (int x, int y)? _sender2Pos;
     private (int x, int y)? _receiverPos;
     private FastPathAudioSim? _fastPathAudioSim;
-    static volatile bool _stream1Playing = false;
-    static volatile bool _stream2Playing = false;
     private DEMReader? _demReader;
     private AudioParams? _signal1Params;
     private AudioParams? _signal2Params;
@@ -61,10 +59,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private readonly string _stream1Id = "stream1";
     private readonly string _stream1File = "countdown.ogg";
-    private readonly string _stream1FileDownsampled = "countdown_8khz.ogg";
     private readonly string _stream2Id = "stream2";
     private readonly string _stream2File = "audio2.ogg";
-    private readonly string _stream2FileDownsampled = "audio2_8khz.ogg";
 
     // ===== MARKER DISPLAY =====
     private Ellipse? _sender1Marker;
@@ -108,9 +104,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         InitializeComponent();
         ButtonSignal1Ptt.AddHandler(PointerPressedEvent, (sender, e) =>
         {
-            _radioPlayback.StartStream(_stream1Id,
-                _stream1File, _signal1Params,
-                _viewModel.AmbientNoiseType);
+            if (_signal1Params is null) return;
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params, _viewModel.AmbientNoiseType);
         }, handledEventsToo: true);
 
         ButtonSignal1Ptt.AddHandler(PointerReleasedEvent, (sender, e) =>
@@ -121,9 +116,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         ButtonSignal2Ptt.AddHandler(PointerPressedEvent,
             (sender, e) =>
             {
-                _radioPlayback.StartStream(_stream2Id,
-                    _stream2File, _signal2Params,
-                    _viewModel.AmbientNoiseType);
+                if (_signal2Params is null) return;
+                _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params, _viewModel.AmbientNoiseType);
             },
             handledEventsToo: true);
 
@@ -135,7 +129,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e);
         _radioPlayback.Initialize();
-        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, ViewModel.Squelch);
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, _viewModel.Squelch);
 
         // Simulation timer — always running; only advances markers that are "playing"
         _simTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SIMULATION_TICK_MS) };
@@ -1097,22 +1091,19 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnUHFVHFChanged(object? sender, RoutedEventArgs e)
     {
-        _radioPlayback.UntuneFrequency(ViewModel.FrequencyKhz);
-        ViewModel.FrequencyKhz = RadioButtonUhf.IsChecked == true ? 513750 : 85000;
-        _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
+        _radioPlayback.UntuneFrequency(_viewModel.FrequencyKhz);
+        _viewModel.FrequencyKhz = RadioButtonUhf.IsChecked == true ? 513750 : 85000;
+        _radioPlayback.TuneFrequency(_viewModel.FrequencyKhz);
         UpdateParameters();
 
-        if (ViewModel.Signal1Continuous)
+        if (_viewModel.Signal1Continuous && _signal1Params is not null)
         {
-            _radioPlayback.StartStream(_stream1Id,
-                _stream1File, _signal1Params,
-                _viewModel.AmbientNoiseType);        }
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params, _viewModel.AmbientNoiseType);
+        }
 
-        if (ViewModel.Signal2Continuous)
+        if (_viewModel.Signal2Continuous && _signal2Params is not null)
         {
-            _radioPlayback.StartStream(_stream2Id,
-                _stream2File, _signal2Params,
-                _viewModel.AmbientNoiseType);
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params, _viewModel.AmbientNoiseType);
         }
     }
 
@@ -1123,11 +1114,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             _radioPlayback.StopStream(_stream1Id).Wait(100);
         }
-        else
+        else if (_signal1Params is not null)
         {
-            _radioPlayback.StartStream(_stream1Id,
-                _stream1File, _signal1Params,
-                _viewModel.AmbientNoiseType);
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params, _viewModel.AmbientNoiseType);
         }
     }
 
@@ -1138,20 +1127,18 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             _radioPlayback.StopStream(_stream2Id).Wait(100);
         }
-        else
+        else if (_signal2Params is not null)
         {
-            _radioPlayback.StartStream(_stream2Id,
-                _stream2File, _signal2Params,
-                _viewModel.AmbientNoiseType);
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params, _viewModel.AmbientNoiseType);
         }
     }
 
     private void OnPpmSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        if (sender.Equals(Ppm1Slider))
-            ViewModel.Ppm1 = (float)e.NewValue;
-        else if (sender.Equals(Ppm2Slider))
-            ViewModel.Ppm2 = (float)e.NewValue;
+        if (ReferenceEquals(sender, Ppm1Slider))
+            _viewModel.Ppm1 = (float)e.NewValue;
+        else if (ReferenceEquals(sender, Ppm2Slider))
+            _viewModel.Ppm2 = (float)e.NewValue;
         UpdateParameters();
     }
 
@@ -1168,18 +1155,14 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnAmbientNoiseTypeChanged(object? sender, RoutedEventArgs e)
     {
-        if (ViewModel.Signal1Continuous)
+        if (_viewModel.Signal1Continuous && _signal1Params is not null)
         {
-            _radioPlayback.StartStream(_stream1Id,
-                _stream1File, _signal1Params,
-                _viewModel.AmbientNoiseType);
+            _radioPlayback.StartStream(_stream1Id, _stream1File, _signal1Params, _viewModel.AmbientNoiseType);
         }
 
-        if (ViewModel.Signal2Continuous)
+        if (_viewModel.Signal2Continuous && _signal2Params is not null)
         {
-            _radioPlayback.StartStream(_stream2Id,
-                _stream2File, _signal2Params,
-                _viewModel.AmbientNoiseType);
+            _radioPlayback.StartStream(_stream2Id, _stream2File, _signal2Params, _viewModel.AmbientNoiseType);
         }
     }
 }

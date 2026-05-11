@@ -50,7 +50,7 @@ sealed class Program
                 }
             };
 
-            messageBox.ShowDialog(null); // Blocking the UI thread until closed
+            messageBox.Show();
         });
     }
 
