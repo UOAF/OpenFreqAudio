@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 using ManagedBass;
 using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
-using NWaves.Filters;
+using NWaves.Filters.Butterworth;
 
 // ReSharper disable InconsistentNaming
 
@@ -75,7 +75,7 @@ public class RadioPlayback : IDisposable
         // so we don't pump while people think about what to say next.
         private const double AlcAttack = 0.003f / 3;
         private const double AlcDecay = 1f / 3;
-        public readonly FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, RadioPlayback.SampleRate);
+        public readonly FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, SampleRate);
 
         public RadioStream(ILogger logger)
         {
@@ -148,10 +148,10 @@ public class RadioPlayback : IDisposable
         //   it only positive values from our envelope.
         //
         // - An equivalent FIR filter needs > 512 taps, adding delays of 5ms and up.
-        public NWaves.Filters.Butterworth.HighPassFilter HighPass { get; } =
-            new NWaves.Filters.Butterworth.HighPassFilter(300.0 / SampleRate, 3);
-        public NWaves.Filters.Butterworth.LowPassFilter LowPass { get; } =
-            new NWaves.Filters.Butterworth.LowPassFilter(3000.0 / SampleRate, 6);
+        public HighPassFilter HighPass { get; } =
+            new HighPassFilter(300.0 / SampleRate, 3);
+        public LowPassFilter LowPass { get; } =
+            new LowPassFilter(3000.0 / SampleRate, 6);
 
         // AGC gain; varies as a low-pass of the received signal
         // according to attack and decay params below.
@@ -1185,11 +1185,19 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // Final output clamping
-            // TODO: We could add peak limiting to prevent hard clipping.
+            // Peak-limit the mixed output: find the highest absolute sample,
+            // and if it would clip, scale the entire buffer down uniformly.
+            // Necessary when dealing with multiple incoming channels at once.
+            var peak = 0f;
             for (int i = 0; i < stereoOutputSamples; ++i)
             {
-                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i], -2f, 2f);
+                peak = MathF.Max(peak, MathF.Abs(_stereoBuffer[i]));
+            }
+
+            var limitGain = peak > 1f ? 1f / peak : 1f;
+            for (var i = 0; i < stereoOutputSamples; ++i)
+            {
+                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i] * limitGain, -2f, 2f);
             }
 
             Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
