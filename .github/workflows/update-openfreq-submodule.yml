@@ -42,4 +42,4 @@ jobs:
           fi
 
           git commit -m "chore: bump OpenFreqAudio to ${SUBMODULE_SHA:0:7}"
-          git push origin "$TARGET_BRANCH"
+          git push origin develop
