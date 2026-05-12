@@ -1,0 +1,48 @@
+name: Update OpenFreq Submodule
+
+on:
+  push:
+    branches: [develop, main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  update-submodule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH for OpenFreq
+        env:
+          SSH_KEY: ${{ secrets.OPENFREQ_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/openfreq_key
+          chmod 600 ~/.ssh/openfreq_key
+          printf 'Host github.com\n  IdentityFile ~/.ssh/openfreq_key\n  StrictHostKeyChecking no\n' >> ~/.ssh/config
+
+      - name: Bump submodule pointer in OpenFreq
+        env:
+          SUBMODULE_SHA: ${{ github.sha }}
+          SRC_BRANCH: ${{ github.ref_name }}
+        run: |
+          git clone git@github.com:UOAF/OpenFreq.git openfreq
+          cd openfreq
+
+          TARGET_BRANCH="develop"
+          if [[ "$SRC_BRANCH" == "main" ]]; then
+            TARGET_BRANCH="main"
+          fi
+          git checkout "$TARGET_BRANCH"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git update-index --cacheinfo 160000,"$SUBMODULE_SHA",libs/OpenFreqAudio
+
+          if git diff --cached --quiet; then
+            echo "Submodule already at $SUBMODULE_SHA, nothing to do"
+            exit 0
+          fi
+
+          git commit -m "chore: bump OpenFreqAudio to ${SUBMODULE_SHA:0:7}"
+          git push origin "$TARGET_BRANCH"

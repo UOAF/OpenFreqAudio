@@ -1,0 +1,77 @@
+name: Nightly Build
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish self-contained builds
+        run: |
+          for RID in win-x64 linux-x64; do
+            OUTDIR="publish/BMSAudioSim-${RID}-selfcontained"
+            dotnet publish BMSAudioSim/BMSAudioSim.csproj \
+              -c Release -r "$RID" --self-contained true \
+              -p:PublishSingleFile=true \
+              -p:PublishTrimmed=true \
+              -p:IncludeNativeLibrariesForSelfExtract=true \
+              -p:DebugType=none -p:DebugSymbols=false \
+              -o "$OUTDIR"
+            pushd "$OUTDIR"
+            zip -r "$GITHUB_WORKSPACE/BMSAudioSim-${RID}-selfcontained.zip" . --exclude "*.pdb"
+            popd
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-builds
+          path: BMSAudioSim-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Delete old nightly release
+        run: gh release delete nightly --yes --cleanup-tag --repo ${{ github.repository }} || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          target_commitish: ${{ github.sha }}
+          name: Nightly Build
+          prerelease: true
+          make_latest: false
+          body: |
+            Automated build from `develop`.
+
+            Commit: ${{ github.sha }}
+            Built: ${{ github.event.head_commit.timestamp }}
+
+            | Archive | Platform |
+            |---|---|
+            | `BMSAudioSim-win-x64-selfcontained.zip` | Windows x64 (self-contained, .NET bundled) |
+            | `BMSAudioSim-linux-x64-selfcontained.zip` | Linux x64 (self-contained, .NET bundled) |
+          files: artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
