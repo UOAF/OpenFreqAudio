@@ -209,6 +209,16 @@ public class RadioPlayback : IDisposable
 
     private int _masterDspProcHandle;
 
+    // Sidetone (own-voice loopback): mic samples pushed here from the recording callback,
+    // drained and mixed in the DSP callback with both sides on separate BASS audio threads,
+    // so we use a lock-free SPSC ring buffer instead of SyncRope to avoid any lock on the hot path.
+    private readonly SidetoneSpscBuffer _sidetoneBuffer = new(8192); // 8192 floats ≈ 170ms @ 48kHz
+    private float[] _sidetoneScratch = [];
+    public bool SidetoneEnabled { get; set; }
+    public float SidetoneVolume { get; set; } = 0.4f;
+
+    public void PushSidetone(ReadOnlySpan<float> samples) => _sidetoneBuffer.Write(samples);
+    public void ClearSidetone() => _sidetoneBuffer.Clear();
 
     public bool Apply3dEffects { get; set; }
 
@@ -1154,6 +1164,27 @@ public class RadioPlayback : IDisposable
                 }
             }
 
+            // Sidetone: mix own voice (mono) into stereo output
+            // No AGC/ALC
+            if (SidetoneEnabled)
+            {
+                int sidetoneAvail = _sidetoneBuffer.Available;
+                if (sidetoneAvail > 0)
+                {
+                    int sidetoneFrames = Math.Min(sidetoneAvail, samples);
+                    if (_sidetoneScratch.Length < sidetoneFrames)
+                        _sidetoneScratch = new float[sidetoneFrames];
+                    int drained = _sidetoneBuffer.Read(_sidetoneScratch.AsSpan()[..sidetoneFrames]);
+                    float vol = SidetoneVolume;
+                    for (int i = 0; i < drained; ++i)
+                    {
+                        float s = _sidetoneScratch[i] * vol;
+                        _stereoBuffer[i * 2]     += s;
+                        _stereoBuffer[i * 2 + 1] += s;
+                    }
+                }
+            }
+
             // Peak-limit the mixed output: find the highest absolute sample,
             // and if it would clip, scale the entire buffer down uniformly.
             // Necessary when dealing with multiple incoming channels at once.
@@ -1316,5 +1347,47 @@ public class RadioPlayback : IDisposable
     public void Dispose()
     {
         StopAll().Wait(500);
+    }
+
+    // Lock-free SPSC ring buffer for sidetone.
+    // Producer = BASS recording thread. Consumer = BASS DSP thread.
+    // Uses Volatile.Write (store-release) on the write index so the consumer sees
+    // all buffer writes before the updated index, and Volatile.Read (load-acquire)
+    // so each side observes the other's latest index across CPU cores / ARM reordering.
+    private sealed class SidetoneSpscBuffer(int capacity)
+    {
+        private readonly float[] _buf = new float[NextPow2(capacity)];
+        private readonly int _mask = NextPow2(capacity) - 1;
+        private int _writeIdx;
+        private int _readIdx;
+
+        private static int NextPow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+
+        public int Available => Volatile.Read(ref _writeIdx) - Volatile.Read(ref _readIdx);
+
+        // Called only from the recording thread.
+        public void Write(ReadOnlySpan<float> src)
+        {
+            int wp = _writeIdx; // only writer touches _writeIdx — no Volatile.Read needed
+            int free = _buf.Length - (wp - Volatile.Read(ref _readIdx));
+            int n = Math.Min(src.Length, free);
+            for (int i = 0; i < n; i++)
+                _buf[(wp + i) & _mask] = src[i];
+            Volatile.Write(ref _writeIdx, wp + n); // release: buffer writes visible before index update
+        }
+
+        // Called only from the DSP thread.
+        public int Read(Span<float> dst)
+        {
+            int rp = _readIdx; // only reader touches _readIdx
+            int n = Math.Min(dst.Length, Volatile.Read(ref _writeIdx) - rp); // acquire
+            for (int i = 0; i < n; i++)
+                dst[i] = _buf[(rp + i) & _mask];
+            Volatile.Write(ref _readIdx, rp + n);
+            return n;
+        }
+
+        // Safe to call from any thread — single store, worst case DSP sees stale index once.
+        public void Clear() => Volatile.Write(ref _readIdx, Volatile.Read(ref _writeIdx));
     }
 }
