@@ -1207,7 +1207,8 @@ public class RadioPlayback : IDisposable
         };
 
         _masterDspProcHandle = Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
-        Bass.ChannelPlay(_masterStream);
+        if (!Bass.ChannelPlay(_masterStream))
+            throw new Exception($"BASS error starting master stream playback: {Bass.LastError}");
     }
 
 
