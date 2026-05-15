@@ -123,6 +123,9 @@ public class RadioPlayback : IDisposable
         public float Volume { get; set; } = 1.0f;
         /// <summary>Pan position: -100 = full left, 0 = center (both), +100 = full right.</summary>
         public int Pan { get; set; } = 0;
+        /// <summary>Squelch threshold: 0 = always open (hear noise), 1 = normal gate (only signals break squelch).</summary>
+        public float SquelchLevel { get; set; } = 1.0f;
+        public bool WasSquelchOpen { get; set; }
     }
 
     /// <summary>
@@ -134,9 +137,6 @@ public class RadioPlayback : IDisposable
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
 
         public bool IsNoiseMuted { get; set; }
-        public float SquelchLevel { get; set; } = 1.0f;
-
-        public bool WasSquelchOpen { get; set; }
 
         // Regardless of our sample rate, we want to band-pass between ~300 and 3000 khz
         // to get our radio sound. Chain two filters
@@ -640,26 +640,18 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    public void SetSquelchLevel(int frequencyKHz, float squelchLevel)
+    public void SetSquelchLevel(int frequencyKHz, Guid slotId, float squelchLevel)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new RadioConfig();
-
-            _frequencies[frequencyKHz].SquelchLevel = squelchLevel;
+            var key = (frequencyKHz, slotId);
+            if (!_slots.TryGetValue(key, out var slot))
+            {
+                slot = new RadioSlotConfig();
+                _slots[key] = slot;
+            }
+            slot.SquelchLevel = squelchLevel;
         }
-    }
-
-    public float GetSquelchLevel(int frequencyKHz)
-    {
-        lock (_lock)
-        {
-            if (_frequencies.TryGetValue(frequencyKHz, out var config))
-                return config.SquelchLevel;
-        }
-
-        return 1.0f; // Default
     }
 
     public void SetFrequencyVolume(int frequencyKHz, Guid slotId, float volume)
@@ -945,10 +937,8 @@ public class RadioPlayback : IDisposable
                 // --- PER-FREQUENCY RF PARAMETERS ---
                 var bandConfig = FastPathAudioSim.GetBandConfig(freq);
 
-                // True if squelch opened at any point in this set of samples
-                bool squelchOpened = false;
-                // Typical squelch is at +6 dB, which is a factor of 2x.
-                float squelchThreshold = freqConfig.SquelchLevel * 2.0f;
+                // Signal level after AGC (used for per-slot squelch gate in fan-out)
+                float signalLevel;
 
                 // Mix transmitting streams
                 if (Apply3dEffects)
@@ -1085,22 +1075,9 @@ public class RadioPlayback : IDisposable
                             // Take the envelope.
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
 
-                            // Update the AGC:
+                            // Update the AGC and normalize; squelch gate happens per-slot in fan-out.
                             freqConfig.Agc.Apply(_dspScratch[n]);
-
-                            // Squelch is driven by the AGC gain.
-                            // When it starts attenuating, we know we hear something.
-                            // NB: Handle squelch per sample!
-                            // We don't want to squelch every sample here (or not!) based on the final AGC value.
-                            if (freqConfig.Agc.D1 >= squelchThreshold)
-                            {
-                                _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
-                                squelchOpened = true;
-                            }
-                            else
-                            {
-                                _dspScratch[n] = 0;
-                            }
+                            _dspScratch[n] = freqConfig.Agc.D1 > 0f ? _dspScratch[n] / freqConfig.Agc.D1 : 0f;
                         }
                     }
                     // Nothing is transmitting except noise, decay AGC back to unity.
@@ -1112,17 +1089,7 @@ public class RadioPlayback : IDisposable
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             freqConfig.Agc.Apply(_dspScratch[n]);
-
-                            // See above.
-                            if (freqConfig.Agc.D1 >= squelchThreshold)
-                            {
-                                _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
-                                squelchOpened = true;
-                            }
-                            else
-                            {
-                                _dspScratch[n] = 0;
-                            }
+                            _dspScratch[n] = freqConfig.Agc.D1 > 0f ? _dspScratch[n] / freqConfig.Agc.D1 : 0f;
                         }
                     }
                     for (int n = 0; n < samples; ++n)
@@ -1132,16 +1099,7 @@ public class RadioPlayback : IDisposable
                             freqConfig.HighPass.Process(_dspScratch[n]));
                     }
 
-                    if (squelchOpened != freqConfig.WasSquelchOpen)
-                    {
-#if DEBUG
-                        _logger.LogDebug(
-                            "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                            squelchOpened ? "OPEN" : "CLOSED", freq, freqConfig.Agc.D1);
-#endif
-
-                        freqConfig.WasSquelchOpen = squelchOpened;
-                    }
+                    signalLevel = freqConfig.Agc.D1;
                 }
                 // Straight mix when we're not applying any FX
                 else
@@ -1171,12 +1129,24 @@ public class RadioPlayback : IDisposable
                     // Set AGC back to unity so there's not sudden jumps
                     // when we turn FX back on.
                     freqConfig.Agc.D1 = 1;
+                    // In non-FX mode use stream presence as signal level proxy.
+                    signalLevel = freqStreams.Any(s => s.Samples.Length > 0) ? 2f : 0f;
                 }
 
-                // Final mix: fan out the processed mono signal to each tuned slot, applying that slot's individual pan and volume.
-                // Pan: -100=full left, 0=center (both at full), +100=full right.
+                // Final mix: fan out the processed mono signal to each tuned slot,
+                // applying per-slot squelch gate, pan, and volume.
                 foreach (var slot in tunedSlots)
                 {
+                    bool squelchOpen = signalLevel >= slot.SquelchLevel * 2f;
+                    if (squelchOpen != slot.WasSquelchOpen)
+                    {
+#if DEBUG
+                        _logger.LogDebug("SQUELCH {State} (Freq: {Frequency})", squelchOpen ? "OPEN" : "CLOSED", freq);
+#endif
+                        slot.WasSquelchOpen = squelchOpen;
+                    }
+                    if (!squelchOpen) continue;
+
                     float leftGain  = slot.Volume * Math.Clamp((100 - slot.Pan) / 100f, 0f, 1f);
                     float rightGain = slot.Volume * Math.Clamp((100 + slot.Pan) / 100f, 0f, 1f);
                     for (int frame = 0; frame < samples; frame++)

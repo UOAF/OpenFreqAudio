@@ -90,6 +90,10 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private bool _sender2Simulating = false;
     private bool _receiverSimulating = false;
     private DispatcherTimer? _simTimer;
+    
+    // ===== Radio Playbac =====
+    private Guid radioSlotId = Guid.NewGuid();
+
 
     public MainWindow(MainWindowViewModel viewModel, ILoggerFactory loggerFactory)
     {
@@ -129,7 +133,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     {
         base.OnLoaded(e);
         _radioPlayback.Initialize();
-        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, _viewModel.Squelch);
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, radioSlotId, _viewModel.Squelch);
 
         // Simulation timer — always running; only advances markers that are "playing"
         _simTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SIMULATION_TICK_MS) };
@@ -895,8 +899,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         _signal1Params = audioParams1;
         _signal2Params = audioParams2;
 
-        _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz);
-        _radioPlayback.SetSquelchLevel(ViewModel.FrequencyKhz, ViewModel.Squelch);
+        _radioPlayback.TuneFrequency(ViewModel.FrequencyKhz, radioSlotId);
+        _radioPlayback.SetSquelchLevel(ViewModel.FrequencyKhz, radioSlotId, ViewModel.Squelch);
 
         _radioPlayback.UpdateStreamParams(_stream1Id, _signal1Params);
         _radioPlayback.UpdateStreamParams(_stream2Id, _signal2Params);
@@ -1091,9 +1095,9 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnUHFVHFChanged(object? sender, RoutedEventArgs e)
     {
-        _radioPlayback.UntuneFrequency(_viewModel.FrequencyKhz);
+        _radioPlayback.UntuneFrequency(_viewModel.FrequencyKhz, radioSlotId);
         _viewModel.FrequencyKhz = RadioButtonUhf.IsChecked == true ? 513750 : 85000;
-        _radioPlayback.TuneFrequency(_viewModel.FrequencyKhz);
+        _radioPlayback.TuneFrequency(_viewModel.FrequencyKhz, radioSlotId);
         UpdateParameters();
 
         if (_viewModel.Signal1Continuous && _signal1Params is not null)
@@ -1144,7 +1148,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void OnSquelchSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
-        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, (float)(e.NewValue / 10));
+        _radioPlayback.SetSquelchLevel(_viewModel.FrequencyKhz, radioSlotId, (float)(e.NewValue / 10));
     }
 
     private void OnEnable3dEffectsChanged(object? sender, RoutedEventArgs e)
