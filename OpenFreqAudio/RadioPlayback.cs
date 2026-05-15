@@ -115,26 +115,26 @@ public class RadioPlayback : IDisposable
     }
 
     /// <summary>
-    /// Represents the parameters of an individual radio.
-    /// Some clients (e.g. GCI) will have many.
+    /// Per-slot output config: one instance per (frequency, slotId) pair.
+    /// </summary>
+    private class RadioSlotConfig
+    {
+        public bool IsTuned { get; set; }
+        public float Volume { get; set; } = 1.0f;
+        /// <summary>Pan position: -100 = full left, 0 = center (both), +100 = full right.</summary>
+        public int Pan { get; set; } = 0;
+    }
+
+    /// <summary>
+    /// Shared signal-processing state for a frequency.
+    /// Stays keyed by frequency so AGC, filters, and noise are shared  across all slots tuned to the same frequency.
     /// </summary>
     public class RadioConfig
     {
-        // ReSharper disable UnusedAutoPropertyAccessor.Local
-        public float Volume { get; set; } = 1.0f;
-
-        /// <summary>
-        /// Which ears should this radino play into?
-        /// </summary>
-        /// <summary>Pan position: -100 = full left, 0 = center (both), +100 = full right.</summary>
-        public int Pan { get; set; } = 0;
-
-        public bool IsTuned { get; set; }
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
 
         public bool IsNoiseMuted { get; set; }
         public float SquelchLevel { get; set; } = 1.0f;
-        // ReSharper restore UnusedAutoPropertyAccessor.Local
 
         public bool WasSquelchOpen { get; set; }
 
@@ -179,9 +179,11 @@ public class RadioPlayback : IDisposable
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
 
-    // Frequencies we are tuned to
-    // TODO: Lots of our logic below assumes only one radio is tuned to a given frequency.
+    // Shared signal-processing state per frequency (AGC, filters, noise generator)
     private readonly Dictionary<int, RadioConfig> _frequencies = new();
+
+    // Per-slot output params: volume, pan, IsTuned — keyed by (frequency, slotId)
+    private readonly Dictionary<(int freq, Guid slotId), RadioSlotConfig> _slots = new();
 
     // Frequencies were we are currently transmitting and which are therefore muted
     private readonly HashSet<int> _transmittingFrequencies = new();
@@ -573,7 +575,7 @@ public class RadioPlayback : IDisposable
 
     private bool ShouldStopMasterStream()
     {
-        bool hasTuned = _frequencies.Values.Any(f => f.IsTuned);
+        bool hasTuned = _slots.Values.Any(s => s.IsTuned);
         return _streams.Count == 0 && !hasTuned && _masterStream != 0;
     }
 
@@ -595,7 +597,7 @@ public class RadioPlayback : IDisposable
         StartMasterStream();
     }
 
-    public void TuneFrequency(int frequencyKHz)
+    public void TuneFrequency(int frequencyKHz, Guid slotId)
     {
         lock (_lock)
         {
@@ -604,26 +606,31 @@ public class RadioPlayback : IDisposable
 
             var freqConfig = _frequencies[frequencyKHz];
 
-            freqConfig.IsTuned = true;
             if (freqConfig.NoiseGenerator == null)
             {
                 freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, frequencyKHz);
-
-                var bandConfig = FastPathAudioSim.GetBandConfig(frequencyKHz);
-
                 _logger.LogInformation("TuneFrequency {Frequency:F3} MHz", frequencyKHz / 1000.0);
             }
+
+            var key = (frequencyKHz, slotId);
+            if (!_slots.TryGetValue(key, out var slot))
+            {
+                slot = new RadioSlotConfig();
+                _slots[key] = slot;
+            }
+            slot.IsTuned = true;
         }
     }
 
-    public void UntuneFrequency(int frequencyKHz)
+    public void UntuneFrequency(int frequencyKHz, Guid slotId)
     {
         bool shouldStopMaster;
 
         lock (_lock)
         {
-            if (!_frequencies.TryGetValue(frequencyKHz, out var frequency)) return;
-            frequency.IsTuned = false;
+            var key = (frequencyKHz, slotId);
+            if (_slots.TryGetValue(key, out var slot))
+                slot.IsTuned = false;
             shouldStopMaster = ShouldStopMasterStream();
         }
 
@@ -655,30 +662,39 @@ public class RadioPlayback : IDisposable
         return 1.0f; // Default
     }
 
-    public void SetFrequencyVolume(int frequencyKHz, float volume)
+    public void SetFrequencyVolume(int frequencyKHz, Guid slotId, float volume)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyKHz)) _frequencies[frequencyKHz] = new RadioConfig();
-            _frequencies[frequencyKHz].Volume = Math.Clamp(volume, -2f, 2f); // allow for some boost
+            var key = (frequencyKHz, slotId);
+            if (!_slots.TryGetValue(key, out var slot))
+            {
+                slot = new RadioSlotConfig();
+                _slots[key] = slot;
+            }
+            slot.Volume = Math.Clamp(volume, -2f, 2f);
         }
     }
 
-    public float GetFrequencyVolume(int frequencyKHz)
+    public float GetFrequencyVolume(int frequencyKHz, Guid slotId)
     {
         lock (_lock)
         {
-            return !_frequencies.TryGetValue(frequencyKHz, out var value) ? 0f : value.Volume;
+            return _slots.TryGetValue((frequencyKHz, slotId), out var slot) ? slot.Volume : 0f;
         }
     }
 
-    public void SetFrequencyPan(int frequencyKHz, int pan)
+    public void SetFrequencyPan(int frequencyKHz, Guid slotId, int pan)
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new RadioConfig();
-            _frequencies[frequencyKHz].Pan = Math.Clamp(pan, -100, 100);
+            var key = (frequencyKHz, slotId);
+            if (!_slots.TryGetValue(key, out var slot))
+            {
+                slot = new RadioSlotConfig();
+                _slots[key] = slot;
+            }
+            slot.Pan = Math.Clamp(pan, -100, 100);
         }
     }
 
@@ -798,24 +814,31 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // Snapshot current streams and frequencies
+            // Snapshot current streams, frequencies and slots
             List<RadioStream> streams;
             Dictionary<int, RadioConfig> frequencySnapshot;
+            Dictionary<int, List<RadioSlotConfig>> tunedSlotsByFreq;
             // What should we mute because we're talking on it?
             HashSet<int> transmittingFrequencies;
             lock (_lock)
             {
-                if (Apply3dEffects)
-                {
-                    // Snapshot transmitting frequencies - but only when we are in 3D Mode
-                    transmittingFrequencies = new (_transmittingFrequencies);
-                }
-                else
-                {
-                    transmittingFrequencies = [];
-                }
+                transmittingFrequencies = Apply3dEffects ? new(_transmittingFrequencies) : [];
                 streams = _streams.Values.ToList();
                 frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
+
+                // Build freq → tuned-slots index from _slots snapshot
+                tunedSlotsByFreq = new Dictionary<int, List<RadioSlotConfig>>();
+                foreach (var kvp in _slots)
+                {
+                    if (!kvp.Value.IsTuned) continue;
+                    int f = kvp.Key.freq;
+                    if (!tunedSlotsByFreq.TryGetValue(f, out var list))
+                    {
+                        list = new List<RadioSlotConfig>();
+                        tunedSlotsByFreq[f] = list;
+                    }
+                    list.Add(kvp.Value);
+                }
             }
 
             // Group streams by frequency - we're treating each as its own radio,
@@ -905,9 +928,10 @@ public class RadioPlayback : IDisposable
                 int freq = kvp.Key;
                 var freqConfig = kvp.Value;
 
-                // If we're not tuned or we're muted, we don't need to process anything,
-                // but we should make sure to drain any buffered samples.
-                if (!freqConfig.IsTuned || freqConfig.IsNoiseMuted ||
+                // Skip if no slots are tuned to this frequency, or if muted.
+                if (!tunedSlotsByFreq.TryGetValue(freq, out var tunedSlots) ||
+                    tunedSlots.Count == 0 ||
+                    freqConfig.IsNoiseMuted ||
                     transmittingFrequencies.Contains(freq))
                 {
                     continue;
@@ -1149,18 +1173,18 @@ public class RadioPlayback : IDisposable
                     freqConfig.Agc.D1 = 1;
                 }
 
-                // Final mix, split to stereo output.
-                // Note that we _sum_, not set stereo buffer so that we can combine multiple radios.
+                // Final mix: fan out the processed mono signal to each tuned slot, applying that slot's individual pan and volume.
                 // Pan: -100=full left, 0=center (both at full), +100=full right.
-                float volume = freqConfig.Volume;
-                float leftGain  = volume * Math.Clamp((100 - freqConfig.Pan) / 100f, 0f, 1f);
-                float rightGain = volume * Math.Clamp((100 + freqConfig.Pan) / 100f, 0f, 1f);
-                for (int frame = 0; frame < samples; frame++)
+                foreach (var slot in tunedSlots)
                 {
-                    int leftIdx = frame * 2;
-                    int rightIdx = leftIdx + 1;
-                    _stereoBuffer[leftIdx]  += leftGain  * _dspScratch[frame];
-                    _stereoBuffer[rightIdx] += rightGain * _dspScratch[frame];
+                    float leftGain  = slot.Volume * Math.Clamp((100 - slot.Pan) / 100f, 0f, 1f);
+                    float rightGain = slot.Volume * Math.Clamp((100 + slot.Pan) / 100f, 0f, 1f);
+                    for (int frame = 0; frame < samples; frame++)
+                    {
+                        int leftIdx = frame * 2;
+                        _stereoBuffer[leftIdx]     += leftGain  * _dspScratch[frame];
+                        _stereoBuffer[leftIdx + 1] += rightGain * _dspScratch[frame];
+                    }
                 }
             }
 
@@ -1231,10 +1255,11 @@ public class RadioPlayback : IDisposable
         // 3. Stop master stream
         StopMasterStream();
 
-        // 4. Clear frequency configs
+        // 4. Clear frequency configs and slot configs
         lock (_lock)
         {
             _frequencies.Clear();
+            _slots.Clear();
         }
 
         ClearTransmittingFrequencies();
