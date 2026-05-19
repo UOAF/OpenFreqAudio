@@ -1188,7 +1188,7 @@ public class RadioPlayback : IDisposable
                 peak = MathF.Max(peak, MathF.Abs(_stereoBuffer[i]));
             }
 
-            var limitGain = peak > 1f ? 1f / peak : 1f;
+            var limitGain = peak > 2f ? 2f / peak : 2f;
             for (var i = 0; i < stereoOutputSamples; ++i)
             {
                 _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i] * limitGain, -2f, 2f);
