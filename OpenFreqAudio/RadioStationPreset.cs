@@ -115,18 +115,46 @@ public static class RadioStationPresets
         description: "E-3 Sentry / E-2 Hawkeye - Airborne Early Warning & Control"
     );
 
-    public static readonly RadioStationPreset Fighter = new(
-        name: "Fighter Aircraft",
+    public static readonly RadioStationPreset FighterF16 = new(
+        name: "F-16 Fighting Falcon",
         category: "Airborne",
         antennaElevation: 2.0,
         txPowerVhf: 10.0, // AN/ARC-210: 10W VHF
         rxSensitivityVhf: -110.0,
         txPowerUhf: 10.0, // AN/ARC-210: 10W UHF AM (20W FM handled in GetTxPower)
         rxSensitivityUhf: -107.0,
-        minPpm: 0.1, // Modern avionics with TCXO/OCXO
-        maxPpm: 1.0,
-        ambientNoiseType: AmbientNoiseType.Air,
-        description: "F-16/F-15/F/A-18 with AN/ARC-210/220 radios"
+        minPpm: 0.1, // Modern OCXO in AN/ARC-210
+        maxPpm: 0.5,
+        ambientNoiseType: AmbientNoiseType.AirF16,
+        description: "F-16C/D with AN/ARC-210 multiband radio"
+    );
+
+    public static readonly RadioStationPreset FighterF15 = new(
+        name: "F-15 Eagle",
+        category: "Airborne",
+        antennaElevation: 2.5,
+        txPowerVhf: 10.0, // AN/ARC-186: 10W VHF AM/FM, 30–174.975 MHz
+        rxSensitivityVhf: -110.0,
+        txPowerUhf: 10.0, // AN/ARC-164: 10W UHF AM, 225–399.975 MHz
+        rxSensitivityUhf: -107.0,
+        minPpm: 0.5, // Crystal oscillator in ARC-164, less stable than ARC-210 OCXO
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.AirF15,
+        description: "F-15C/D/E with AN/ARC-164 UHF and AN/ARC-186 VHF radios"
+    );
+
+    public static readonly RadioStationPreset FighterGeneric = new(
+        name: "Fighter Aircraft",
+        category: "Airborne",
+        antennaElevation: 2.0,
+        txPowerVhf: 10.0,
+        rxSensitivityVhf: -108.0,
+        txPowerUhf: 10.0,
+        rxSensitivityUhf: -105.0,
+        minPpm: 0.5,
+        maxPpm: 2.0,
+        ambientNoiseType: AmbientNoiseType.AirGeneric,
+        description: "Generic tactical fighter with standard military radios"
     );
 
     public static readonly RadioStationPreset Tanker = new(
@@ -345,7 +373,7 @@ public static class RadioStationPresets
         return new[]
         {
             // Airborne
-            AWACS, Fighter, Tanker, Transport, Helicopter,
+            AWACS, FighterF16, FighterF15, FighterGeneric, Tanker, Transport, Helicopter,
             // Ground Military
             GCI_LowTower, GCI_HighTower,
             FACC_Standard, FACC_Extended,
@@ -359,7 +387,7 @@ public static class RadioStationPresets
     public static readonly IEnumerable<RadioStationPreset> AllPresets =
     [
         // Airborne
-        AWACS, Fighter, Tanker, Transport, Helicopter,
+        AWACS, FighterF16, FighterF15, FighterGeneric, Tanker, Transport, Helicopter,
         // Ground Military
         GCI_LowTower, GCI_HighTower,
         FACC_Standard, FACC_Extended,
