@@ -816,22 +816,19 @@ namespace OpenFreqAudio
             // over-sea paths already in a null correctly accumulate terrain loss on top.
             ap.ReceivedDb += (float)twoRayDb;
             
-            // === APPLY TWO-SIDED DOPPLER ===
+            // Doppler shift
             if (txVelocity.HasValue && rxVelocity.HasValue)
             {
                 double ux = dx / dist, uy = dy / dist, uz = dz / dist;
-
-                // Positive = moving toward receiver, negative = moving away
                 var (tvx, tvy, tvz) = txVelocity.Value;
                 var (rvx, rvy, rvz) = rxVelocity.Value;
-                double txRadial = tvx * ux + tvy * uy + tvz * uz;
-                double rxRadial = rvx * ux + rvy * uy + rvz * uz;
 
-                // Just be sure to clamp txRadial in case we get weird speed vectors due to BMS lag
-                txRadial = Math.Clamp(txRadial, -10000.0, 10000.0); // max ~Mach 29
+                // u points TX→RX, so closing speed = (v_tx - v_rx)·u (positive when approaching).
+                // Clamp against weird velocity vectors from BMS lag.
+                double closingSpeed = (tvx - rvx) * ux + (tvy - rvy) * uy + (tvz - rvz) * uz;
+                closingSpeed = Math.Clamp(closingSpeed, -10000.0, 10000.0); // max ~Mach 29
 
-                double fReceived = freqHz * (SpeedOfLight + rxRadial) / (SpeedOfLight - txRadial);
-                double shiftPpm = (fReceived - freqHz) / freqHz * 1e6;
+                double shiftPpm = closingSpeed / SpeedOfLight * 1e6;
                 ap.TuneOffsetPPM += (float)shiftPpm;
             }
 
