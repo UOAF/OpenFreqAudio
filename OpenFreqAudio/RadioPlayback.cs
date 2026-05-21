@@ -890,10 +890,9 @@ public class RadioPlayback : IDisposable
                     for (int i = 0; i < drained; ++i)
                     {
                         stream.Alc.Apply(Math.Abs(stream.Scratch[i]));
-                        // Avoid ALC asymptotes as measured volume drops to 0
-                        // (unlikely for users to give us a perfectly silent signal,
-                        // but for file playback/test tones...)
-                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.01f);
+                        // Limit our max gain to 2x to avoid blasting random background noise
+                        // (like a fan in your room)
+                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.5f);
                     }
                     
                     // Apply radio effects
@@ -1077,7 +1076,7 @@ public class RadioPlayback : IDisposable
 
                             // Update the AGC and normalize; squelch gate happens per-slot in fan-out.
                             freqConfig.Agc.Apply(_dspScratch[n]);
-                            _dspScratch[n] = freqConfig.Agc.D1 > 0f ? _dspScratch[n] / freqConfig.Agc.D1 : 0f;
+                            _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                         }
                     }
                     // Nothing is transmitting except noise, decay AGC back to unity.
@@ -1089,7 +1088,7 @@ public class RadioPlayback : IDisposable
                             double q = _dspScratch2[n];
                             _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                             freqConfig.Agc.Apply(_dspScratch[n]);
-                            _dspScratch[n] = freqConfig.Agc.D1 > 0f ? _dspScratch[n] / freqConfig.Agc.D1 : 0f;
+                            _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                         }
                     }
                     for (int n = 0; n < samples; ++n)
