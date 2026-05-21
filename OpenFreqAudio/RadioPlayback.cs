@@ -890,10 +890,9 @@ public class RadioPlayback : IDisposable
                     for (int i = 0; i < drained; ++i)
                     {
                         stream.Alc.Apply(Math.Abs(stream.Scratch[i]));
-                        // Avoid ALC asymptotes as measured volume drops to 0
-                        // (unlikely for users to give us a perfectly silent signal,
-                        // but for file playback/test tones...)
-                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.01f);
+                        // Limit our max gain to 2x to avoid blasting random background noise
+                        // (like a fan in your room)
+                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.5f);
                     }
                     
                     // Apply radio effects

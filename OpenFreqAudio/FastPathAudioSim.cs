@@ -871,30 +871,6 @@ namespace OpenFreqAudio
             return kAvg;
         }
 
-        /// <summary>
-        /// Apply AGC (Automatic Gain Control) curve to map RF gain to audio gain.
-        /// </summary>
-        public static float ApplyAGC(float rfGain)
-        {
-            // Use logarithmic compression (similar to real AGC circuits)
-            // Formula: audioGain = tanh(log10(rfGain + 1) * k) where k controls compression
-
-            if (rfGain <= 0.0f)
-                return 0.0f;
-
-            // Logarithmic scaling factor (tune this to taste)
-            const double agcCompressionFactor = 1.2;
-
-            // Log compression: compress the dynamic range
-            double logGain = Math.Log10(rfGain + 1.0) * agcCompressionFactor;
-
-            // Soft saturation using tanh (prevents hard clipping)
-            double audioGain = Math.Tanh(logGain);
-
-            // Scale to comfortable range (max 1.0)
-            return (float)Math.Clamp(audioGain, 0.0, 1.0);
-        }
-
         public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm = 0f)
         {
             var ap = new AudioParams
