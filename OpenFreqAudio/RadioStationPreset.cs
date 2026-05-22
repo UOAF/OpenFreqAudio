@@ -420,4 +420,14 @@ public static class RadioStationPresets
         return GetAllPresets().FirstOrDefault(p =>
             p.Name != null && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
     }
+    
+    public static RadioStationPreset GetPresetByBmsAircraftNctr(string? aircraftNctr)
+    {
+        return aircraftNctr switch
+        {
+            "F16" => RadioStationPresets.FighterF16,
+            "F15" => RadioStationPresets.FighterF15,
+            _ => RadioStationPresets.FighterGeneric
+        };
+    }
 }
