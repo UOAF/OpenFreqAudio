@@ -1,6 +1,7 @@
 # OpenFreqAudio
 
-Physics-based radio communication simulation for flight simulators, primarily targeting Falcon BMS. Implements VHF/UHF radio propagation, audio processing, and real-world radio effects.
+Physics-based radio communication simulation for flight simulators, primarily targeting Falcon BMS.
+Models radio propagation over terrain and AM radio demodulation.
 
 ## Features
 
@@ -14,26 +15,19 @@ Radio frequency propagation modeling based on ITU-R standards:
 - **Fresnel zone clearance** for path obstruction
 - **Atmospheric refraction** using altitude-dependent refractivity (SAND2012-10690)
 - **Doppler shift** from transmitter and receiver velocities
+- **Multipath fading**: fast flutter (dropout rate) and slow deep fades
+- **Weather attenuation** (0.02 dB/km)
 
 ### Audio Processing
 
-#### Automatic Gain Control (AGC)
-- Logarithmic compression with tanh-based soft saturation
-- Dynamic range compression
+Baseband simulation of
+[AM demodulation](https://en.wikipedia.org/wiki/Envelope_detector#AM_demodulation), with realistic:
+- Radio bandwidth and filtering
+- Automatic gain control and squelch based on received signal power
+- Interference from multiple simultaneous transmitters, with "stepped-on" tones from
+  mistuned or Doppler-shifted carriers
 
-#### Squelch Control
-- SNR-based squelch threshold with burst sounds
-- Smooth gate transitions
-- Configurable levels per frequency
-
-#### Heterodyne Beat Frequencies
-When multiple transmitters operate on the same frequency with slightly mistuned oscillators:
-- **AM envelope detection** using I/Q signal processing
-- **Beat frequency generation** from PPM offset differences
-- **Ring modulation** of weaker signals
-- **Amplitude modulation** between competing transmissions
-- **AGC pumping** from low-frequency beats
-
+Demo: <https://youtu.be/Sxe9OoFJ44g>
 
 ### Background Noise
 
@@ -50,32 +44,12 @@ Frequency-appropriate ambient noise based on radio type:
 - **Ground vehicle**: Engine and movement sounds
 - **Stationary station**: Clean radio room ambiance
 
-
-### Signal Quality
-
-- **SNR calculation** from received power and thermal noise
-- **Multipath fading**: fast flutter (dropout rate) and slow deep fades
-- **Modulation-specific behavior**: AM graceful degradation, FM capture effect
-- **Weather attenuation** (0.02 dB/km)
-
-### Radio Bands
-
-- **VHF (30-200 MHz)**: 3 kHz bandwidth, AM modulation
-- **UHF (200-520 MHz)**: 3 kHz bandwidth, FM modulation
-- Configurable bandwidth, diffraction, and modulation per band
-
-### Audio Pipeline
-
-- **8 kHz sample rate** (4 kHz Nyquist for VHF/UHF speech)
-- **Ring buffer architecture** with jitter compensation
-- **low end-to-end latency**
-- **BASS audio library** for cross-platform support
-
 ## Architecture
 
 ### Projects
 
 #### OpenFreqAudio
+
 Core audio engine library providing:
 - RF propagation simulation (`FastPathAudioSim`)
 - Audio effects processing (`RadioEffect`)
@@ -98,8 +72,6 @@ Allows testing of Doppler effects, terrain fading, multipath interference, and d
 - **.NET 10.0**
 - **BASS Audio Library** (ManagedBass, ManagedBass.Mix)
 - **Avalonia 11.3**
-- **Memory-mapped DEM files** for terrain access
-- **Lock-free ring buffers** for real-time streaming
 
 ## Building
 
