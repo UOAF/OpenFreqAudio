@@ -193,6 +193,29 @@ public class RadioPlayback : IDisposable
     private int _masterStream;
     private DSPProcedure? _dspProc;
 
+    /// <summary>
+    /// Fired on errors that are meaningful to the user (device switch failures, playback loss).
+    /// Message is already human-readable; no stack trace. Raised on the calling thread.
+    /// Subscribe in OpenFreqService; do not subscribe from UI layers directly.
+    /// </summary>
+    public event Action<string>? UserFacingError;
+
+    private void RaiseUserFacingError(string message)
+    {
+        UserFacingError?.Invoke(message);
+        _logger.LogError("{UserMessage}", message);
+    }
+
+    // True after Initialize() — used to distinguish "no master stream yet" from
+    // "master stream died after a failed device switch". ChangeOutputDevice always
+    // attempts to (re)start the master stream when this is true, even if _masterStream == 0.
+    private bool _isInitialized;
+
+    // The BASS device index the current (or last successfully started) master stream ran on.
+    // Populated in Initialize() and updated on each successful ChangeOutputDevice.
+    // Used as the fallback target when a new device switch fails.
+    private int _currentDeviceIndex = -1;
+
     private const int MaxBufferSize = 24576;
     private float[] _dspScratch = new float[MaxBufferSize];
     private float[] _dspScratch2 = new float[MaxBufferSize];
@@ -263,6 +286,10 @@ public class RadioPlayback : IDisposable
 
                 Bass.CurrentDevice = playbackDeviceIndex;
             }
+
+            // Capture the actual BASS device index after init so we know the fallback target.
+            // For default device (-1), Bass.CurrentDevice resolves to the real index after init.
+            _currentDeviceIndex = Bass.CurrentDevice;
 
             // Configure BASS for low-latency operation
             Bass.Configure(Configuration.UpdatePeriod, 5);
@@ -596,6 +623,7 @@ public class RadioPlayback : IDisposable
         // This eliminates race conditions when adding streams later
         // The stream will just output silence until streams are added
         StartMasterStream();
+        _isInitialized = true;
     }
 
     public void TuneFrequency(int frequencyKHz, Guid slotId)
@@ -1141,7 +1169,8 @@ public class RadioPlayback : IDisposable
                     if (squelchOpen != slot.WasSquelchOpen)
                     {
 #if DEBUG
-                        _logger.LogDebug("SQUELCH {State} (Freq: {Frequency})", squelchOpen ? "OPEN" : "CLOSED", freq);
+                        _logger.LogDebug("SQUELCH {State} (Freq: {FrequencyKHz} kHz, SignalLevel: {Level:F3}, Threshold: {Threshold:F3})",
+                            squelchOpen ? "OPEN" : "CLOSED", freq, signalLevel, slot.SquelchLevel * 2f);
 #endif
                         slot.WasSquelchOpen = squelchOpen;
                     }
@@ -1202,6 +1231,17 @@ public class RadioPlayback : IDisposable
         };
 
         _masterDspProcHandle = Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
+        if (_masterDspProcHandle == 0)
+            throw new Exception($"BASS error attaching DSP proc to master stream: {Bass.LastError}. All playback would be silent.");
+
+        // Ensure device output is running. On a device that was disconnected and reconnected,
+        // BASS keeps IsInitialized = true but stops the output (BASS_ERROR_START on ChannelPlay).
+        // Bass.Start() is idempotent — no-op if output is already running.
+        if (!Bass.Start())
+            _logger.LogWarning(
+                "Bass.Start() on device {Device} returned false: {Error}. ChannelPlay may fail.",
+                Bass.CurrentDevice, Bass.LastError);
+
         if (!Bass.ChannelPlay(_masterStream))
             throw new Exception($"BASS error starting master stream playback: {Bass.LastError}");
     }
@@ -1291,37 +1331,110 @@ public class RadioPlayback : IDisposable
 
     public void ChangeOutputDevice(int newDeviceIndex)
     {
-        bool hadMasterStream = false;
-
+        // Capture previous device index BEFORE stopping — needed for fallback if switch fails.
+        // Do NOT use _masterStream != 0 to decide whether to restart: after a failed previous
+        // switch, _masterStream may be 0 even though _isInitialized is true and we need a stream.
+        int previousDeviceIndex;
         lock (_lock)
         {
-            hadMasterStream = _masterStream != 0;
+            previousDeviceIndex = _currentDeviceIndex;
         }
 
-        if (hadMasterStream)
-        {
-            StopMasterStream();
-        }
+        _logger.LogInformation(
+            "Switching BASS playback device: {Old} → {New}",
+            previousDeviceIndex, newDeviceIndex);
 
-        // Initialize the new device if not already initialized
-        // Check if device is already initialized
+        // Stop the current master stream regardless — StopMasterStream is a no-op if none running.
+        StopMasterStream();
+
+        // Initialize the new device if BASS hasn't seen it yet.
+        // NOTE: a device that was disconnected and reconnected still shows IsInitialized = true —
+        // BASS does not auto-deinit on disconnect. Its output is stopped, not its init state.
+        // Bass.Start() inside SetupDSPAndPlay handles that case.
         var deviceInfo = Bass.GetDeviceInfo(newDeviceIndex);
         if (!deviceInfo.IsInitialized)
         {
-            // Initialize the new device
+            _logger.LogInformation("BASS device {Index} not yet initialized — calling Bass.Init", newDeviceIndex);
             if (!Bass.Init(newDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
             {
-                _logger.LogError($"Failed to initialize device {newDeviceIndex}: {Bass.LastError}");
+                RaiseUserFacingError(
+                    $"Audio device (index {newDeviceIndex}) failed to initialize: {Bass.LastError}. Restoring previous device.");
+                TryRestorePreviousDevice(previousDeviceIndex);
                 return;
             }
         }
 
-        // Set current device for this thread
         Bass.CurrentDevice = newDeviceIndex;
 
-        if (hadMasterStream)
+        if (_isInitialized)
+        {
+            try
+            {
+                StartMasterStream();
+                lock (_lock) { _currentDeviceIndex = newDeviceIndex; }
+                _logger.LogInformation("BASS playback started on device {Index}", newDeviceIndex);
+            }
+            catch (Exception ex)
+            {
+                // First attempt failed (e.g. reconnected device with stale BASS state).
+                // Try force-reinit: free device in BASS and re-initialize from scratch.
+                _logger.LogWarning(ex,
+                    "First start attempt failed on device {Index} — trying force-reinit (Bass.Free + Bass.Init).",
+                    newDeviceIndex);
+                try
+                {
+                    Bass.CurrentDevice = newDeviceIndex;
+                    Bass.Free(); // deinit this specific device in BASS
+                    if (Bass.Init(newDeviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+                    {
+                        Bass.CurrentDevice = newDeviceIndex;
+                        StartMasterStream();
+                        lock (_lock) { _currentDeviceIndex = newDeviceIndex; }
+                        _logger.LogInformation("BASS playback started on device {Index} after force-reinit", newDeviceIndex);
+                        return;
+                    }
+                    _logger.LogError("Force-reinit of BASS device {Index} failed: {Error}", newDeviceIndex, Bass.LastError);
+                }
+                catch (Exception reinitEx)
+                {
+                    _logger.LogWarning(reinitEx, "Force-reinit of BASS device {Index} threw", newDeviceIndex);
+                }
+
+                RaiseUserFacingError(
+                    $"Playback failed to start on audio device (index {newDeviceIndex}). Restoring previous device.");
+                TryRestorePreviousDevice(previousDeviceIndex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempt to restart the master stream on <paramref name="deviceIndex"/>.
+    /// Called on the error path of <see cref="ChangeOutputDevice"/> so audio is not
+    /// permanently lost when the target device fails to initialise or play.
+    /// </summary>
+    private void TryRestorePreviousDevice(int deviceIndex)
+    {
+        if (deviceIndex < 0 || !_isInitialized)
+        {
+            RaiseUserFacingError(
+                "Audio playback lost — no valid previous device to fall back to. Please select a device in Settings.");
+            return;
+        }
+
+        _logger.LogWarning("Attempting to restore BASS playback on previous device {Index}", deviceIndex);
+        Bass.CurrentDevice = deviceIndex;
+
+        try
         {
             StartMasterStream();
+            lock (_lock) { _currentDeviceIndex = deviceIndex; }
+            _logger.LogWarning("Restored BASS playback on device {Index}", deviceIndex);
+        }
+        catch (Exception ex)
+        {
+            RaiseUserFacingError(
+                "Audio playback lost — failed to restore previous output device. Please select a device in Settings.");
+            _logger.LogError(ex, "Failed to restore BASS playback on device {Index}", deviceIndex);
         }
     }
 
