@@ -218,6 +218,7 @@ public class RadioPlayback : IDisposable
     private float[] _sidetoneScratch = [];
     public bool SidetoneEnabled { get; set; }
     public float SidetoneVolume { get; set; } = 0.4f;
+    public float MasterVolume { get; set; } = 1.0f;
 
     public void PushSidetone(ReadOnlySpan<float> samples) => _sidetoneBuffer.Write(samples);
     public void ClearSidetone() => _sidetoneBuffer.Clear();
@@ -1146,8 +1147,9 @@ public class RadioPlayback : IDisposable
                     }
                     if (!squelchOpen) continue;
 
-                    float leftGain  = slot.Volume * Math.Clamp((100 - slot.Pan) / 100f, 0f, 1f);
-                    float rightGain = slot.Volume * Math.Clamp((100 + slot.Pan) / 100f, 0f, 1f);
+                    float mv = MasterVolume;
+                    float leftGain  = mv * slot.Volume * Math.Clamp((100 - slot.Pan) / 100f, 0f, 1f);
+                    float rightGain = mv * slot.Volume * Math.Clamp((100 + slot.Pan) / 100f, 0f, 1f);
                     for (int frame = 0; frame < samples; frame++)
                     {
                         int leftIdx = frame * 2;
