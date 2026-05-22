@@ -11,9 +11,6 @@ public enum AmbientNoiseType
     /// <summary>No ambient layer — clean demodulated audio only.</summary>
     None,
 
-    /// <summary>Airborne platform (fast jet / helicopter). Alias for AirF16.</summary>
-    Air,
-
     /// <summary>F-16 cockpit: inverter whine, engine roar, oxygen-mask muffle.</summary>
     AirF16,
 
@@ -55,7 +52,6 @@ internal static class AmbientNoiseEffectFactory
     public static IAmbientNoiseEffect Create(AmbientNoiseType type, int sampleRate, int channels, float strength = 5.0f)
         => type switch
         {
-            AmbientNoiseType.Air or
             AmbientNoiseType.AirF16     => new AirF16AmbientEffect(sampleRate, channels, strength),
             AmbientNoiseType.AirF15     => new AirF15AmbientEffect(sampleRate, channels, strength),
             AmbientNoiseType.AirGeneric => new AirGenericAmbientEffect(sampleRate, channels, strength),

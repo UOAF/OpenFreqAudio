@@ -167,7 +167,7 @@ public static class RadioStationPresets
         rxSensitivityUhf: -107.0,
         minPpm: 0.5, // Good quality TCXO
         maxPpm: 2.0,
-        ambientNoiseType: AmbientNoiseType.Air,
+        ambientNoiseType: AmbientNoiseType.AirGeneric,
         description: "KC-135/KC-10 aerial refueling aircraft"
     );
 
@@ -181,7 +181,7 @@ public static class RadioStationPresets
         rxSensitivityUhf: -105.0,
         minPpm: 0.5, // Standard military TCXO
         maxPpm: 2.0,
-        ambientNoiseType: AmbientNoiseType.Air,
+        ambientNoiseType: AmbientNoiseType.AirGeneric,
         description: "C-130/C-17 military transport aircraft"
     );
 
@@ -195,7 +195,7 @@ public static class RadioStationPresets
         rxSensitivityUhf: -105.0,
         minPpm: 1.0, // More vibration, temperature variation
         maxPpm: 3.0,
-        ambientNoiseType: AmbientNoiseType.Air,
+        ambientNoiseType: AmbientNoiseType.AirGeneric,
         description: "AH-64/UH-60 attack and utility helicopters"
     );
 
