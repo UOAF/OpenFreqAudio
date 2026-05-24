@@ -1,8 +1,11 @@
+![OpenFreqAudio Banner](docs/openfreqaudio_banner.png)
+
 # OpenFreqAudio
 
 Physics-based radio communication simulation for flight simulators, primarily targeting Falcon BMS.
 Models radio propagation over terrain and AM radio demodulation.
 
+![BMSAudioSim screenshot](docs/bmsaudiosim_screenshot_1.png)
 ## Features
 
 ### RF Propagation Physics
