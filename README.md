@@ -1,3 +1,5 @@
+![OpenFreqAudio Banner](docs/openfreqaudio_banner.png)
+
 # OpenFreqAudio
 
 Physics-based radio communication simulation for flight simulators, primarily targeting Falcon BMS.
