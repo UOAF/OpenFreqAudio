@@ -32,11 +32,16 @@ public enum AmbientNoiseType
 /// PreFade — transmitter-side acoustics (cockpit noise, mask muffling) on clean PCM.
 /// PostFade — receiver-side IF filtering after demodulation.
 /// Not thread-safe; each RadioEffect owns its own instance and replaces it atomically.
+/// Always operates on mono audio.
 /// </summary>
 internal interface IAmbientNoiseEffect
 {
-    /// <summary>Transmitter-side acoustics. Called on clean PCM before RF fading.</summary>
-    void ApplyPreFade(float[] buffer, int offset, int frames);
+    /// <summary>
+    /// Transmitter-side acoustics. Called on clean mono PCM before RF fading.
+    /// <paramref name="volume"/> (0..1) wet/dry-blends the effect against the
+    /// clean input: 0 bypasses the effect entirely, 1 applies it at full strength.
+    /// </summary>
+    void ApplyPreFade(float[] buffer, int offset, int frames, float volume);
 }
 
 // ---------------------------------------------------------------------------
@@ -49,14 +54,14 @@ internal static class AmbientNoiseEffectFactory
     /// Create an ambient noise effect with configurable strength.
     /// </summary>
     /// <param name="strength">Effect intensity multiplier (0.0 = no effect, 1.0 = full strength, > 1.0 = boost).</param>
-    public static IAmbientNoiseEffect Create(AmbientNoiseType type, int sampleRate, int channels, float strength = 5.0f)
+    public static IAmbientNoiseEffect Create(AmbientNoiseType type, int sampleRate, float strength = 5.0f)
         => type switch
         {
-            AmbientNoiseType.AirF16     => new AirF16AmbientEffect(sampleRate, channels, strength),
-            AmbientNoiseType.AirF15     => new AirF15AmbientEffect(sampleRate, channels, strength),
-            AmbientNoiseType.AirGeneric => new AirGenericAmbientEffect(sampleRate, channels, strength),
-            AmbientNoiseType.Ground     => new GroundAmbientEffect(sampleRate, channels, strength),
-            AmbientNoiseType.Stationary => new StationaryAmbientEffect(sampleRate, channels, strength),
+            AmbientNoiseType.AirF16     => new AirF16AmbientEffect(sampleRate, strength),
+            AmbientNoiseType.AirF15     => new AirF15AmbientEffect(sampleRate, strength),
+            AmbientNoiseType.AirGeneric => new AirGenericAmbientEffect(sampleRate, strength),
+            AmbientNoiseType.Ground     => new GroundAmbientEffect(sampleRate, strength),
+            AmbientNoiseType.Stationary => new StationaryAmbientEffect(sampleRate, strength),
             _                           => NullAmbientEffect.Instance,
         };
 }
@@ -70,7 +75,7 @@ internal sealed class NullAmbientEffect : IAmbientNoiseEffect
     public static readonly NullAmbientEffect Instance = new();
     private NullAmbientEffect() { }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames) { }
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume) { }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,14 +94,13 @@ internal sealed class NullAmbientEffect : IAmbientNoiseEffect
 internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly float _strength;
 
     // Oxygen-mask LPF — two cascaded one-pole stages at 900 Hz
     private const float MuffleCutoff = 1300f;
     private readonly float _muffleA;
-    private readonly float[] _muffleLP1;
-    private readonly float[] _muffleLP2;
+    private float _muffleLP1;
+    private float _muffleLP2;
 
     // Inverter whine — 400 Hz near-square-wave: fundamental + 3rd + 5th harmonics.
     // FM wobble via 0.8 Hz LFO simulates power-supply frequency drift.
@@ -123,20 +127,16 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
     private double _rumblePhase1;
     private double _rumblePhase2;
 
-    public AirF16AmbientEffect(int sampleRate, int channels, float strength)
+    public AirF16AmbientEffect(int sampleRate, float strength)
     {
         _sampleRate = sampleRate;
-        _channels   = channels;
         _strength   = strength;
 
-        _muffleA   = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
-        _muffleLP1 = new float[channels];
-        _muffleLP2 = new float[channels];
-
+        _muffleA = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
         _roarLpA = MathF.Exp(-2f * MathF.PI * 350f / sampleRate);
     }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames)
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume)
     {
         double wobbleInc  = 2.0 * Math.PI * WhineWobbleRate / _sampleRate;
         double rumbleInc1 = 2.0 * Math.PI * RumbleFreq1 / _sampleRate;
@@ -166,28 +166,27 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
             if (_rumblePhase1 > Math.PI * 2) _rumblePhase1 -= Math.PI * 2;
             if (_rumblePhase2 > Math.PI * 2) _rumblePhase2 -= Math.PI * 2;
 
-            // Engine roar: Knuth LCG → one-pole LPF, mono source shared across channels
+            // Engine roar: Knuth LCG → one-pole LPF
             _noiseState  = _noiseState * 1664525u + 1013904223u;
             float roar   = _roarLpA * _roarLpState + (1f - _roarLpA) * ((int)_noiseState * (1f / 2147483648f));
             _roarLpState = roar;
 
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+            int idx = offset + frame;
+            float dry = buffer[idx];
+            float x = dry;
 
-                x *= rumbleGain;                    // airframe vibration AM-modulates mic pickup
-                x += whineSample;                   // electrical wiring bleed
-                x += roar * RoarLevel * _strength;  // structure-borne acoustic roar
+            x *= rumbleGain;                    // airframe vibration AM-modulates mic pickup
+            x += whineSample;                   // electrical wiring bleed
+            x += roar * RoarLevel * _strength;  // structure-borne acoustic roar
 
-                // Oxygen-mask two-pole LPF + nasal cavity blend
-                float lp1 = _muffleA * _muffleLP1[c] + (1f - _muffleA) * x;
-                _muffleLP1[c] = lp1;
-                float lp2 = _muffleA * _muffleLP2[c] + (1f - _muffleA) * lp1;
-                _muffleLP2[c] = lp2;
+            // Oxygen-mask two-pole LPF + nasal cavity blend
+            float lp1 = _muffleA * _muffleLP1 + (1f - _muffleA) * x;
+            _muffleLP1 = lp1;
+            float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
+            _muffleLP2 = lp2;
 
-                buffer[idx] = lp2 * 0.60f + x * 0.55f * 0.40f;
-            }
+            float wet = lp2 * 0.60f + x * 0.55f * 0.40f;
+            buffer[idx] = dry + volume * (wet - dry);
         }
     }
 }
@@ -207,13 +206,12 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
 internal sealed class AirF15AmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly float _strength;
 
     // Single-pole mask muffle — higher cutoff than F-16 for a crisper, more analog feel
     private const float MuffleCutoff = 2000f;
     private readonly float _muffleA;
-    private readonly float[] _muffleLP;
+    private float _muffleLP;
 
     // Airframe AM — twin-engine F100 beat signature
     private const float RumbleFreq1  = 50f;
@@ -236,19 +234,16 @@ internal sealed class AirF15AmbientEffect : IAmbientNoiseEffect
     private const float SatDrive = 2.5f;
     private static readonly float SatNorm = 1.0f / MathF.Tanh(SatDrive);
 
-    public AirF15AmbientEffect(int sampleRate, int channels, float strength)
+    public AirF15AmbientEffect(int sampleRate, float strength)
     {
         _sampleRate = sampleRate;
-        _channels   = channels;
         _strength   = strength;
 
-        _muffleA  = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
-        _muffleLP = new float[channels];
-
+        _muffleA = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
         _roarLpA = MathF.Exp(-2f * MathF.PI * 400f / sampleRate);
     }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames)
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume)
     {
         double rumbleInc1 = 2.0 * Math.PI * RumbleFreq1 / _sampleRate;
         double rumbleInc2 = 2.0 * Math.PI * RumbleFreq2 / _sampleRate;
@@ -269,23 +264,22 @@ internal sealed class AirF15AmbientEffect : IAmbientNoiseEffect
             float roar   = _roarLpA * _roarLpState + (1f - _roarLpA) * ((int)_noiseState * (1f / 2147483648f));
             _roarLpState = roar;
 
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+            int idx = offset + frame;
+            float dry = buffer[idx];
+            float x = dry;
 
-                x *= rumbleGain;
-                x += roar * RoarLevel * _strength;
+            x *= rumbleGain;
+            x += roar * RoarLevel * _strength;
 
-                // Analog preamp saturation: soft-clips peaks, adds odd harmonics for 80s crunch
-                x = MathF.Tanh(x * SatDrive) * SatNorm;
+            // Analog preamp saturation: soft-clips peaks, adds odd harmonics for 80s crunch
+            x = MathF.Tanh(x * SatDrive) * SatNorm;
 
-                // Single-pole mask muffle: softer coloring than F-16, more dry signal let through
-                float lp = _muffleA * _muffleLP[c] + (1f - _muffleA) * x;
-                _muffleLP[c] = lp;
+            // Single-pole mask muffle: softer coloring than F-16, more dry signal let through
+            float lp = _muffleA * _muffleLP + (1f - _muffleA) * x;
+            _muffleLP = lp;
 
-                buffer[idx] = lp * 0.40f + x * 0.60f;
-            }
+            float wet = lp * 0.40f + x * 0.60f;
+            buffer[idx] = dry + volume * (wet - dry);
         }
     }
 }
@@ -311,14 +305,13 @@ internal sealed class AirF15AmbientEffect : IAmbientNoiseEffect
 internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly float _strength;
 
     // Oxygen-mask two-pole LPF — same cutoff as F-16 for consistent muffling character
     private const float MuffleCutoff = 1300f;
     private readonly float _muffleA;
-    private readonly float[] _muffleLP1;
-    private readonly float[] _muffleLP2;
+    private float _muffleLP1;
+    private float _muffleLP2;
 
     // N1 fan stage — lower harmonic series, slow wobble (fan RPM variation)
     private const float N1Freq        = 480f;
@@ -355,20 +348,16 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
     private float _roarLpState;
     private uint _noiseState = 0x9E3779B9u;
 
-    public AirGenericAmbientEffect(int sampleRate, int channels, float strength)
+    public AirGenericAmbientEffect(int sampleRate, float strength)
     {
         _sampleRate = sampleRate;
-        _channels   = channels;
         _strength   = strength;
 
-        _muffleA   = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
-        _muffleLP1 = new float[channels];
-        _muffleLP2 = new float[channels];
-
+        _muffleA = MathF.Exp(-2f * MathF.PI * MuffleCutoff / sampleRate);
         _roarLpA = MathF.Exp(-2f * MathF.PI * 350f / sampleRate);
     }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames)
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume)
     {
         double n1WobbleInc = 2.0 * Math.PI * N1WobbleRate / _sampleRate;
         double n2WobbleInc = 2.0 * Math.PI * N2WobbleRate / _sampleRate;
@@ -416,23 +405,22 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
             float roar   = _roarLpA * _roarLpState + (1f - _roarLpA) * ((int)_noiseState * (1f / 2147483648f));
             _roarLpState = roar;
 
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+            int idx = offset + frame;
+            float dry = buffer[idx];
+            float x = dry;
 
-                x *= rumbleGain;
-                x += n1Sample + n2Sample;
-                x += roar * RoarLevel * _strength;
+            x *= rumbleGain;
+            x += n1Sample + n2Sample;
+            x += roar * RoarLevel * _strength;
 
-                // Oxygen-mask two-pole LPF + nasal cavity blend
-                float lp1 = _muffleA * _muffleLP1[c] + (1f - _muffleA) * x;
-                _muffleLP1[c] = lp1;
-                float lp2 = _muffleA * _muffleLP2[c] + (1f - _muffleA) * lp1;
-                _muffleLP2[c] = lp2;
+            // Oxygen-mask two-pole LPF + nasal cavity blend
+            float lp1 = _muffleA * _muffleLP1 + (1f - _muffleA) * x;
+            _muffleLP1 = lp1;
+            float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
+            _muffleLP2 = lp2;
 
-                buffer[idx] = lp2 * 0.60f + x * 0.55f * 0.40f;
-            }
+            float wet = lp2 * 0.60f + x * 0.55f * 0.40f;
+            buffer[idx] = dry + volume * (wet - dry);
         }
     }
 }
@@ -454,7 +442,6 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
 internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly float _strength;
 
     // Diesel AM — firing frequency + hull resonance beating for organic lope.
@@ -492,12 +479,11 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
     // Crew compartment coloration — LP 2000 Hz, boxy sealed-hull character
     private const float CompartmentCutoff = 2000f;
     private readonly float _compartmentA;
-    private readonly float[] _compartmentLP;
+    private float _compartmentLP;
 
-    public GroundAmbientEffect(int sampleRate, int channels, float strength)
+    public GroundAmbientEffect(int sampleRate, float strength)
     {
         _sampleRate = sampleRate;
-        _channels   = channels;
         _strength   = strength;
 
         _roarLpA    = MathF.Exp(-2f * MathF.PI * 500f / sampleRate);
@@ -505,11 +491,10 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
         _driveLpA   = MathF.Exp(-2f * MathF.PI * 900f / sampleRate);
         _clatterLpA = MathF.Exp(-2f * MathF.PI * 450f / sampleRate);
 
-        _compartmentA  = MathF.Exp(-2f * MathF.PI * CompartmentCutoff / sampleRate);
-        _compartmentLP = new float[channels];
+        _compartmentA = MathF.Exp(-2f * MathF.PI * CompartmentCutoff / sampleRate);
     }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames)
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume)
     {
         double thrumInc1 = 2.0 * Math.PI * ThrumFreq1 / _sampleRate;
         double thrumInc2 = 2.0 * Math.PI * ThrumFreq2 / _sampleRate;
@@ -547,21 +532,19 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
             float clatterLp    = _clatterLpA * _clatterLpState + (1f - _clatterLpA) * ((int)_clatterNoiseState * (1f / 2147483648f));
             _clatterLpState    = clatterLp;
 
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+            int idx = offset + frame;
+            float dry = buffer[idx];
+            float x = dry;
 
-                x *= thrumGain;                                       // engine vibration AM-modulates mic pickup
-                x += roarLp2   * RoarLevel * _strength;               // acoustic engine roar
-                x += (driveLp - driveHp) * DrivetrainLevel * _strength; // drivetrain/gearbox grind
-                x += clatterLp * ClatterLevel * _strength;            // track and chassis clatter
+            x *= thrumGain;                                       // engine vibration AM-modulates mic pickup
+            x += roarLp2   * RoarLevel * _strength;               // acoustic engine roar
+            x += (driveLp - driveHp) * DrivetrainLevel * _strength; // drivetrain/gearbox grind
+            x += clatterLp * ClatterLevel * _strength;            // track and chassis clatter
 
-                float lp = _compartmentA * _compartmentLP[c] + (1f - _compartmentA) * x;
-                _compartmentLP[c] = lp;
+            float lp = _compartmentA * _compartmentLP + (1f - _compartmentA) * x;
+            _compartmentLP = lp;
 
-                buffer[idx] = lp;
-            }
+            buffer[idx] = dry + volume * (lp - dry);
         }
     }
 }
@@ -582,7 +565,6 @@ internal sealed class GroundAmbientEffect : IAmbientNoiseEffect
 internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
 {
     private readonly int _sampleRate;
-    private readonly int _channels;
     private readonly float _strength;
 
     // Mains hum — 50 Hz fundamental + 2nd harmonic (rectifier ripple) + 3rd (odd distortion)
@@ -612,22 +594,20 @@ internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
     // Room coloration — LP 3500 Hz, mild HF absorption of a furnished ops room
     private const float RoomCutoff = 3500f;
     private readonly float _roomA;
-    private readonly float[] _roomLP;
+    private float _roomLP;
 
-    public StationaryAmbientEffect(int sampleRate, int channels, float strength)
+    public StationaryAmbientEffect(int sampleRate, float strength)
     {
         _sampleRate = sampleRate;
-        _channels   = channels;
         _strength   = strength;
 
         _hvacLpA     = MathF.Exp(-2f * MathF.PI * 220f  / sampleRate);
         _hissLpHighA = MathF.Exp(-2f * MathF.PI * 1500f / sampleRate);
         _hissLpLowA  = MathF.Exp(-2f * MathF.PI * 300f  / sampleRate);
         _roomA       = MathF.Exp(-2f * MathF.PI * RoomCutoff / sampleRate);
-        _roomLP      = new float[channels];
     }
 
-    public void ApplyPreFade(float[] buffer, int offset, int frames)
+    public void ApplyPreFade(float[] buffer, int offset, int frames, float volume)
     {
         double mainsInc  = 2.0 * Math.PI * MainsFreq      / _sampleRate;
         double hvacAMInc = 2.0 * Math.PI * HvacDuctAMRate / _sampleRate;
@@ -658,20 +638,18 @@ internal sealed class StationaryAmbientEffect : IAmbientNoiseEffect
             _hissLpHighState = hissHigh;
             _hissLpLowState  = hissLow;
 
-            for (int c = 0; c < _channels; c++)
-            {
-                int idx = offset + frame * _channels + c;
-                float x = buffer[idx];
+            int idx = offset + frame;
+            float dry = buffer[idx];
+            float x = dry;
 
-                x += mainsSample;
-                x += hvacLp * HvacLevel * _strength * hvacAM;
-                x += (hissHigh - hissLow) * HissLevel * _strength;
+            x += mainsSample;
+            x += hvacLp * HvacLevel * _strength * hvacAM;
+            x += (hissHigh - hissLow) * HissLevel * _strength;
 
-                float lp = _roomA * _roomLP[c] + (1f - _roomA) * x;
-                _roomLP[c] = lp;
+            float lp = _roomA * _roomLP + (1f - _roomA) * x;
+            _roomLP = lp;
 
-                buffer[idx] = lp;
-            }
+            buffer[idx] = dry + volume * (lp - dry);
         }
     }
 }
