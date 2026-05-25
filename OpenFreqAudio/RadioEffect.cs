@@ -80,7 +80,7 @@ public class RadioEffect
             {
                 if (_ambientNoiseType == value) return;
                 _ambientNoiseType = value;
-                _ambientEffect = AmbientNoiseEffectFactory.Create(value, _sampleRate, _channels);
+                _ambientEffect = AmbientNoiseEffectFactory.Create(value, _sampleRate);
 #if DEBUG
                 _logger.LogDebug("AmbientNoise changed to {Type} (StreamRate={SampleRate} Hz)", value, _sampleRate);
 #endif
@@ -107,8 +107,10 @@ public class RadioEffect
     /// <summary>
     /// Process <paramref name="samples"/> samples (frames x channels) starting
     /// at <paramref name="offset"/> in <paramref name="buffer"/> in-place.
+    /// <paramref name="ambientNoiseVolume"/> (0..1) wet/dry-blends the ambient
+    /// noise layer: 0 bypasses it, 1 applies it at full strength.
     /// </summary>
-    public void Process(float[] buffer, int offset, int samples)
+    public void Process(float[] buffer, int offset, int samples, float ambientNoiseVolume)
     {
         var rng = ThreadRng.Value!;
         AudioParams p;
@@ -123,7 +125,7 @@ public class RadioEffect
         int frames = samples / _channels;
 
         // 1. Transmitter acoustics: mic pickup, mask muffling, cockpit noise.
-        ambientEffect.ApplyPreFade(buffer, offset, frames);
+        ambientEffect.ApplyPreFade(buffer, offset, frames, ambientNoiseVolume);
 
         // 2. RF channel fading: schedule new events, then apply envelopes.
         ScheduleFadingEvents(rng, frames, p);

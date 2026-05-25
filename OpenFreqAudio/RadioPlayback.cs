@@ -248,6 +248,10 @@ public class RadioPlayback : IDisposable
 
     public bool Apply3dEffects { get; set; }
 
+    // Wet/dry blend (0..1) for the transmitter-side ambient noise layer.
+    // 0 bypasses ambient SFX entirely; 1 applies them at full strength.
+    public float AmbientNoiseVolume { get; set; } = 1.0f;
+
     /// <summary>
     /// Create a first-order filter from attack and decay time constants
     /// </summary>
@@ -927,7 +931,7 @@ public class RadioPlayback : IDisposable
                     // Apply radio effects
                     if (Apply3dEffects)
                     {
-                        stream.RadioEffect.Process(stream.Scratch, 0, drained);
+                        stream.RadioEffect.Process(stream.Scratch, 0, drained, AmbientNoiseVolume);
                     }
                     
                     for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
