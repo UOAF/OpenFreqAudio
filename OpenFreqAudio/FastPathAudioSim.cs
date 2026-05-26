@@ -451,8 +451,10 @@ namespace OpenFreqAudio
 #endif
             }
 
-            // Combine theoretical loss with wavelength correction
-            double totalTerrainLoss = theoreticalDiffractionLoss + wavelengthCorrection;
+            // Combine theoretical loss with wavelength correction.
+            // Positive correction = better diffraction (VHF advantage) → reduces terrain loss.
+            // Negative correction = worse diffraction (UHF) → increases terrain loss.
+            double totalTerrainLoss = theoreticalDiffractionLoss - wavelengthCorrection;
 
             // SMOOTH BLENDING: For severe obstruction, blend between theoretical and measured diffraction loss
             // - clearance > 0.4: Use pure theoretical (approximation works well)
