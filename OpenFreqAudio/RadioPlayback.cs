@@ -1177,8 +1177,9 @@ public class RadioPlayback : IDisposable
                     if (!squelchOpen) continue;
 
                     float mv = MasterVolume;
-                    float leftGain  = mv * slot.Volume * Math.Clamp((100 - slot.Pan) / 100f, 0f, 1f);
-                    float rightGain = mv * slot.Volume * Math.Clamp((100 + slot.Pan) / 100f, 0f, 1f);
+                    float panAngle  = (slot.Pan + 100) / 200f * MathF.PI / 2f;
+                    float leftGain  = mv * slot.Volume * MathF.Cos(panAngle);
+                    float rightGain = mv * slot.Volume * MathF.Sin(panAngle);
                     for (int frame = 0; frame < samples; frame++)
                     {
                         int leftIdx = frame * 2;
