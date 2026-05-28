@@ -296,7 +296,7 @@ public class RadioPlayback : IDisposable
             Bass.Configure(Configuration.PlaybackBufferLength, 10);
             Bass.Configure(Configuration.DeviceBufferLength, 10);
             Bass.Configure(Configuration.UpdateThreads, 1);
-            
+
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
@@ -475,29 +475,28 @@ public class RadioPlayback : IDisposable
             throw new ArgumentException($"Expected mono, got {channels} channels");
         }
 
+        // Build the stream object outside the lock
+        var newStream = new RadioStream(_loggerFactory.CreateLogger<RadioStream>())
+        {
+            StreamId = streamId,
+            FrequencyKHz = audioParams.RadioFrequencyKHz,
+            BassStreamHandle = 0,
+            IsPush = true,
+            RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
+                _loggerFactory.CreateLogger<RadioEffect>()),
+            CurrentParams = audioParams,
+        };
+
         lock (_lock)
         {
+            // Re-check under lock — another thread may have added the same stream while
+            // we were constructing newStream outside the lock.
             if (_streams.ContainsKey(streamId)) return;
+
             if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
                 _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
-        }
-
-
-        lock (_lock)
-        {
-            var stream = new RadioStream(_loggerFactory.CreateLogger<RadioStream>())
-            {
-                StreamId = streamId,
-                FrequencyKHz = audioParams.RadioFrequencyKHz,
-                BassStreamHandle = 0,
-                IsPush = true,
-                RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
-                    _loggerFactory.CreateLogger<RadioEffect>()),
-                CurrentParams = audioParams,
-            };
 
             int ringFrames = (sampleRate * 150) / 1000; // 150ms
-            int minBufferFrames = (sampleRate * 120) / 1000; // 120ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
 
             _logger.LogInformation("Stream '{StreamId}' on {Frequency:F3} MHz", streamId,
@@ -507,7 +506,7 @@ public class RadioPlayback : IDisposable
                 "  RingBuffer: {RingFrames} frames × {Channels} ch = {RingCapacity} samples ({Duration:F1}s)",
                 ringFrames, Math.Max(1, channels), ringCapacity, (float)ringFrames / sampleRate);
 
-            _streams.Add(streamId, stream);
+            _streams.Add(streamId, newStream);
         }
     }
 
@@ -624,6 +623,20 @@ public class RadioPlayback : IDisposable
         // The stream will just output silence until streams are added
         StartMasterStream();
         _isInitialized = true;
+    }
+
+    /// <summary>
+    /// Restart the master stream if it is not running. No-op if already playing.
+    /// Guards against edge cases where the stream was stopped (e.g. all slots were
+    /// untuned during a shutdown) and the same RadioPlayback instance is reused on reconnect.
+    /// </summary>
+    public void EnsureMasterStreamRunning()
+    {
+        if (_isInitialized && _masterStream == 0)
+        {
+            _logger.LogWarning("Master stream not running — restarting");
+            StartMasterStream();
+        }
     }
 
     public void TuneFrequency(int frequencyKHz, Guid slotId)
@@ -923,13 +936,13 @@ public class RadioPlayback : IDisposable
                         // (like a fan in your room)
                         stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.5f);
                     }
-                    
+
                     // Apply radio effects
                     if (Apply3dEffects)
                     {
                         stream.RadioEffect.Process(stream.Scratch, 0, drained);
                     }
-                    
+
                     for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
                     stream.Samples = stream.Scratch.AsMemory()[..drained];
                 }
