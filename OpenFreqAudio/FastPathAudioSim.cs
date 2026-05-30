@@ -163,7 +163,7 @@ namespace OpenFreqAudio
                 freqMaxKhz: 520000,
                 bandwidth: 3000.0f,
                 diffractionDb: -7.0, // More LOS-dependent
-                modulation: ModulationType.FM
+                modulation: ModulationType.AM
             )
         };
 
@@ -612,9 +612,9 @@ namespace OpenFreqAudio
             // Get band configuration for this frequency
             RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
 
-            // Use provided sensitivity or default values based on modulation
+            // Use provided sensitivity or band-based defaults
             double rxSensitivity = receiverSensitivityDbm ??
-                                   (bandConfig.Modulation == ModulationType.AM ? -113.0 : -107.0);
+                                   (RadioStationPreset.IsVHF(frequencyKhz) ? -113.0 : -107.0);
 
             // Received power before terrain effects
             ap.ReceivedDb = (float)(txPowerDbm - fspl - weatherLoss);
@@ -733,7 +733,7 @@ namespace OpenFreqAudio
 
                 // Check that terrain at the specular midpoint does not block the reflected path.
                 // Positive specElev means terrain rising above the sea surface at the bounce point.
-                double specX = 0.5 * (txXVal + rxYVal);
+                double specX = 0.5 * (txXVal + rxXVal);
                 double specY = 0.5 * (txYVal + rxYVal);
                 // BMS ocean tiles return negative elevation values — clamp to 0 (sea level).
                 double specElev = Math.Max(0.0, SampleElevation(specX, specY));
