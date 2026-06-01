@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using ManagedBass;
+using ManagedBass.Enc;
 using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
 using NWaves.Filters.Butterworth;
@@ -246,6 +247,49 @@ public class RadioPlayback : IDisposable
     public void PushSidetone(ReadOnlySpan<float> samples) => _sidetoneBuffer.Write(samples);
     public void ClearSidetone() => _sidetoneBuffer.Clear();
 
+    // --- Session capture (one combined stereo mix: incoming as heard with pan + own voice centered,
+    //     rendered as if heard from same position). The mix can be written to an Ogg/Vorbis file
+    //     OR streamed to a separate playback device (e.g. a virtual cable). Exclusive in practice,
+    //     but both sinks are supported independently here. ---
+    private bool _recording;        // file sink active
+    private int _recordStream;      // dummy decode stream that sets the encoder format
+    private int _recordEncoder;     // BassEnc_Ogg handle
+    private bool _monitoring;       // device sink active
+    private int _monitorStream;     // push stream on the monitor output device
+    private OwnVoiceRadioRenderer? _ownVoiceRenderer;
+    private float[] _recordStereo = [];
+    private float[] _ownVoiceScratch = [];
+    // Own mic samples pushed here from the recording callback (producer), drained on the
+    // DSP thread (consumer). Same SPSC buffer used for sidetone.
+    private readonly SidetoneSpscBuffer _recordOwnVoiceBuffer = new(8192);
+
+    private bool Capturing => _recording || _monitoring;
+
+    /// <summary>Feed own mic samples (mono, 48kHz, [-1,1]) for the outgoing side of the capture.</summary>
+    public void PushOwnVoiceForRecording(ReadOnlySpan<float> samples)
+    {
+        if (Capturing) _recordOwnVoiceBuffer.Write(samples);
+    }
+
+    /// <summary>Set the radio params + transmitter ambient SFX used to render own voice. Call at TX start.</summary>
+    public void SetOwnVoiceRecordParams(AudioParams p, AmbientNoiseType ambient)
+        => _ownVoiceRenderer?.SetParams(p, ambient);
+
+    public bool IsRecording => _recording;
+    public bool IsMonitoring => _monitoring;
+    public bool IsCapturing => Capturing;
+
+    /// <summary>When false, own voice is captured clean (no radio FX/AGC/squelch). Default true.</summary>
+    public bool OwnVoiceSfxEnabled
+    {
+        get;
+        set
+        {
+            field = value;
+            if (_ownVoiceRenderer != null) _ownVoiceRenderer.ApplySfx = value;
+        }
+    } = true;
+
     public bool Apply3dEffects { get; set; }
 
     // Wet/dry blend (0..1) for the transmitter-side ambient noise layer.
@@ -306,6 +350,9 @@ public class RadioPlayback : IDisposable
                 // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
                 // We don't need to free it explicitly, this is covered by BASS
                 NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
+                // Session recording encoder. bassenc_ogg depends on bassenc, so load bassenc first.
+                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassenc.so"));
+                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassenc_ogg.so"));
             }
         }
     }
@@ -643,6 +690,160 @@ public class RadioPlayback : IDisposable
         }
     }
 
+    // Create the own-voice renderer if no capture sink owns one yet. Call under _lock.
+    private void EnsureCaptureRenderer()
+    {
+        if (_ownVoiceRenderer != null) return;
+        _ownVoiceRenderer = new OwnVoiceRadioRenderer(SampleRate,
+            FastPathAudioSim.GetDefaultAudioParams(0),
+            _loggerFactory.CreateLogger<OwnVoiceRadioRenderer>())
+        {
+            ApplySfx = OwnVoiceSfxEnabled
+        };
+        _recordOwnVoiceBuffer.Clear();
+    }
+
+    // Drop the renderer once no capture sink is active anymore. Call under _lock.
+    private void ClearCaptureRendererIfIdle()
+    {
+        if (Capturing) return;
+        _ownVoiceRenderer = null;
+        _recordOwnVoiceBuffer.Clear();
+    }
+
+    /// <summary>
+    /// Start recording the session to a combined stereo Ogg/Vorbis file at <paramref name="filePath"/>.
+    /// Captures incoming audio (as heard, post-FX, with pan) plus our own voice rendered as if heard
+    /// from the same position, panned centre. No-op if already recording. Encoding runs on BASSenc's
+    /// own thread.
+    /// </summary>
+    public void StartRecording(string filePath)
+    {
+        lock (_lock)
+        {
+            if (_recording) return;
+
+            // Dummy decode stream only sets the encoder format (48k stereo float); never played.
+            int stream = Bass.CreateStream(SampleRate, 2, BassFlags.Float | BassFlags.Decode,
+                StreamProcedureType.Dummy);
+            if (stream == 0)
+            {
+                RaiseUserFacingError($"Recording: failed to create encoder stream: {Bass.LastError}");
+                return;
+            }
+
+            // EncodeFlags.Queue → EncodeWrite copies to a queue and BASSenc encodes off the audio thread.
+            int enc = BassEnc_Ogg.Start(stream, "--quality=3", EncodeFlags.Queue, filePath);
+            if (enc == 0)
+            {
+                Bass.StreamFree(stream);
+                RaiseUserFacingError($"Recording: failed to start Ogg encoder: {Bass.LastError}");
+                return;
+            }
+
+            _recordStream = stream;
+            _recordEncoder = enc;
+            EnsureCaptureRenderer();
+            _recording = true;
+            _logger.LogInformation("Recording started: {Path}", filePath);
+        }
+    }
+
+    /// <summary>Stop and finalize the session recording. No-op if not recording.</summary>
+    public void StopRecording()
+    {
+        int enc, stream;
+        lock (_lock)
+        {
+            if (!_recording) return;
+            _recording = false;
+            enc = _recordEncoder;
+            stream = _recordStream;
+            _recordEncoder = 0;
+            _recordStream = 0;
+            ClearCaptureRendererIfIdle();
+        }
+
+        // Free outside the lock — EncodeStop flushes the queue.
+        if (enc != 0) BassEnc.EncodeStop(enc);
+        if (stream != 0) Bass.StreamFree(stream);
+        _logger.LogInformation("Recording stopped");
+    }
+
+    /// <summary>
+    /// Start streaming the combined capture mix to a separate playback device (BASS device index
+    /// <paramref name="deviceIndex"/>), e.g. a virtual audio cable. No-op if already monitoring.
+    /// The monitor device runs on its own clock, independent of the master output device, so a
+    /// generous push-stream buffer is used to absorb drift.
+    /// </summary>
+    public void StartMonitor(int deviceIndex)
+    {
+        lock (_lock)
+        {
+            if (_monitoring) return;
+
+            int stream = 0;
+            try
+            {
+                var info = Bass.GetDeviceInfo(deviceIndex);
+                if (!info.IsInitialized &&
+                    !Bass.Init(deviceIndex, SampleRate, DeviceInitFlags.Default, IntPtr.Zero))
+                {
+                    RaiseUserFacingError($"Monitor: failed to initialize device {deviceIndex}: {Bass.LastError}");
+                    return;
+                }
+
+                Bass.CurrentDevice = deviceIndex;
+
+                // Generous buffer to absorb clock drift vs the master device. Restore afterwards
+                // so other stream creation keeps the low-latency setting.
+                int prevBuf = Bass.GetConfig(Configuration.PlaybackBufferLength);
+                Bass.Configure(Configuration.PlaybackBufferLength, 200);
+                stream = Bass.CreateStream(SampleRate, 2, BassFlags.Float, StreamProcedureType.Push);
+                Bass.Configure(Configuration.PlaybackBufferLength, prevBuf);
+
+                if (stream == 0)
+                {
+                    RaiseUserFacingError($"Monitor: failed to create stream on device {deviceIndex}: {Bass.LastError}");
+                    return;
+                }
+
+                Bass.ChannelPlay(stream);
+            }
+            finally
+            {
+                // Keep the master device current for the rest of the pipeline on this thread.
+                if (_currentDeviceIndex >= 0) Bass.CurrentDevice = _currentDeviceIndex;
+            }
+
+            _monitorStream = stream;
+            EnsureCaptureRenderer();
+            _monitoring = true;
+            _logger.LogInformation("Monitor stream started on device {Device}", deviceIndex);
+        }
+    }
+
+    /// <summary>Stop streaming the capture mix to the monitor device. No-op if not monitoring.</summary>
+    public void StopMonitor()
+    {
+        int stream;
+        lock (_lock)
+        {
+            if (!_monitoring) return;
+            _monitoring = false;
+            stream = _monitorStream;
+            _monitorStream = 0;
+            ClearCaptureRendererIfIdle();
+        }
+
+        if (stream != 0)
+        {
+            Bass.ChannelStop(stream);
+            Bass.StreamFree(stream);
+        }
+        _logger.LogInformation("Monitor stream stopped");
+    }
+
     public void TuneFrequency(int frequencyKHz, Guid slotId)
     {
         lock (_lock)
@@ -858,11 +1059,20 @@ public class RadioPlayback : IDisposable
             Dictionary<int, List<RadioSlotConfig>> tunedSlotsByFreq;
             // What should we mute because we're talking on it?
             HashSet<int> transmittingFrequencies;
+            // Capture state snapshot (encoder / monitor handles stay valid for this callback).
+            bool capturing;
+            int recordEncoder;
+            int monitorStream;
+            OwnVoiceRadioRenderer? ownVoiceRenderer;
             lock (_lock)
             {
                 transmittingFrequencies = Apply3dEffects ? new(_transmittingFrequencies) : [];
                 streams = _streams.Values.ToList();
                 frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
+                capturing = Capturing;
+                recordEncoder = _recordEncoder;
+                monitorStream = _monitorStream;
+                ownVoiceRenderer = _ownVoiceRenderer;
 
                 // Build freq → tuned-slots index from _slots snapshot
                 tunedSlotsByFreq = new Dictionary<int, List<RadioSlotConfig>>();
@@ -1206,6 +1416,12 @@ public class RadioPlayback : IDisposable
                 }
             }
 
+            // Capture for the session recording/monitor BEFORE sidetone is mixed in, so the
+            // incoming side is "as heard" minus our own raw mic loopback. Our own voice
+            // is added back rendered through the radio FX (CaptureRecordingFrame).
+            if (capturing)
+                CaptureRecordingFrame(samples, recordEncoder, monitorStream, ownVoiceRenderer);
+
             // Sidetone: mix own voice (mono) into stereo output
             // No AGC/ALC
             if (SidetoneEnabled)
@@ -1265,9 +1481,60 @@ public class RadioPlayback : IDisposable
     }
 
 
+    /// <summary>
+    /// Build one stereo recording frame (incoming as heard, with pan, + own voice rendered as
+    /// if heard from the same position and panned centre) and feed it to the encoder. Runs on
+    /// the DSP thread; the encode itself happens on BASSenc's thread (EncodeFlags.Queue).
+    /// </summary>
+    private void CaptureRecordingFrame(int samples, int encoder, int monitorStream,
+        OwnVoiceRadioRenderer? renderer)
+    {
+        int stereo = samples * 2;
+        if (_recordStereo.Length < stereo) _recordStereo = new float[stereo];
+
+        // Incoming, as heard (pre-sidetone) — pan / volume already applied in the fan-out.
+        Array.Copy(_stereoBuffer, _recordStereo, stereo);
+
+        // Own voice, rendered through the radio FX, mixed in centre. The renderer runs EVERY
+        // frame (not just when voice is present) so its noise / AGC / squelch state machine
+        // stays continuous and produces the key-down crackle and key-up squelch tail.
+        if (renderer != null)
+        {
+            if (_ownVoiceScratch.Length < samples) _ownVoiceScratch = new float[samples];
+            int voiceAvail = Math.Min(_recordOwnVoiceBuffer.Available, samples);
+            int drained = voiceAvail > 0
+                ? _recordOwnVoiceBuffer.Read(_ownVoiceScratch.AsSpan()[..voiceAvail])
+                : 0;
+            // Carrier-off remainder of the buffer (key released) → squelch tail develops.
+            for (int i = drained; i < samples; i++) _ownVoiceScratch[i] = 0f;
+
+            renderer.Process(_ownVoiceScratch, drained, samples, AmbientNoiseVolume);
+
+            // Centre pan: each channel gets cos45° = sin45° ≈ 0.707, scaled by MasterVolume —
+            // matches the gain staging a centre-panned, unity-volume incoming stream receives.
+            float ownGain = 0.70710678f * MasterVolume;
+            for (int i = 0; i < samples; i++)
+            {
+                float s = ownGain * _ownVoiceScratch[i];
+                _recordStereo[i * 2] += s;
+                _recordStereo[i * 2 + 1] += s;
+            }
+        }
+
+        int bytes = stereo * sizeof(float);
+        // File sink: queued to BASSenc's own thread.
+        if (encoder != 0) BassEnc.EncodeWrite(encoder, _recordStereo, bytes);
+        // Device sink: push to the monitor output stream (its device pulls at its own rate).
+        if (monitorStream != 0) Bass.StreamPutData(monitorStream, _recordStereo, bytes);
+    }
+
     public async Task StopAll()
     {
         _logger.LogInformation("Stopping all streams and cleaning up resources...");
+
+        // Finalize any active capture before tearing down BASS.
+        StopRecording();
+        StopMonitor();
 
         // 2. Stop all streams
         List<string> ids;
