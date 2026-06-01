@@ -79,6 +79,27 @@ internal sealed class NullAmbientEffect : IAmbientNoiseEffect
 }
 
 // ---------------------------------------------------------------------------
+//  Shared DSP helpers
+// ---------------------------------------------------------------------------
+
+internal static class AmbientDsp
+{
+    /// <summary>
+    /// Transmitter ALC: clean linear makeup gain followed by a soft-knee peak
+    /// limiter, no "crunch".
+    /// Output is bounded to ±1.
+    /// </summary>
+    public static float SoftAlc(float x, float makeup, float knee)
+    {
+        x *= makeup;
+        float a = MathF.Abs(x);
+        if (a <= knee) return x;
+        float over = (a - knee) / (1f - knee);
+        return MathF.Sign(x) * (knee + (1f - knee) * MathF.Tanh(over));
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  AirF16 — F-16 cockpit
 // ---------------------------------------------------------------------------
 
@@ -96,11 +117,18 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
     private readonly int _sampleRate;
     private readonly float _strength;
 
-    // Oxygen-mask LPF — two cascaded one-pole stages at 900 Hz
-    private const float MuffleCutoff = 1300f;
+    // Oxygen-mask + comms band-limit — two cascaded one-pole stages.
+    // Cutoff sits above the 1–3 kHz presence band so voice stays intelligible;
+    // darker than the F-15 (2000 Hz) for the mask-muffled character.
+    private const float MuffleCutoff = 1900f;
     private readonly float _muffleA;
     private float _muffleLP1;
     private float _muffleLP2;
+
+    // Transmitter ALC — clean makeup gain + soft-knee peak limiter (see
+    // AmbientDsp.SoftAlc). Loud, constant level without broadband crunch.
+    private const float AlcMakeup = 2.0f;
+    private const float AlcKnee   = 0.70f;
 
     // Inverter whine — 400 Hz near-square-wave: fundamental + 3rd + 5th harmonics.
     // FM wobble via 0.8 Hz LFO simulates power-supply frequency drift.
@@ -179,13 +207,16 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
             x += whineSample;                   // electrical wiring bleed
             x += roar * RoarLevel * _strength;  // structure-borne acoustic roar
 
+            // Transmitter ALC: clean makeup gain + peak limiter → loud, no crunch
+            x = AmbientDsp.SoftAlc(x, AlcMakeup, AlcKnee);
+
             // Oxygen-mask two-pole LPF + nasal cavity blend
             float lp1 = _muffleA * _muffleLP1 + (1f - _muffleA) * x;
             _muffleLP1 = lp1;
             float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
             _muffleLP2 = lp2;
 
-            float wet = lp2 * 0.60f + x * 0.40f;
+            float wet = lp2 * 0.55f + x * 0.45f;
             buffer[idx] = dry + volume * (wet - dry);
         }
     }
@@ -307,11 +338,17 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
     private readonly int _sampleRate;
     private readonly float _strength;
 
-    // Oxygen-mask two-pole LPF — same cutoff as F-16 for consistent muffling character
-    private const float MuffleCutoff = 1300f;
+    // Oxygen-mask + comms band-limit — two-pole LPF, same cutoff as F-16 for
+    // consistent muffling character while keeping 1–3 kHz presence intelligible.
+    private const float MuffleCutoff = 1900f;
     private readonly float _muffleA;
     private float _muffleLP1;
     private float _muffleLP2;
+
+    // Transmitter ALC — clean makeup gain + soft-knee peak limiter (matches F-16).
+    // Loud, constant level without broadband crunch. See AmbientDsp.SoftAlc.
+    private const float AlcMakeup = 2.0f;
+    private const float AlcKnee   = 0.70f;
 
     // N1 fan stage — lower harmonic series, slow wobble (fan RPM variation)
     private const float N1Freq        = 480f;
@@ -413,13 +450,16 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
             x += n1Sample + n2Sample;
             x += roar * RoarLevel * _strength;
 
+            // Transmitter ALC: clean makeup gain + peak limiter → loud, no crunch
+            x = AmbientDsp.SoftAlc(x, AlcMakeup, AlcKnee);
+
             // Oxygen-mask two-pole LPF + nasal cavity blend
             float lp1 = _muffleA * _muffleLP1 + (1f - _muffleA) * x;
             _muffleLP1 = lp1;
             float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
             _muffleLP2 = lp2;
 
-            float wet = lp2 * 0.60f + x * 0.40f;
+            float wet = lp2 * 0.55f + x * 0.45f;
             buffer[idx] = dry + volume * (wet - dry);
         }
     }
