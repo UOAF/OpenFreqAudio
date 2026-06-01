@@ -185,7 +185,7 @@ internal sealed class AirF16AmbientEffect : IAmbientNoiseEffect
             float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
             _muffleLP2 = lp2;
 
-            float wet = lp2 * 0.60f + x * 0.55f * 0.40f;
+            float wet = lp2 * 0.60f + x * 0.40f;
             buffer[idx] = dry + volume * (wet - dry);
         }
     }
@@ -419,7 +419,7 @@ internal sealed class AirGenericAmbientEffect : IAmbientNoiseEffect
             float lp2 = _muffleA * _muffleLP2 + (1f - _muffleA) * lp1;
             _muffleLP2 = lp2;
 
-            float wet = lp2 * 0.60f + x * 0.55f * 0.40f;
+            float wet = lp2 * 0.60f + x * 0.40f;
             buffer[idx] = dry + volume * (wet - dry);
         }
     }
