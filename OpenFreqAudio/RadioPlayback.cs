@@ -160,11 +160,14 @@ public class RadioPlayback : IDisposable
         // See: https://en.wikipedia.org/wiki/RC_circuit
         //
         // Radio specifications I found suggest AGC should attack
-        // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms.
-        // So we should pick time constants about a third of those values
+        // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms,
+        // but ramping down faster (say 10-20ms) gives us quick clicks
+        // even when in close formation, and produces cool-sounding
+        // distortions when barely coming through.
+        // Pick time constants about a third of those values
         // to get the intended effect. (Feel free to tune these by ear!)
         public const double AgcAttack = 0.003f / 3;
-        public const double AgcDecay = 0.1f / 3;
+        public const double AgcDecay = 0.01f / 3;
     }
 
 
