@@ -63,41 +63,33 @@ public class BackgroundNoiseGenerator
     }
 
     /// <summary>
-    /// Generate background noise into the provided buffer
+    /// Generate the next background-noise sample.
     /// </summary>
-    /// <param name="buffer">Output buffer (interleaved samples)</param>
-    /// <param name="offset">Starting offset in buffer</param>
-    /// <param name="samples">Total samples to generate (frames * channels)</param>
-    /// <param name="gain">Overall noise level (0.0 to 1.0)</param>
-    public void GenerateNoise(float[] buffer, int offset, int samples, float gain)
+    public float NextSample()
     {
-        for (int frame = 0; frame < samples; frame++)
+        // Generate base noise sample
+        float noiseSample = _radioType switch
         {
-            // Generate base noise sample
-            float noiseSample = _radioType switch
-            {
-                RadioType.VHF_AM => GenerateVHFNoise(),
-                RadioType.UHF_AM => GenerateUHFNoise(),
-                RadioType.UHF_FM => GenerateFMNoise(),
-                _ => GenerateUHFNoise()
-            };
+            RadioType.VHF_AM => GenerateVHFNoise(),
+            RadioType.UHF_AM => GenerateUHFNoise(),
+            RadioType.UHF_FM => GenerateFMNoise(),
+            _ => GenerateUHFNoise()
+        };
 
-            // For AM: no modulation, just straight noise
-            // For FM: use modulation
-            if (_radioType == RadioType.UHF_FM)
-            {
-                double dt = 1.0 / _sampleRate;
-                _modulationPhase += 2.0 * Math.PI * ModulationFrequency * dt;
-                if (_modulationPhase > 2.0 * Math.PI)
-                    _modulationPhase -= 2.0 * Math.PI;
+        // For AM: no modulation, just straight noise
+        // For FM: use modulation
+        if (_radioType == RadioType.UHF_FM)
+        {
+            double dt = 1.0 / _sampleRate;
+            _modulationPhase += 2.0 * Math.PI * ModulationFrequency * dt;
+            if (_modulationPhase > 2.0 * Math.PI)
+                _modulationPhase -= 2.0 * Math.PI;
 
-                float modulation = (float)(0.85f + 0.15f * Math.Sin(_modulationPhase));
-                noiseSample *= modulation;
-            }
-
-            // Apply gain
-            buffer[frame] = noiseSample * gain;
+            float modulation = (float)(0.85f + 0.15f * Math.Sin(_modulationPhase));
+            noiseSample *= modulation;
         }
+
+        return noiseSample;
     }
 
     /// <summary>

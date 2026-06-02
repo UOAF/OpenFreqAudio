@@ -213,7 +213,6 @@ public class RadioPlayback : IDisposable
 
     private const int MaxBufferSize = 24576;
     private float[] _dspScratch = new float[MaxBufferSize];
-    private float[] _dspScratch2 = new float[MaxBufferSize];
     private float[] _stereoBuffer = new float[MaxBufferSize * 2];
 
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
@@ -833,7 +832,6 @@ public class RadioPlayback : IDisposable
                 lock (_lock)
                 {
                     _dspScratch = new float[samples];
-                    _dspScratch2 = new float[samples];
                     _stereoBuffer = new float[stereoOutputSamples];
                 }
             }
@@ -1073,13 +1071,10 @@ public class RadioPlayback : IDisposable
                         // Noise is always there!
                         // The question is just "how loud compared to the signal?"
                         // (What's the SNR?)
-                        slot.NoiseGenerator?.GenerateNoise(_dspScratch, 0, samples, 1.0f);
-                        // We need random I *and* Q values - if we use
-                        // I_noise[n] = Q_noise[n] = -dspScrach[n],
-                        // we wouldn't have random noise,
+                        // We draw independent I and Q noise per sample below - if we used
+                        // I_noise[n] = Q_noise[n], we wouldn't have random noise,
                         // we'd have a single signal with a fixed phase (45 deg).
-                        // TODO: Generate this each sample instead of filling buffers of noise?
-                        slot.NoiseGenerator?.GenerateNoise(_dspScratch2, 0, samples, 1.0f);
+                        var noiseGen = slot.NoiseGenerator;
 
                         if (numStreams > 0)
                         {
@@ -1087,8 +1082,8 @@ public class RadioPlayback : IDisposable
                             for (int n = 0; n < samples; ++n)
                             {
                                 // Start with our noise.
-                                double i = _dspScratch[n];
-                                double q = _dspScratch2[n];
+                                double i = noiseGen?.NextSample() ?? 0.0;
+                                double q = noiseGen?.NextSample() ?? 0.0;
                                 // Real aircraft radios don't have 100% modulation.
                                 // A bunch of the standards are paywalled, but those I've found
                                 // suggest minimum specs are 85% modulation, with 90-95% being common.
@@ -1133,8 +1128,8 @@ public class RadioPlayback : IDisposable
                         {
                             for (int n = 0; n < samples; ++n)
                             {
-                                double i = _dspScratch[n];
-                                double q = _dspScratch2[n];
+                                double i = noiseGen?.NextSample() ?? 0.0;
+                                double q = noiseGen?.NextSample() ?? 0.0;
                                 _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
                                 slot.Agc.Apply(_dspScratch[n]);
 
