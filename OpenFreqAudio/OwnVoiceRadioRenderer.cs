@@ -36,12 +36,8 @@ public sealed class OwnVoiceRadioRenderer
 
     private readonly RadioEffect _effect;
 
-    // ALC — matches RadioPlayback.RadioStream.Alc (AlcAttack = 0.003/3, AlcDecay = 1/3).
-    private const double AlcAttack = 0.003f / 3;
-    private const double AlcDecay = 1f / 3;
+    // ALC + AGC time constants are shared with the receive chain — see RadioPlayback.
     private readonly FirstOrderFilter _alc;
-
-    // AGC + band-pass — matches RadioPlayback.RadioConfig.
     private readonly FirstOrderFilter _agc;
     private readonly HighPassFilter _highPass;
     private readonly LowPassFilter _lowPass;
@@ -50,8 +46,6 @@ public sealed class OwnVoiceRadioRenderer
     // Per-frequency background noise. Recreated when the tuned frequency changes.
     private BackgroundNoiseGenerator? _noise;
     private int _noiseFreqKhz = -1;
-    private float[] _noiseI = [];
-    private float[] _noiseQ = [];
 
     // Linear received power relative to the noise floor (10^(SNR/20)); cached from params.
     private float _relativePower = 1f;
@@ -67,9 +61,10 @@ public sealed class OwnVoiceRadioRenderer
     {
         _sampleRate = sampleRate;
         _effect = new RadioEffect(sampleRate, 1, initial, logger);
-        _alc = RadioPlayback.MakeFirstOrderFilter(AlcAttack, AlcDecay, sampleRate);
-        _agc = RadioPlayback.MakeFirstOrderFilter(RadioPlayback.RadioConfig.AgcAttack,
-            RadioPlayback.RadioConfig.AgcDecay, sampleRate);
+        _alc = RadioPlayback.MakeFirstOrderFilter(
+            RadioPlayback.AlcAttack, RadioPlayback.AlcDecay, sampleRate);
+        _agc = RadioPlayback.MakeFirstOrderFilter(
+            RadioPlayback.AgcAttack, RadioPlayback.AgcDecay, sampleRate);
         _highPass = new HighPassFilter(300.0 / sampleRate, 3);
         _lowPass = new LowPassFilter(3000.0 / sampleRate, 6);
         ApplyParams(initial);
@@ -139,18 +134,14 @@ public sealed class OwnVoiceRadioRenderer
         if (voiceCount > 0) _effect.Process(buffer, 0, voiceCount, ambientVolume);
 
         // 3. AM envelope + noise + AGC (single transmitter → no beats).
-        if (_noiseI.Length < frames) { _noiseI = new float[frames]; _noiseQ = new float[frames]; }
-        _noise.GenerateNoise(_noiseI, 0, frames, 1.0f);
-        _noise.GenerateNoise(_noiseQ, 0, frames, 1.0f);
-
         for (int i = 0; i < frames; i++)
         {
             bool carrierOn = i < voiceCount;
             float a = carrierOn ? _relativePower : 0f;
             float samp = carrierOn ? buffer[i] : 0f;
 
-            double iComp = _noiseI[i] + a * (1 + samp * ModIndex);
-            double qComp = _noiseQ[i];
+            double iComp = _noise.NextSample() + a * (1 + samp * ModIndex);
+            double qComp = _noise.NextSample();
             float env = (float)Math.Sqrt(iComp * iComp + qComp * qComp);
 
             _agc.Apply(env);

@@ -218,7 +218,7 @@ namespace OpenFreqAudio
             double fx = gx - col;
             double fy = gy - row;
 
-            // Bilinear interpolation — sample four nearest grid points
+            // Bilinear interpolation - sample four nearest grid points
             float v00 = dem.Sample(row, col);
             float v10 = dem.Sample(row, col + 1);
             float v01 = dem.Sample(row + 1, col);
@@ -255,12 +255,28 @@ namespace OpenFreqAudio
                 ap.TerrainProfile = profile;
         }
 
-        // Adaptive sampling of terrain along the line
-        private List<(double dist, double elev)> SampleProfileAdaptive(
-            double txX, double txY, double rxX, double rxY, int desiredSamples)
+        // Adaptive sampling of terrain along the line.
+        //
+        // A coarse evenly-spaced backbone is refined by a max-priority subdivision:
+        // the interval with the largest expected error is always split first (instead
+        // of a single left-to-right pass), and BOTH halves of a split are pushed back
+        // so a sharp feature anywhere in a cell can still be found by recursion.
+        //
+        // Priority = chord deviation (how far the true mid-elevation departs from the
+        // linear interpolation of the interval endpoints) weighted by Fresnel-zone
+        // relevance. The chord deviation is LOS-independent so it catches narrow
+        // ridges regardless of the average ground slope; the Fresnel weight (which
+        // uses the actual TX/RX altitudes and frequency) biases the budget toward
+        // terrain that pokes into the real radio ray's first Fresnel zone.
+        //
+        // Each dequeue samples one new midpoint and commits it - there are no
+        // speculative samples, so the DEM-read count is bounded by desiredSamples.
+        // This keeps the cost predictable for the ~10 Hz call rate.
+        internal List<(double dist, double elev)> SampleProfileAdaptive(
+            double txX, double txY, double rxX, double rxY,
+            double txAlt, double rxAlt, double freqHz, int desiredSamples)
         {
-            // Pre-allocate with maximum expected capacity to avoid resizing
-            var result = new List<(double, double)>(desiredSamples);
+            var result = new List<(double dist, double elev)>(desiredSamples);
             double dx = rxX - txX, dy = rxY - txY;
             double D = Math.Sqrt(dx * dx + dy * dy);
             if (D < 1.0)
@@ -269,44 +285,87 @@ namespace OpenFreqAudio
                 return result;
             }
 
-            int coarseSamples = Math.Min(desiredSamples, 256);
-            for (int i = 0; i <= coarseSamples; i++)
+            // Sub-millimetre curvature is DEM quantization/float noise, not real terrain.
+            const double CurvatureEpsilonM = 1e-3;
+
+            double lambda = SpeedOfLight / freqHz;
+            double rxMinusTx = rxAlt - txAlt;
+
+            // Fresnel-relevance weight at fractional position t with terrain top elev.
+            // >1 when the terrain approaches/intrudes the first Fresnel zone of the ray.
+            double FresnelWeight(double t, double elev)
             {
-                double t = i / (double)coarseSamples;
-                double sx = txX + t * dx;
-                double sy = txY + t * dy;
-                double elev = SampleElevation(sx, sy);
-                result.Add((t * D, elev));
+                double d1 = t * D, d2 = D - d1;
+                if (d1 < 1.0 || d2 < 1.0) return 0.1;
+                double f1 = Math.Sqrt(lambda * d1 * d2 / D);
+                double losH = txAlt + rxMinusTx * t;
+                double intrusion = elev - (losH - f1); // terrain vs bottom of Fresnel zone
+                return 1.0 + Math.Max(0.0, intrusion) / Math.Max(f1, 1.0);
             }
 
-            double txBase = SampleElevation(txX, txY);
-            double rxBase = SampleElevation(rxX, rxY);
-            for (int i = 0; i + 1 < result.Count && result.Count < desiredSamples; i++)
+            // Coarse backbone - leave most of the budget for adaptive refinement.
+            int coarse = Math.Clamp(desiredSamples / 8, 16, 64);
+            var coarseElev = new double[coarse + 1];
+            for (int i = 0; i <= coarse; i++)
             {
-                var (distA, elevA) = result[i];
-                var (distB, elevB) = result[i + 1];
-                double tA = distA / D, tB = distB / D;
-                double losA = txBase + tA * (rxBase - txBase);
-                double losB = txBase + tB * (rxBase - txBase);
-                double excessA = elevA - losA;
-                double excessB = elevB - losB;
-                if (Math.Abs(excessB - excessA) > 5.0)
-                {
-                    double tMid = (tA + tB) * 0.5;
-                    double sx = txX + tMid * dx;
-                    double sy = txY + tMid * dy;
-                    double elevMid = SampleElevation(sx, sy);
-                    result.Insert(i + 1, (tMid * D, elevMid));
-                }
+                double t = i / (double)coarse;
+                coarseElev[i] = SampleElevation(txX + t * dx, txY + t * dy);
+                result.Add((t * D, coarseElev[i]));
             }
 
+            // Min-heap on negated key => largest (chordDev * weight) is split first.
+            var pq = new PriorityQueue<(double tA, double eA, double tB, double eB), double>();
+            for (int i = 0; i < coarse; i++)
+            {
+                double tA = i / (double)coarse, tB = (i + 1) / (double)coarse;
+                double eA = coarseElev[i], eB = coarseElev[i + 1];
+                // Seed priority from local curvature (second difference of already-sampled
+                // coarse points). Curvature - not slope - so a constant ramp seeds zero and
+                // is left unrefined. End intervals use a one-sided stencil.
+                double curv;
+                if (i > 0 && i < coarse - 1)
+                    curv = Math.Abs(coarseElev[i - 1] - 2.0 * coarseElev[i] + coarseElev[i + 1]);
+                else if (i == 0)
+                    curv = Math.Abs(coarseElev[0] - 2.0 * coarseElev[1] + coarseElev[2]);
+                else
+                    curv = Math.Abs(coarseElev[coarse - 2] - 2.0 * coarseElev[coarse - 1] + coarseElev[coarse]);
+                if (curv <= CurvatureEpsilonM) continue; // flat / linear cell - interpolation already exact
+                double w = FresnelWeight((tA + tB) * 0.5, 0.5 * (eA + eB));
+                pq.Enqueue((tA, eA, tB, eB), -(curv * w));
+            }
+
+            const double floorMeters = 2.0; // never refine below this - protects endpoints where F1->0
+            const double kFresnel = 0.25;   // resolve terrain to a quarter of the local Fresnel radius
+            while (result.Count < desiredSamples && pq.TryDequeue(out var iv, out _))
+            {
+                double tMid = (iv.tA + iv.tB) * 0.5;
+                double eMid = SampleElevation(txX + tMid * dx, txY + tMid * dy);
+                result.Add((tMid * D, eMid)); // commit every sample
+
+                double chordDev = Math.Abs(eMid - 0.5 * (iv.eA + iv.eB));
+
+                // Stop threshold scaled by the local Fresnel radius (with a fixed floor),
+                // instead of a wavelength-agnostic constant.
+                double d1 = tMid * D, d2 = D - d1;
+                double f1 = (d1 > 1.0 && d2 > 1.0) ? Math.Sqrt(lambda * d1 * d2 / D) : 0.0;
+                if (chordDev < Math.Max(floorMeters, kFresnel * f1))
+                    continue; // region flat enough - keep the sample, don't subdivide further
+
+                double w = FresnelWeight(tMid, eMid);
+                double childKey = -(chordDev * w);
+                pq.Enqueue((iv.tA, iv.eA, tMid, eMid), childKey);
+                pq.Enqueue((tMid, eMid, iv.tB, iv.eB), childKey);
+            }
+
+            // Consumer walks the profile in ascending distance.
+            result.Sort((a, b) => a.dist.CompareTo(b.dist));
             return result;
         }
 
         /// <summary>
         /// Calculate noise level from SNR and modulation type.
         /// AM: analog static increases smoothly with decreasing SNR.
-        /// FM: threshold effect — noise suppression until below threshold.
+        /// FM: threshold effect - noise suppression until below threshold.
         /// </summary>
         public static float CalculateNoiseLevel(double snrDb, ModulationType modulation)
         {
@@ -620,7 +679,8 @@ namespace OpenFreqAudio
             ap.ReceivedDb = (float)(txPowerDbm - fspl - weatherLoss);
 
             // Sample terrain profile
-            var profile = SampleProfileAdaptive(txXVal, txYVal, rxXVal, rxYVal, maxSamplesPerPath);
+            var profile = SampleProfileAdaptive(txXVal, txYVal, rxXVal, rxYVal,
+                txAltVal, rxAltVal, freqHz, maxSamplesPerPath);
             // Bail now if there's not any terrain to obstruct us.
             if (profile.Count < 2)
             {
@@ -735,7 +795,7 @@ namespace OpenFreqAudio
                 // Positive specElev means terrain rising above the sea surface at the bounce point.
                 double specX = 0.5 * (txXVal + rxXVal);
                 double specY = 0.5 * (txYVal + rxYVal);
-                // BMS ocean tiles return negative elevation values — clamp to 0 (sea level).
+                // BMS ocean tiles return negative elevation values - clamp to 0 (sea level).
                 double specElev = Math.Max(0.0, SampleElevation(specX, specY));
 
                 if (specElev <= 10.0)
