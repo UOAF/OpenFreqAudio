@@ -6,20 +6,16 @@ using NWaves.Filters.Butterworth;
 namespace OpenFreqAudio;
 
 /// <summary>
-/// Renders our own microphone audio as it would sound coming back over the radio
-/// "from the same position" — i.e. at zero distance: full signal, no path loss, no fading.
-/// Feeds the session recording so the outgoing side matches the radio character of the
-/// incoming side, including the background hiss and the squelch open/tail SFX.
-///
-/// This is a faithful port of the SINGLE-transmitter signal chain in
-/// <see cref="RadioPlayback"/>'s DSP callback (the multi-transmitter beat math collapses to
-/// nothing for one source: beat = 0, so cos θ = 1, sin θ = 0):
-///   1. ALC          — per-stream level control (same constants as RadioPlayback.RadioStream)
-///   2. RadioEffect  — transmitter-side ambient SFX (cockpit, mask, …) + RF fading
-///   3. AM envelope + background noise + AGC — the radio sound. The AGC is bounded here
+/// Renders our own microphone audio as it would sound coming back over the radio from the same position (i.e. at zero distance):
+/// full signal, no path loss, no fading.
+/// This is a port of the single-transmitter signal chain in
+/// <see cref="RadioPlayback"/>'s DSP callback
+///   1. ALC: per-stream level control (same constants as RadioPlayback.RadioStream)
+///   2. RadioEffect: transmitter-side ambient SFX (cockpit, mask, …) + RF fading
+///   3. AM envelope + background noise + AGC: the radio sound. The AGC is bounded here
 ///      (unlike a bare-voice AGC) because the carrier + noise floor are always present.
 ///   4. 300–3000 Hz band-pass
-///   5. squelch gate — opens when the AGC-tracked signal level crosses the threshold and
+///   5. squelch gate: opens when the AGC-tracked signal level crosses the threshold and
 ///      tails out (noise swell) when the carrier drops on key-up, exactly like the incoming
 ///      per-slot gate.
 ///
@@ -31,6 +27,7 @@ public sealed class OwnVoiceRadioRenderer
 {
     // Matches the multi-transmitter mixer in RadioPlayback.
     private const double ModIndex = 0.9;
+
     // Default per-slot squelch gate: slot.SquelchLevel (1.0) * 2f, as in RadioPlayback fan-out.
     private const float SquelchThreshold = 2f;
 
@@ -107,11 +104,13 @@ public sealed class OwnVoiceRadioRenderer
                 _alc.Apply(Math.Abs(buffer[i]));
                 buffer[i] /= Math.Max(_alc.D1, 0.5f);
             }
+
             for (int i = voiceCount; i < frames; i++)
             {
                 _alc.Apply(0f);
                 buffer[i] = 0f;
             }
+
             return;
         }
 
@@ -128,6 +127,7 @@ public sealed class OwnVoiceRadioRenderer
             _alc.Apply(Math.Abs(buffer[i]));
             buffer[i] /= Math.Max(_alc.D1, 0.5f);
         }
+
         for (int i = voiceCount; i < frames; i++) _alc.Apply(0f);
 
         // 2. Transmitter acoustics (ambient SFX) + RF fading, on the voice portion only.
