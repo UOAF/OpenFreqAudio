@@ -115,9 +115,11 @@ public class RadioPlayback : IDisposable
     }
 
     /// <summary>
-    /// Per-slot output config: one instance per (frequency, slotId) pair.
+    /// Per-slot radio state: one instance per (frequency, slotId) pair.
+    /// Each slot is its own receiver — it owns the full signal-processing chain
+    /// (noise, AGC, band-pass filters, squelch) as well as its output params (volume, pan).
     /// </summary>
-    private class RadioSlotConfig
+    private class RadioConfig
     {
         public bool IsTuned { get; set; }
         public float Volume { get; set; } = 1.0f;
@@ -126,14 +128,7 @@ public class RadioPlayback : IDisposable
         /// <summary>Squelch threshold: 0 = always open (hear noise), 1 = normal gate (only signals break squelch).</summary>
         public float SquelchLevel { get; set; } = 1.0f;
         public bool WasSquelchOpen { get; set; }
-    }
 
-    /// <summary>
-    /// Shared signal-processing state for a frequency.
-    /// Stays keyed by frequency so AGC, filters, and noise are shared  across all slots tuned to the same frequency.
-    /// </summary>
-    public class RadioConfig
-    {
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
 
         public bool IsNoiseMuted { get; set; }
@@ -179,11 +174,8 @@ public class RadioPlayback : IDisposable
     // All incoming streams
     private readonly Dictionary<string, RadioStream> _streams = new();
 
-    // Shared signal-processing state per frequency (AGC, filters, noise generator)
-    private readonly Dictionary<int, RadioConfig> _frequencies = new();
-
-    // Per-slot output params: volume, pan, IsTuned — keyed by (frequency, slotId)
-    private readonly Dictionary<(int freq, Guid slotId), RadioSlotConfig> _slots = new();
+    // Per-slot radio state (full signal-processing chain + output params), keyed by (frequency, slotId)
+    private readonly Dictionary<(int freq, Guid slotId), RadioConfig> _slots = new();
 
     // Frequencies were we are currently transmitting and which are therefore muted
     private readonly HashSet<int> _transmittingFrequencies = new();
@@ -320,8 +312,6 @@ public class RadioPlayback : IDisposable
         lock (_lock)
         {
             if (_streams.ContainsKey(streamId)) StopStreamInternal(streamId);
-            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
-                _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
 
             // Create BASS decode stream (float)
             bassStream = Bass.CreateStream(filePath, 0, 0, BassFlags.Loop | BassFlags.Float | BassFlags.Decode);
@@ -497,9 +487,6 @@ public class RadioPlayback : IDisposable
             // we were constructing newStream outside the lock.
             if (_streams.ContainsKey(streamId)) return;
 
-            if (!_frequencies.ContainsKey(audioParams.RadioFrequencyKHz))
-                _frequencies[audioParams.RadioFrequencyKHz] = new RadioConfig();
-
             int ringFrames = (sampleRate * 150) / 1000; // 150ms
             int ringCapacity = ringFrames * Math.Max(1, channels);
 
@@ -647,23 +634,19 @@ public class RadioPlayback : IDisposable
     {
         lock (_lock)
         {
-            if (!_frequencies.ContainsKey(frequencyKHz))
-                _frequencies[frequencyKHz] = new RadioConfig();
-
-            var freqConfig = _frequencies[frequencyKHz];
-
-            if (freqConfig.NoiseGenerator == null)
-            {
-                freqConfig.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, frequencyKHz);
-                _logger.LogInformation("TuneFrequency {Frequency:F3} MHz", frequencyKHz / 1000.0);
-            }
-
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioSlotConfig();
+                slot = new RadioConfig();
                 _slots[key] = slot;
             }
+
+            if (slot.NoiseGenerator == null)
+            {
+                slot.NoiseGenerator = new BackgroundNoiseGenerator(SampleRate, frequencyKHz);
+                _logger.LogInformation("TuneFrequency {Frequency:F3} MHz", frequencyKHz / 1000.0);
+            }
+
             slot.IsTuned = true;
         }
     }
@@ -693,7 +676,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioSlotConfig();
+                slot = new RadioConfig();
                 _slots[key] = slot;
             }
             slot.SquelchLevel = squelchLevel;
@@ -707,7 +690,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioSlotConfig();
+                slot = new RadioConfig();
                 _slots[key] = slot;
             }
             slot.Volume = Math.Clamp(volume, -2f, 2f);
@@ -729,7 +712,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioSlotConfig();
+                slot = new RadioConfig();
                 _slots[key] = slot;
             }
             slot.Pan = Math.Clamp(pan, -100, 100);
@@ -852,27 +835,25 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // Snapshot current streams, frequencies and slots
+            // Snapshot current streams and slots
             List<RadioStream> streams;
-            Dictionary<int, RadioConfig> frequencySnapshot;
-            Dictionary<int, List<RadioSlotConfig>> tunedSlotsByFreq;
+            Dictionary<int, List<RadioConfig>> tunedSlotsByFreq;
             // What should we mute because we're talking on it?
             HashSet<int> transmittingFrequencies;
             lock (_lock)
             {
                 transmittingFrequencies = Apply3dEffects ? new(_transmittingFrequencies) : [];
                 streams = _streams.Values.ToList();
-                frequencySnapshot = new Dictionary<int, RadioConfig>(_frequencies);
 
                 // Build freq → tuned-slots index from _slots snapshot
-                tunedSlotsByFreq = new Dictionary<int, List<RadioSlotConfig>>();
+                tunedSlotsByFreq = new Dictionary<int, List<RadioConfig>>();
                 foreach (var kvp in _slots)
                 {
                     if (!kvp.Value.IsTuned) continue;
                     int f = kvp.Key.freq;
                     if (!tunedSlotsByFreq.TryGetValue(f, out var list))
                     {
-                        list = new List<RadioSlotConfig>();
+                        list = new List<RadioConfig>();
                         tunedSlotsByFreq[f] = list;
                     }
                     list.Add(kvp.Value);
@@ -958,18 +939,12 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // 2: Process each frequency (noise + squelch + mixing), AKA radio,
-            //    which should have its own AGC, Squelch, etc.
-            foreach (var kvp in frequencySnapshot)
+            // 2: Process each tuned slot (noise + envelope + AGC + squelch + band-pass + mix).
+            //    Each slot is its own radio/receiver, with its own AGC, squelch, filters, and noise.
+            foreach (var (freq, tunedSlots) in tunedSlotsByFreq)
             {
-                int freq = kvp.Key;
-                var freqConfig = kvp.Value;
-
-                // Skip if no slots are tuned to this frequency, or if muted.
-                if (!tunedSlotsByFreq.TryGetValue(freq, out var tunedSlots) ||
-                    tunedSlots.Count == 0 ||
-                    freqConfig.IsNoiseMuted ||
-                    transmittingFrequencies.Contains(freq))
+                // Skip frequencies we're transmitting on — we mute our own TX.
+                if (transmittingFrequencies.Contains(freq))
                 {
                     continue;
                 }
@@ -979,26 +954,9 @@ public class RadioPlayback : IDisposable
                 // still want to apply squelch sound and other FX.
                 var freqStreams = streamsByFrequency.GetValueOrDefault(freq, []);
 
-                // --- PER-FREQUENCY RF PARAMETERS ---
-                var bandConfig = FastPathAudioSim.GetBandConfig(freq);
-
-                // Signal level after AGC (used for per-slot squelch gate in fan-out)
-                float signalLevel;
-
                 // Mix transmitting streams
                 if (Apply3dEffects)
                 {
-                    // Noise is always there!
-                    // The question is just "how loud compared to the signal?"
-                    // (What's the SNR?)
-                    freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch, 0, samples, 1.0f);
-                    // We need random I *and* Q values - if we use
-                    // I_noise[n] = Q_noise[n] = -dspScrach[n],
-                    // we wouldn't have random noise,
-                    // we'd have a single signal with a fixed phase (45 deg).
-                    // TODO: Generate this each sample instead of filling buffers of noise?
-                    freqConfig.NoiseGenerator?.GenerateNoise(_dspScratch2, 0, samples, 1.0f);
-
                     var transmittingStreams = freqStreams.Where(s => s.Samples.Length > 0).ToList();
                     // Sanity check:
                     // By our maxReady logic above, any streams _with_ samples should be the same length,
@@ -1008,70 +966,74 @@ public class RadioPlayback : IDisposable
                         throw new Exception("Active streams have different lengths");
                     }
 
-                    if (transmittingStreams.Count > 0)
+                    // --- PER-FREQUENCY STREAM SETUP (shared across this frequency's slots) ---
+                    // The carrier/beat math depends only on the transmitting streams,
+                    // so compute it once here and reuse it for every slot on this frequency.
+
+                    // TODO: Factor this out into a function.
+
+                    // AM demodulators are envelope detectors
+                    // (https://en.wikipedia.org/wiki/Envelope_detector)
+                    // They pull out the modulated voice by extracting
+                    // the shape (envelope) of the signal.
+                    // This has some nice advantages:
+                    //
+                    // 1. Receivers don't have to perfectly match the channel frequency
+                    //    of the transmitter - as long as a TX is in the passband of an RX,
+                    //    we can recover the transmitted voice without any frequency errors
+                    //    that would make it sound too high or too low.
+                    //    (This is especially nice for fast aircraft, since the Doppler effect
+                    //    means the frequencies are changing all the time!)
+                    //
+                    // 2. The electronics for an envelope detector are pretty cheap and simple.
+                    //
+                    // All is well when a single transmitter is sending on a frequency,
+                    // but when *multiple* transmitters send at once, trouble starts.
+                    // IRL radios are never tuned to the exact same frequency, since
+                    // making two oscillators moving at several million cycles per second
+                    // match perfectly is very hard - and so the carrier frequencies
+                    // create beats (https://en.wikipedia.org/wiki/Beat_(acoustics)).
+                    // Along with people talking over each other,
+                    // the receiver hears some nasty effects:
+                    //
+                    // 1. The receiver hears tones at each of the beat frequencies.
+                    //
+                    // 2. The beat frequencies ring modulate the weaker voice -
+                    //    each frequency f turns into two: f + beat and f - beat.
+                    //    (Find some videos of guitar pedals and vocoders that apply
+                    //    ring modulation for an example of what this sounds like.)
+                    //
+                    // 3. The louder voice amplitude-modulates the weaker one.
+                    //
+                    // 4. Low beat frequencies that fall inside the AGC's passband
+                    //    can cause the volume to "pump" up and down.
+                    //
+                    // Instead of trying to simulate all this, we can calculate the real thing!
+                    // For some signal s[n], its envelope is E[n] = sqrt(I[n]^2 + Q[n]^2)
+                    // where (I + jQ) is the representation of the signal as a complex number
+                    // (see https://en.wikipedia.org/wiki/In-phase_and_quadrature_components).
+                    //
+                    // And for each beat frequency k,
+                    // I_k = cos(θ_k[n])
+                    // Q_k = sin(θ_k[n])
+                    // where θ_k[n] = 2π · beat[k] · n / F_s
+                    //   and F_s is the sample rate.
+                    // We'll multiply those terms by each AM signal A_k + v_k[n],
+                    // where A_k is the received power of the carrier and v_k[n] is the modulated voice.
+                    // All together, we get
+                    //
+                    // I[n] = Σ_k (A_k + v_k[n]) · cos(θ_k[n])
+                    // Q[n] = Σ_k (A_k + v_k[n]) · sin(θ_k[n])
+                    // E[n] = sqrt(I[n]² + Q[n]²)
+                    //
+                    // which gives us an envelope between 0 and 2.
+                    // Shift that back to [-1, 1] and we have ourselves the envelope.
+
+                    var numStreams = transmittingStreams.Count;
+                    var relativePowers = new List<float>(numStreams);
+                    var beats = new List<float>(numStreams);
+                    if (numStreams > 0)
                     {
-                        // TODO: Factor this out into a function.
-
-                        // AM demodulators are envelope detectors
-                        // (https://en.wikipedia.org/wiki/Envelope_detector)
-                        // They pull out the modulated voice by extracting
-                        // the shape (envelope) of the signal.
-                        // This has some nice advantages:
-                        //
-                        // 1. Receivers don't have to perfectly match the channel frequency
-                        //    of the transmitter - as long as a TX is in the passband of an RX,
-                        //    we can recover the transmitted voice without any frequency errors
-                        //    that would make it sound too high or too low.
-                        //    (This is especially nice for fast aircraft, since the Doppler effect
-                        //    means the frequencies are changing all the time!)
-                        //
-                        // 2. The electronics for an envelope detector are pretty cheap and simple.
-                        //
-                        // All is well when a single transmitter is sending on a frequency,
-                        // but when *multiple* transmitters send at once, trouble starts.
-                        // IRL radios are never tuned to the exact same frequency, since
-                        // making two oscillators moving at several million cycles per second
-                        // match perfectly is very hard - and so the carrier frequencies
-                        // create beats (https://en.wikipedia.org/wiki/Beat_(acoustics)).
-                        // Along with people talking over each other,
-                        // the receiver hears some nasty effects:
-                        //
-                        // 1. The receiver hears tones at each of the beat frequencies.
-                        //
-                        // 2. The beat frequencies ring modulate the weaker voice -
-                        //    each frequency f turns into two: f + beat and f - beat.
-                        //    (Find some videos of guitar pedals and vocoders that apply
-                        //    ring modulation for an example of what this sounds like.)
-                        //
-                        // 3. The louder voice amplitude-modulates the weaker one.
-                        //
-                        // 4. Low beat frequencies that fall inside the AGC's passband
-                        //    can cause the volume to "pump" up and down.
-                        //
-                        // Instead of trying to simulate all this, we can calculate the real thing!
-                        // For some signal s[n], its envelope is E[n] = sqrt(I[n]^2 + Q[n]^2)
-                        // where (I + jQ) is the representation of the signal as a complex number
-                        // (see https://en.wikipedia.org/wiki/In-phase_and_quadrature_components).
-                        //
-                        // And for each beat frequency k,
-                        // I_k = cos(θ_k[n])
-                        // Q_k = sin(θ_k[n])
-                        // where θ_k[n] = 2π · beat[k] · n / F_s
-                        //   and F_s is the sample rate.
-                        // We'll multiply those terms by each AM signal A_k + v_k[n],
-                        // where A_k is the received power of the carrier and v_k[n] is the modulated voice.
-                        // All together, we get
-                        //
-                        // I[n] = Σ_k (A_k + v_k[n]) · cos(θ_k[n])
-                        // Q[n] = Σ_k (A_k + v_k[n]) · sin(θ_k[n])
-                        // E[n] = sqrt(I[n]² + Q[n]²)
-                        //
-                        // which gives us an envelope between 0 and 2.
-                        // Shift that back to [-1, 1] and we have ourselves the envelope.
-
-                        var numStreams = transmittingStreams.Count;
-                        var relativePowers = new List<float>(numStreams);
-                        var beats = new List<float>(numStreams);
                         // We can make any of the frequencies "0" and calculate beats off of it.
                         // Just pick the first transmitter in the list.
                         float zeroFreq = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
@@ -1092,63 +1054,135 @@ public class RadioPlayback : IDisposable
                                 beats.Add(Math.Abs(thisFreq - zeroFreq));
                             }
                         }
+                    }
 
-                        // Calculate E[n] for each sample n.
-                        for (int n = 0; n < samples; ++n)
+                    // Run the full effects chain per slot — each slot is its own receiver
+                    // with its own noise, AGC, squelch, and band-pass filters.
+                    foreach (var slot in tunedSlots)
+                    {
+                        if (slot.IsNoiseMuted) continue;
+
+                        // Typical squelch is at +6 dB, which is a factor of 2x.
+                        float squelchThreshold = slot.SquelchLevel * 2.0f;
+                        // True if squelch opened at any point in this set of samples.
+                        bool squelchOpened = false;
+
+                        // Noise is always there!
+                        // The question is just "how loud compared to the signal?"
+                        // (What's the SNR?)
+                        slot.NoiseGenerator?.GenerateNoise(_dspScratch, 0, samples, 1.0f);
+                        // We need random I *and* Q values - if we use
+                        // I_noise[n] = Q_noise[n] = -dspScrach[n],
+                        // we wouldn't have random noise,
+                        // we'd have a single signal with a fixed phase (45 deg).
+                        // TODO: Generate this each sample instead of filling buffers of noise?
+                        slot.NoiseGenerator?.GenerateNoise(_dspScratch2, 0, samples, 1.0f);
+
+                        if (numStreams > 0)
                         {
-                            // Start with our noise.
-                            double i = _dspScratch[n];
-                            double q = _dspScratch2[n];
-                            // Real aircraft radios don't have 100% modulation.
-                            // A bunch of the standards are paywalled, but those I've found
-                            // suggest minimum specs are 85% modulation, with 90-95% being common.
-                            // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
-                            // https://avweb.com/avionics/vhf-nav-comm-basics/
-                            const double modIndex = 0.9;
-                            for (int k = 0; k < numStreams; ++k)
+                            // Calculate E[n] for each sample n.
+                            for (int n = 0; n < samples; ++n)
                             {
-                                // θ_k is the phasor that rotates around at each beat frequency k.
-                                double theta = 2.0f * Math.PI * beats[k] *
-                                    (double)(n + _sampleNum) / (double)SampleRate;
-                                // Sum IQ components _before_ taking the length of the vector,
-                                // as that's a nonlinear operation.
-                                float samp = transmittingStreams[k].Samples.Span[n];
-                                i += relativePowers[k] * (1 + samp * modIndex) * Math.Cos(theta);
-                                q += relativePowers[k] * (1 + samp * modIndex) * Math.Sin(theta);
+                                // Start with our noise.
+                                double i = _dspScratch[n];
+                                double q = _dspScratch2[n];
+                                // Real aircraft radios don't have 100% modulation.
+                                // A bunch of the standards are paywalled, but those I've found
+                                // suggest minimum specs are 85% modulation, with 90-95% being common.
+                                // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
+                                // https://avweb.com/avionics/vhf-nav-comm-basics/
+                                const double modIndex = 0.9;
+                                for (int k = 0; k < numStreams; ++k)
+                                {
+                                    // θ_k is the phasor that rotates around at each beat frequency k.
+                                    double theta = 2.0f * Math.PI * beats[k] *
+                                        (double)(n + _sampleNum) / (double)SampleRate;
+                                    // Sum IQ components _before_ taking the length of the vector,
+                                    // as that's a nonlinear operation.
+                                    float samp = transmittingStreams[k].Samples.Span[n];
+                                    i += relativePowers[k] * (1 + samp * modIndex) * Math.Cos(theta);
+                                    q += relativePowers[k] * (1 + samp * modIndex) * Math.Sin(theta);
+                                }
+
+                                // Take the envelope.
+                                _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
+
+                                // Update the AGC:
+                                slot.Agc.Apply(_dspScratch[n]);
+
+                                // Squelch is driven by the AGC gain.
+                                // When it starts attenuating, we know we hear something.
+                                // NB: Handle squelch per sample, before the band-pass smooths the edges!
+                                // We don't want to gate the whole buffer (or not!) based on a single AGC value.
+                                if (slot.Agc.D1 >= squelchThreshold)
+                                {
+                                    _dspScratch[n] = _dspScratch[n] / slot.Agc.D1;
+                                    squelchOpened = true;
+                                }
+                                else
+                                {
+                                    _dspScratch[n] = 0;
+                                }
                             }
-
-                            // Take the envelope.
-                            _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-
-                            // Update the AGC and normalize; squelch gate happens per-slot in fan-out.
-                            freqConfig.Agc.Apply(_dspScratch[n]);
-                            _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
                         }
-                    }
-                    // Nothing is transmitting except noise, decay AGC back to unity.
-                    else
-                    {
+                        // Nothing is transmitting except noise, decay AGC back to unity.
+                        else
+                        {
+                            for (int n = 0; n < samples; ++n)
+                            {
+                                double i = _dspScratch[n];
+                                double q = _dspScratch2[n];
+                                _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
+                                slot.Agc.Apply(_dspScratch[n]);
+
+                                // See above.
+                                if (slot.Agc.D1 >= squelchThreshold)
+                                {
+                                    _dspScratch[n] = _dspScratch[n] / slot.Agc.D1;
+                                    squelchOpened = true;
+                                }
+                                else
+                                {
+                                    _dspScratch[n] = 0;
+                                }
+                            }
+                        }
+
                         for (int n = 0; n < samples; ++n)
                         {
-                            double i = _dspScratch[n];
-                            double q = _dspScratch2[n];
-                            _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                            freqConfig.Agc.Apply(_dspScratch[n]);
-                            _dspScratch[n] = _dspScratch[n] / freqConfig.Agc.D1;
+                            // Bandpass the signal, which removes the DC component and centers us around 0
+                            _dspScratch[n] = slot.LowPass.Process(
+                                slot.HighPass.Process(_dspScratch[n]));
+                        }
+
+                        if (squelchOpened != slot.WasSquelchOpen)
+                        {
+#if DEBUG
+                            _logger.LogDebug(
+                                "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
+                                squelchOpened ? "OPEN" : "CLOSED", freq, slot.Agc.D1);
+#endif
+                            slot.WasSquelchOpen = squelchOpened;
+                        }
+
+                        // Mix this slot's mono signal into the stereo output with its pan and volume.
+                        float mv = MasterVolume;
+                        float panAngle  = (slot.Pan + 100) / 200f * MathF.PI / 2f;
+                        float leftGain  = mv * slot.Volume * MathF.Cos(panAngle);
+                        float rightGain = mv * slot.Volume * MathF.Sin(panAngle);
+                        for (int frame = 0; frame < samples; frame++)
+                        {
+                            int leftIdx = frame * 2;
+                            _stereoBuffer[leftIdx]     += leftGain  * _dspScratch[frame];
+                            _stereoBuffer[leftIdx + 1] += rightGain * _dspScratch[frame];
                         }
                     }
-                    for (int n = 0; n < samples; ++n)
-                    {
-                        // Bandpass the signal, which removes the DC component and centers us around 0
-                        _dspScratch[n] = freqConfig.LowPass.Process(
-                            freqConfig.HighPass.Process(_dspScratch[n]));
-                    }
-
-                    signalLevel = freqConfig.Agc.D1;
                 }
                 // Straight mix when we're not applying any FX
                 else
                 {
+                    // The straight mix is identical for every slot on this frequency,
+                    // so build it once into _dspScratch.
                     Array.Clear(_dspScratch, 0, samples);
 
                     int numTransmitting = freqStreams.Count;
@@ -1171,37 +1205,26 @@ public class RadioPlayback : IDisposable
                         }
                     }
 
-                    // Set AGC back to unity so there's not sudden jumps
-                    // when we turn FX back on.
-                    freqConfig.Agc.D1 = 1;
-                    // In non-FX mode use stream presence as signal level proxy.
-                    signalLevel = freqStreams.Any(s => s.Samples.Length > 0) ? 2f : 0f;
-                }
-
-                // Final mix: fan out the processed mono signal to each tuned slot,
-                // applying per-slot squelch gate, pan, and volume.
-                foreach (var slot in tunedSlots)
-                {
-                    bool squelchOpen = signalLevel >= slot.SquelchLevel * 2f;
-                    if (squelchOpen != slot.WasSquelchOpen)
+                    // No squelch in non-FX mode (matches original behavior).
+                    // Fan out the dry mix to each slot with its pan and volume.
+                    foreach (var slot in tunedSlots)
                     {
-#if DEBUG
-                        _logger.LogDebug("SQUELCH {State} (Freq: {FrequencyKHz} kHz, SignalLevel: {Level:F3}, Threshold: {Threshold:F3})",
-                            squelchOpen ? "OPEN" : "CLOSED", freq, signalLevel, slot.SquelchLevel * 2f);
-#endif
-                        slot.WasSquelchOpen = squelchOpen;
-                    }
-                    if (!squelchOpen) continue;
+                        if (slot.IsNoiseMuted) continue;
 
-                    float mv = MasterVolume;
-                    float panAngle  = (slot.Pan + 100) / 200f * MathF.PI / 2f;
-                    float leftGain  = mv * slot.Volume * MathF.Cos(panAngle);
-                    float rightGain = mv * slot.Volume * MathF.Sin(panAngle);
-                    for (int frame = 0; frame < samples; frame++)
-                    {
-                        int leftIdx = frame * 2;
-                        _stereoBuffer[leftIdx]     += leftGain  * _dspScratch[frame];
-                        _stereoBuffer[leftIdx + 1] += rightGain * _dspScratch[frame];
+                        // Set AGC back to unity so there's not sudden jumps
+                        // when we turn FX back on.
+                        slot.Agc.D1 = 1;
+
+                        float mv = MasterVolume;
+                        float panAngle  = (slot.Pan + 100) / 200f * MathF.PI / 2f;
+                        float leftGain  = mv * slot.Volume * MathF.Cos(panAngle);
+                        float rightGain = mv * slot.Volume * MathF.Sin(panAngle);
+                        for (int frame = 0; frame < samples; frame++)
+                        {
+                            int leftIdx = frame * 2;
+                            _stereoBuffer[leftIdx]     += leftGain  * _dspScratch[frame];
+                            _stereoBuffer[leftIdx + 1] += rightGain * _dspScratch[frame];
+                        }
                     }
                 }
             }
@@ -1284,10 +1307,9 @@ public class RadioPlayback : IDisposable
         // 3. Stop master stream
         StopMasterStream();
 
-        // 4. Clear frequency configs and slot configs
+        // 4. Clear slot configs
         lock (_lock)
         {
-            _frequencies.Clear();
             _slots.Clear();
         }
 
