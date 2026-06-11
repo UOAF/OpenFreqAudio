@@ -900,7 +900,8 @@ public class RadioPlayback : IDisposable
                 slot = new RadioConfig();
                 _slots[key] = slot;
             }
-            slot.Volume = Math.Clamp(volume, -2f, 2f);
+            // Headroom up to 4x (+12 dB)
+            slot.Volume = Math.Clamp(volume, -4f, 4f);
         }
     }
 
@@ -1055,7 +1056,7 @@ public class RadioPlayback : IDisposable
             {
                 transmittingFrequencies = Apply3dEffects ? new(_transmittingFrequencies) : [];
                 streams = _streams.Values.ToList();
-                
+
                 capturing = Capturing;
                 recordEncoder = _recordEncoder;
                 monitorStream = _monitorStream;
@@ -1478,10 +1479,15 @@ public class RadioPlayback : IDisposable
                 peak = MathF.Max(peak, MathF.Abs(_stereoBuffer[i]));
             }
 
-            var limitGain = peak > 2f ? 2f / peak : 2f;
+            // True brickwall limiter: leave the mix alone unless a peak would clip the
+            // BASS float output (full scale ±1), then scale the whole buffer down so the
+            // loudest sample sits at ±1. No makeup boost here - headroom is what lets the
+            // per-radio volume knob (slot.Volume) and the Master Volume slider (0–200 %)
+            // actually control loudness instead of everything pinning at the clip.
+            var limitGain = peak > 1f ? 1f / peak : 1f;
             for (var i = 0; i < stereoOutputSamples; ++i)
             {
-                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i] * limitGain, -2f, 2f);
+                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i] * limitGain, -1f, 1f);
             }
 
             Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
