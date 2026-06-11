@@ -207,7 +207,7 @@ namespace OpenFreqAudio
 
 
         // Bilinear elevation sampling
-        private double SampleElevation(double xMeters, double yMeters)
+        public double SampleElevation(double xMeters, double yMeters)
         {
             // Convert world coordinates → DEM pixel coordinates
             double gx = (xMeters - originX) / cellSizeMeters;
