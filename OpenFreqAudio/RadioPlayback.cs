@@ -1183,10 +1183,6 @@ public class RadioPlayback : IDisposable
                         throw new Exception("Active streams have different lengths");
                     }
 
-                    // --- PER-FREQUENCY STREAM SETUP (shared across this frequency's slots) ---
-                    // The carrier/beat math depends only on the transmitting streams,
-                    // so compute it once here and reuse it for every slot on this frequency.
-
                     // TODO: Factor this out into a function.
 
                     // AM demodulators are envelope detectors
@@ -1230,7 +1226,7 @@ public class RadioPlayback : IDisposable
                     // where (I + jQ) is the representation of the signal as a complex number
                     // (see https://en.wikipedia.org/wiki/In-phase_and_quadrature_components).
                     //
-                    // And for each beat frequency k,
+                    // And for each carrier frequency k (relative to θ_0),
                     // I_k = cos(θ_k[n])
                     // Q_k = sin(θ_k[n])
                     // where θ_k[n] = 2π · beat[k] · n / F_s
@@ -1248,13 +1244,14 @@ public class RadioPlayback : IDisposable
 
                     var numStreams = transmittingStreams.Count;
                     var relativePowers = new List<float>(numStreams);
-                    var beats = new List<float>(numStreams);
+                    var carrierOffsets = new List<float>(numStreams);
                     if (numStreams > 0)
                     {
-                        // We can make any of the frequencies "0" and calculate beats off of it.
+                        // We can make any of the carrier frequencies "0" and calculate the relative frequencies
+                        // of the other carriers off of it.
                         // Just pick the first transmitter in the list.
-                        float zeroFreq = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
-                        zeroFreq += zeroFreq * transmittingStreams[0].CurrentParams.TuneOffsetPPM * 1e-6f;
+                        float zeroCarrier = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
+                        zeroCarrier += zeroCarrier * transmittingStreams[0].CurrentParams.TuneOffsetPPM * 1e-6f;
                         for (int i = 0; i < numStreams; ++i)
                         {
                             // We need to convert from dB to linear power when weighing the signals.
@@ -1262,13 +1259,13 @@ public class RadioPlayback : IDisposable
                             relativePowers.Add((float)thisSnrLinear);
                             if (i == 0)
                             {
-                                beats.Add(0);
+                                carrierOffsets.Add(0);
                             }
                             else
                             {
                                 var thisFreq = (float)transmittingStreams[i].CurrentParams.RadioFrequencyKHz * 1e3f;
                                 thisFreq += thisFreq * transmittingStreams[i].CurrentParams.TuneOffsetPPM * 1e-6f;
-                                beats.Add(Math.Abs(thisFreq - zeroFreq));
+                                carrierOffsets.Add(thisFreq - zeroCarrier);
                             }
                         }
                     }
@@ -1309,7 +1306,7 @@ public class RadioPlayback : IDisposable
                                 for (int k = 0; k < numStreams; ++k)
                                 {
                                     // θ_k is the phasor that rotates around at each beat frequency k.
-                                    double theta = 2.0f * Math.PI * beats[k] *
+                                    double theta = 2.0f * Math.PI * carrierOffsets[k] *
                                         (double)(n + _sampleNum) / (double)SampleRate;
                                     // Sum IQ components _before_ taking the length of the vector,
                                     // as that's a nonlinear operation.
