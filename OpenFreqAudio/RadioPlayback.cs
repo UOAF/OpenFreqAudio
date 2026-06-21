@@ -1235,7 +1235,7 @@ public class RadioPlayback : IDisposable
                                 // suggest minimum specs are 85% modulation, with 90-95% being common.
                                 // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
                                 // https://avweb.com/avionics/vhf-nav-comm-basics/
-                                const double modIndex = 0.9;
+                                const double modIndex = 0.95;
                                 for (int k = 0; k < numStreams; ++k)
                                 {
                                     // θ_k is the phasor that rotates around at each beat frequency k.
