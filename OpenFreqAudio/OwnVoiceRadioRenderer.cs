@@ -10,12 +10,11 @@ namespace OpenFreqAudio;
 /// full signal, no path loss, no fading.
 /// This is a port of the single-transmitter signal chain in
 /// <see cref="RadioPlayback"/>'s DSP callback
-///   1. ALC: per-stream level control (same constants as RadioPlayback.RadioStream)
-///   2. RadioEffect: transmitter-side ambient SFX (cockpit, mask, …) + RF fading
-///   3. AM envelope + background noise + AGC: the radio sound. The AGC is bounded here
+///   1. RadioEffect: transmitter-side ambient SFX (cockpit, mask, …) + RF fading
+///   2. AM envelope + background noise + AGC: the radio sound. The AGC is bounded here
 ///      (unlike a bare-voice AGC) because the carrier + noise floor are always present.
-///   4. 300–3000 Hz band-pass
-///   5. squelch gate: opens when the AGC-tracked signal level crosses the threshold and
+///   3. 300–3000 Hz band-pass
+///   4. squelch gate: opens when the AGC-tracked signal level crosses the threshold and
 ///      tails out (noise swell) when the carrier drops on key-up, exactly like the incoming
 ///      per-slot gate.
 ///
@@ -34,7 +33,6 @@ public sealed class OwnVoiceRadioRenderer
     private readonly RadioEffect _effect;
 
     // ALC + AGC time constants are shared with the receive chain — see RadioPlayback.
-    private readonly FirstOrderFilter _alc;
     private readonly FirstOrderFilter _agc;
     private readonly HighPassFilter _highPass;
     private readonly LowPassFilter _lowPass;
@@ -58,8 +56,6 @@ public sealed class OwnVoiceRadioRenderer
     {
         _sampleRate = sampleRate;
         _effect = new RadioEffect(sampleRate, 1, initial, logger);
-        _alc = RadioPlayback.MakeFirstOrderFilter(
-            RadioPlayback.AlcAttack, RadioPlayback.AlcDecay, sampleRate);
         _agc = RadioPlayback.MakeFirstOrderFilter(
             RadioPlayback.AgcAttack, RadioPlayback.AgcDecay, sampleRate);
         _highPass = new HighPassFilter(300.0 / sampleRate, 3);
@@ -98,19 +94,6 @@ public sealed class OwnVoiceRadioRenderer
     {
         if (!ApplySfx)
         {
-            // Clean own voice: level-control only, no radio colouring.
-            for (int i = 0; i < voiceCount; i++)
-            {
-                _alc.Apply(Math.Abs(buffer[i]));
-                buffer[i] /= Math.Max(_alc.D1, 0.5f);
-            }
-
-            for (int i = voiceCount; i < frames; i++)
-            {
-                _alc.Apply(0f);
-                buffer[i] = 0f;
-            }
-
             return;
         }
 
@@ -121,19 +104,10 @@ public sealed class OwnVoiceRadioRenderer
             return;
         }
 
-        // 1. ALC on the real voice samples (limit max gain to 2x); decay it over the rest.
-        for (int i = 0; i < voiceCount; i++)
-        {
-            _alc.Apply(Math.Abs(buffer[i]));
-            buffer[i] /= Math.Max(_alc.D1, 0.5f);
-        }
-
-        for (int i = voiceCount; i < frames; i++) _alc.Apply(0f);
-
-        // 2. Transmitter acoustics (ambient SFX) + RF fading, on the voice portion only.
+        // 1. Transmitter acoustics (ambient SFX) + RF fading, on the voice portion only.
         if (voiceCount > 0) _effect.Process(buffer, 0, voiceCount, ambientVolume);
 
-        // 3. AM envelope + noise + AGC (single transmitter → no beats).
+        // 2. AM envelope + noise + AGC (single transmitter → no beats).
         for (int i = 0; i < frames; i++)
         {
             bool carrierOn = i < voiceCount;
@@ -147,10 +121,10 @@ public sealed class OwnVoiceRadioRenderer
             _agc.Apply(env);
             float norm = env / _agc.D1;
 
-            // 4. Band-pass for the radio tone (run the filters every sample for continuity).
+            // 3. Band-pass for the radio tone (run the filters every sample for continuity).
             norm = _lowPass.Process(_highPass.Process(norm));
 
-            // 5. Squelch gate: open while the signal level is above threshold; tails out as
+            // 4. Squelch gate: open while the signal level is above threshold; tails out as
             //    the AGC decays after the carrier drops, then cuts to silence.
             buffer[i] = _agc.D1 >= SquelchThreshold ? norm : 0f;
         }

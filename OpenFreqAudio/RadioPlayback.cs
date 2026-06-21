@@ -46,10 +46,6 @@ public class FirstOrderFilter
 /// </summary>
 public class RadioPlayback : IDisposable
 {
-    // Level-control time constants, shared by the receive chain (RadioStream/RadioConfig)
-    // and the own-voice render chain (OwnVoiceRadioRenderer).
-    public const double AlcAttack = 0.003f / 3;
-    public const double AlcDecay = 1f / 3;
     public const double AgcAttack = 0.003f / 3;
     public const double AgcDecay = 0.01f / 3;
 
@@ -71,17 +67,6 @@ public class RadioPlayback : IDisposable
         // A view of Scratch that contains valid samples.
         // (Should we have some method fill scratch and set this?)
         public Memory<float> Samples { get; set; }
-
-        // Automatic level control - boost the signal to unityish.
-        // For a time constant tau, if Fs is our sample rate,
-        // AGC ramps down each sample at e^(-1/tau * Fs).
-        // This means we ramp about 95% of the way in 3 tau,
-        // 99% of the way in 4.6 tau, etc.
-        // See: https://en.wikipedia.org/wiki/RC_circuit
-        //
-        // Aggressive attack to avoid clipping, but decay slowly
-        // so we don't pump while people think about what to say next.
-        public readonly FirstOrderFilter Alc = MakeFirstOrderFilter(AlcAttack, AlcDecay, SampleRate);
 
         public RadioStream(ILogger logger)
         {
@@ -1130,14 +1115,6 @@ public class RadioPlayback : IDisposable
                     {
                         throw new Exception($"Expected {mr} samples, got {drained}");
                     }
-                    // Automatic level control (ALC)
-                    for (int i = 0; i < drained; ++i)
-                    {
-                        stream.Alc.Apply(Math.Abs(stream.Scratch[i]));
-                        // Limit our max gain to 2x to avoid blasting random background noise
-                        // (like a fan in your room)
-                        stream.Scratch[i] /= Math.Max(stream.Alc.D1, 0.5f);
-                    }
 
                     // Apply radio effects
                     if (Apply3dEffects)
@@ -1145,13 +1122,10 @@ public class RadioPlayback : IDisposable
                         stream.RadioEffect.Process(stream.Scratch, 0, drained, AmbientNoiseVolume);
                     }
 
-                    for (int i = drained; i < samples; ++i) stream.Alc.Apply(0f);
                     stream.Samples = stream.Scratch.AsMemory()[..drained];
                 }
                 else
                 {
-                    // Decay ALC
-                    for (int i = 0; i < samples; ++i) stream.Alc.Apply(0f);
                     stream.Samples = new Memory<float>();
                 }
             }
