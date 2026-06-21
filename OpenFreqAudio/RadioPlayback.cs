@@ -10,35 +10,6 @@ using NWaves.Filters.Butterworth;
 namespace OpenFreqAudio;
 
 /// <summary>
-/// AKA EnvelopeFollower in NWaves,
-/// but without a dumb private delay tap.
-/// </summary>
-public class FirstOrderFilter
-{
-    private float Attack;
-    private float Decay;
-
-    /// <summary>
-    /// The delay tap - i.e. the current value of the filter
-    /// </summary>
-    public float D1;
-
-    public FirstOrderFilter(float a, float d, float init)
-    {
-        Attack = a;
-        Decay = d;
-        D1 = init;
-    }
-
-    public float Apply(float x)
-    {
-        float alpha = x > D1 ? Attack : Decay;
-        D1 = alpha * x + (1 - alpha) * D1;
-        return D1;
-    }
-}
-
-/// <summary>
 /// RadioPlayback
 /// - Push (WebRTC) streams use a per-stream circular float ring buffer.
 /// - File-based streams are decoded by a background reader task that fills the same ring buffer,
@@ -141,7 +112,7 @@ public class RadioPlayback : IDisposable
 
         // AGC gain; varies as a low-pass of the received signal
         // according to attack and decay params below.
-        public FirstOrderFilter Agc = MakeFirstOrderFilter(AgcAttack, AgcDecay, SampleRate);
+        public AttackDecayFilter Agc = AttackDecayFilter.MakeAttackDecayFilter(AgcAttack, AgcDecay, SampleRate);
 
         // AGC attack and decay are exponential functions -
         // for a time constant tau, if Fs is our sample rate,
@@ -278,18 +249,6 @@ public class RadioPlayback : IDisposable
     // Wet/dry blend (0..1) for the transmitter-side ambient noise layer.
     // 0 bypasses ambient SFX entirely; 1 applies them at full strength.
     public float AmbientNoiseVolume { get; set; } = 1.0f;
-
-    /// <summary>
-    /// Create a first-order filter from attack and decay time constants
-    /// </summary>
-    /// <returns>The filter - not lifted into a closure so that you can query the previous value</returns>
-    public static FirstOrderFilter MakeFirstOrderFilter(double attackTau, double decayTau, double sampleRate)
-    {
-        double attackApha = 1 - Math.Exp(-1 / (sampleRate * attackTau));
-        double decayAlpha = 1 - Math.Exp(-1 / (sampleRate * decayTau));
-        // Assume we're using this for an AGC or something similar where the initial gain should be 1.
-        return new FirstOrderFilter((float)attackApha, (float)decayAlpha, 1.0f);
-    }
 
     public RadioPlayback(ILoggerFactory loggerFactory, int playbackDeviceIndex = -1)
     {

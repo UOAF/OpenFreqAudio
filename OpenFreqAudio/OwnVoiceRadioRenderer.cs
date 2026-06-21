@@ -33,7 +33,7 @@ public sealed class OwnVoiceRadioRenderer
     private readonly RadioEffect _effect;
 
     // ALC + AGC time constants are shared with the receive chain — see RadioPlayback.
-    private readonly FirstOrderFilter _agc;
+    private readonly AttackDecayFilter _agc;
     private readonly HighPassFilter _highPass;
     private readonly LowPassFilter _lowPass;
     private readonly int _sampleRate;
@@ -56,7 +56,7 @@ public sealed class OwnVoiceRadioRenderer
     {
         _sampleRate = sampleRate;
         _effect = new RadioEffect(sampleRate, 1, initial, logger);
-        _agc = RadioPlayback.MakeFirstOrderFilter(
+        _agc = AttackDecayFilter.MakeAttackDecayFilter(
             RadioPlayback.AgcAttack, RadioPlayback.AgcDecay, sampleRate);
         _highPass = new HighPassFilter(300.0 / sampleRate, 3);
         _lowPass = new LowPassFilter(3000.0 / sampleRate, 6);
