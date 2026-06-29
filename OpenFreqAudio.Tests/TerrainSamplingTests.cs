@@ -5,156 +5,101 @@ using System.Linq;
 namespace OpenFreqAudio.Tests
 {
     /// <summary>
-    /// Unit tests for FastPathAudioSim.SampleProfileAdaptive — the priority-queue
-    /// adaptive terrain sampler. Tests exercise the structural invariants and the
-    /// behaviours the rewrite was meant to fix:
-    ///   - flat/linear terrain → no wasted refinement (just the coarse backbone)
-    ///   - sharp features in the FIRST half of a coarse cell are still localized
-    ///     (the old forward-pass dropped them)
-    ///   - budget goes to the largest feature, not whatever comes first left-to-right
-    ///   - chord-deviation catches a feature even when the radio ray clears it
-    ///   - the sample budget cap is never exceeded
+    /// Tests for FastPathAudioSim.SampleProfile — the conservative max-pyramid traversal
+    /// (HeightPyramid.SampleProfile) that replaced the adaptive backbone sampler. They pin
+    /// the new contract:
+    ///   - terrain far below the ray prunes to an all-clear verdict with a sparse profile
+    ///   - terrain entering the first Fresnel zone forces a native-resolution descent that
+    ///     captures the feature (including narrow ridges the old fixed backbone could alias
+    ///     past)
+    ///   - the profile is strictly ascending in distance with TX/RX endpoints present
     /// </summary>
     public class TerrainSamplingTests
     {
-        // Mirror of the sampler's internals so assertions track the implementation.
-        private const int DesiredSamples = 512;
-        private const int CoarseIntervals = 64;            // Clamp(512/8, 16, 64)
-        private const int BackboneCount = CoarseIntervals + 1;
-
-        // 120 MHz VHF link: lambda = 2.5 m.
-        private const double FreqHz = 120e6;
-
-        // Standard horizontal path geometry used by most tests.
+        private const double FreqHz = 120e6; // VHF, lambda = 2.5 m
         private const double TxX = 50.0, RxX = 1050.0, PathY = 1.5;
         private const double PathLen = RxX - TxX; // 1000 m, cellSize = 1 m
 
-        private static List<(double dist, double elev)> Sample(
-            TerrainHarness h, double txAlt = 1000.0, double rxAlt = 1000.0)
-            => h.Sim.SampleProfileAdaptive(TxX, PathY, RxX, PathY, txAlt, rxAlt, FreqHz, DesiredSamples);
+        private static (List<(double dist, double elev)> profile, bool allClear) Sample(
+            TerrainHarness h, double txAlt, double rxAlt)
+            => h.Sim.SampleProfile(TxX, PathY, RxX, PathY, txAlt, rxAlt, FreqHz);
 
         // Triangular ridge centred at column x0, half-width w (cols), peak height H (m).
         private static Func<int, double> Ridge(double x0, double w, double h)
             => col => Math.Max(0.0, h * (1.0 - Math.Abs(col - x0) / w));
 
         [Fact]
-        public void FlatTerrain_ReturnsOnlyBackbone_NoWastedRefinement()
+        public void ClearPath_HighAntennas_AllClear()
         {
             using var h = new TerrainHarness(1100, 4, _ => 0.0);
-            var p = Sample(h);
+            var (profile, allClear) = Sample(h, txAlt: 1000.0, rxAlt: 1000.0);
 
-            Assert.Equal(BackboneCount, p.Count);
+            Assert.True(allClear, "flat terrain far below the ray should prune to all-clear");
+            Assert.True(profile.Count >= 2, "endpoints are always present");
+            // Pruned at a coarse level → a handful of samples, not a dense native walk.
+            Assert.True(profile.Count < 32, $"clear path should stay sparse, got {profile.Count}");
+            Assert.True(profile.All(p => p.elev < 1.0), "clear-path samples are the (flat) ground");
         }
 
         [Fact]
-        public void LinearRamp_ReturnsOnlyBackbone_InterpolationIsExact()
+        public void TerrainInZone_NotAllClear_CapturesPeak()
         {
-            // Constant slope => zero curvature => linear interpolation is exact => no refinement.
-            // 1 ft/col keeps the int16-feet DEM exactly linear (no quantization curvature).
-            using var h = new TerrainHarness(1100, 4, col => col * 0.3048);
-            var p = Sample(h);
+            const double peakCol = TxX + 0.5 * PathLen; // 550
+            const double height = 200.0;
+            using var h = new TerrainHarness(1100, 4, Ridge(peakCol, 60.0, height));
+            // Antennas just above the ridge so it intrudes the first Fresnel zone.
+            var (profile, allClear) = Sample(h, txAlt: 210.0, rxAlt: 210.0);
 
-            Assert.Equal(BackboneCount, p.Count);
+            Assert.False(allClear, "a ridge inside the Fresnel zone must force a descent");
+            double maxElev = profile.Max(p => p.elev);
+            Assert.True(maxElev > height - 12.0, $"captured peak {maxElev:F1} m, expected ~{height} m");
+
+            var top = profile.OrderByDescending(p => p.elev).First();
+            Assert.True(Math.Abs(top.dist - 0.5 * PathLen) < 20.0,
+                $"peak localized at {top.dist:F1} m, expected ~{0.5 * PathLen:F1} m");
+        }
+
+        [Fact]
+        public void NarrowRidge_InZone_IsCaptured_NotAliased()
+        {
+            // A near-single-column spike: the old fixed backbone (~16 m spacing) could step
+            // over it; the max-pyramid raises the containing cell's max, forcing a native
+            // DDA that samples the spike.
+            const double peakCol = TxX + 0.5 * PathLen;
+            const double height = 150.0;
+            using var h = new TerrainHarness(1100, 4, Ridge(peakCol, 1.0, height));
+            var (profile, allClear) = Sample(h, txAlt: 160.0, rxAlt: 160.0);
+
+            Assert.False(allClear);
+            double maxElev = profile.Max(p => p.elev);
+            Assert.True(maxElev > height - 12.0, $"narrow ridge missed: captured {maxElev:F1} m");
+        }
+
+        [Fact]
+        public void Profile_IsAscending_WithEndpoints()
+        {
+            using var h = new TerrainHarness(1100, 4,
+                col => 40.0 * Math.Sin(col * 0.3) + 25.0 * Math.Sin(col * 0.07) + 80.0);
+            // Low link so the rough terrain stays in/near the zone and forces descents.
+            var (profile, _) = Sample(h, txAlt: 120.0, rxAlt: 120.0);
+
+            Assert.True(profile.Count >= 2);
+            Assert.Equal(0.0, profile[0].dist, 6);
+            Assert.True(profile[^1].dist <= PathLen + 1e-6);
+            Assert.True(Math.Abs(profile[^1].dist - PathLen) < 2.0, "last sample ~ path end");
+            for (int i = 1; i < profile.Count; i++)
+                Assert.True(profile[i].dist > profile[i - 1].dist, $"not strictly ascending at {i}");
         }
 
         [Fact]
         public void DegeneratePath_ReturnsSinglePoint()
         {
             using var h = new TerrainHarness(64, 4, _ => 0.0);
-            var p = h.Sim.SampleProfileAdaptive(10.0, 2.0, 10.2, 2.0, 100.0, 100.0, FreqHz, DesiredSamples);
+            var (profile, allClear) = h.Sim.SampleProfile(10.0, 2.0, 10.2, 2.0, 100.0, 100.0, FreqHz);
 
-            Assert.Single(p);
-            Assert.Equal(0.0, p[0].dist);
-        }
-
-        [Fact]
-        public void Profile_IsSortedAscending_WithinPathBounds_AndUnderBudget()
-        {
-            // Rough deterministic terrain to force heavy refinement.
-            using var h = new TerrainHarness(1100, 4,
-                col => 40.0 * Math.Sin(col * 0.3) + 25.0 * Math.Sin(col * 0.07));
-            var p = Sample(h);
-
-            Assert.True(p.Count <= DesiredSamples, $"budget exceeded: {p.Count}");
-            Assert.True(p.Count > BackboneCount, "rough terrain should trigger refinement");
-
-            Assert.Equal(0.0, p[0].dist, 6);
-            Assert.True(p[^1].dist <= PathLen + 1e-6);
-            for (int i = 1; i < p.Count; i++)
-                Assert.True(p[i].dist > p[i - 1].dist, $"not strictly ascending at {i}");
-        }
-
-        [Fact]
-        public void SharpRidge_InFirstHalf_IsLocalized()
-        {
-            // Peak at 25% of the path — the case the old forward-pass could miss because
-            // the front half of a split cell was never re-examined.
-            const double peakCol = TxX + 0.25 * PathLen; // 300
-            const double height = 200.0;
-            using var h = new TerrainHarness(1100, 4, Ridge(peakCol, 60.0, height));
-            var p = Sample(h);
-
-            var top = p.OrderByDescending(pt => pt.elev).First();
-            double peakDist = peakCol - TxX;
-
-            Assert.True(Math.Abs(top.dist - peakDist) < 10.0,
-                $"peak localized at {top.dist:F1} m, expected ~{peakDist:F1} m");
-            Assert.True(top.elev > height - 12.0,
-                $"captured peak {top.elev:F1} m, expected ~{height} m");
-        }
-
-        [Fact]
-        public void SharpRidge_NearReceiver_IsLocalized_BudgetNotExhaustedEarly()
-        {
-            // Peak at 85% — verifies refinement reaches the far end instead of spending
-            // the whole budget left-to-right.
-            const double peakCol = TxX + 0.85 * PathLen; // 900
-            const double height = 200.0;
-            using var h = new TerrainHarness(1100, 4, Ridge(peakCol, 60.0, height));
-            var p = Sample(h);
-
-            var top = p.OrderByDescending(pt => pt.elev).First();
-            double peakDist = peakCol - TxX;
-
-            Assert.True(Math.Abs(top.dist - peakDist) < 10.0,
-                $"peak localized at {top.dist:F1} m, expected ~{peakDist:F1} m");
-            Assert.True(top.elev > height - 12.0,
-                $"captured peak {top.elev:F1} m, expected ~{height} m");
-        }
-
-        [Fact]
-        public void Budget_FavorsLargerFeature_OverSmallEarlierOne()
-        {
-            // Small ridge near TX (15%), big ridge near RX (85%). Priority subdivision
-            // should spend more samples on the big ridge despite it coming later.
-            const double smallCol = TxX + 0.15 * PathLen; // 200
-            const double bigCol = TxX + 0.85 * PathLen;   // 900
-            using var h = new TerrainHarness(1100, 4,
-                col => Math.Max(Ridge(smallCol, 50.0, 20.0)(col), Ridge(bigCol, 50.0, 300.0)(col)));
-            var p = Sample(h);
-
-            double smallDist = smallCol - TxX, bigDist = bigCol - TxX;
-            int Near(double d) => p.Count(pt => Math.Abs(pt.dist - d) <= 50.0);
-
-            Assert.True(Near(bigDist) > Near(smallDist),
-                $"big ridge points={Near(bigDist)} should exceed small ridge points={Near(smallDist)}");
-        }
-
-        [Fact]
-        public void ChordDeviation_CatchesFeature_EvenWhenRayClearsIt()
-        {
-            // High link (3 km) over a 200 m ridge — the ray clears the Fresnel zone, so a
-            // ground-line "excess" detector would not refine here, but chord-deviation must
-            // still localize the terrain feature for the later ray-vs-terrain check.
-            const double peakCol = TxX + 0.5 * PathLen;
-            const double height = 200.0;
-            using var h = new TerrainHarness(1100, 4, Ridge(peakCol, 60.0, height));
-            var p = Sample(h, txAlt: 3000.0, rxAlt: 3000.0);
-
-            var top = p.OrderByDescending(pt => pt.elev).First();
-            Assert.True(top.elev > height - 12.0,
-                $"feature missed under clearing ray: captured {top.elev:F1} m");
-            Assert.True(p.Count > BackboneCount, "feature should still trigger refinement");
+            Assert.Single(profile);
+            Assert.Equal(0.0, profile[0].dist);
+            Assert.True(allClear);
         }
     }
 }
