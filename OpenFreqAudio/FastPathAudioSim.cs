@@ -1,18 +1,5 @@
-// - Assumes DEM mipmaps: mipmaps[0] = finest (native), mipmaps[last] = coarsest.
-// - Uses bilinear sampling and an adaptive sample/refine policy.
-// - Returns AudioParams (gain linear, lowpassHz, noiseLevel [0..1], dropoutProb).
-//
-// PHYSICS MODEL:
-// - Knife-edge diffraction theory (ITU-R P.526) as foundation
-// - Smooth continuous degradation
-// - Wavelength-dependent corrections with configurable AM/FM modulation
-// - Parametrized radio band characteristics (bandwidth, diffraction, modulation type)
-
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.IO.MemoryMappedFiles;
 using Microsoft.Extensions.Logging;
+using OpenFreqAudio.TerrainSampling;
 
 // ReSharper disable InconsistentNaming
 
@@ -87,46 +74,6 @@ namespace OpenFreqAudio
     }
 
     // ================================================================
-    // Fast, memory-mapped DEM reader (cross-platform)
-    // ================================================================
-    public class DEMReader : IDisposable
-    {
-        private readonly MemoryMappedFile mmf;
-        private readonly MemoryMappedViewAccessor accessor;
-        private int width { get; }
-        private int height { get; }
-        private readonly int bytesPerSample;
-        private readonly long headerBytes;
-        public int Width => width;
-        public int Height => height;
-
-        public DEMReader(string path, int width, int height, int bytesPerSample = 2, long headerBytes = 0)
-        {
-            this.width = width;
-            this.height = height;
-            this.bytesPerSample = bytesPerSample;
-            this.headerBytes = headerBytes;
-
-            mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-        }
-
-        public float Sample(int row, int col)
-        {
-            if (row < 0 || row >= height || col < 0 || col >= width)
-                return 0f;
-            long offset = headerBytes + ((long)row * width + col) * bytesPerSample;
-            return accessor.ReadInt16(offset) * 0.3048f; // ft to m
-        }
-
-        public void Dispose()
-        {
-            accessor.Dispose();
-            mmf.Dispose();
-        }
-    }
-
-    // ================================================================
     // Main audio-path propagation simulator
     // ================================================================
     public class FastPathAudioSim
@@ -136,6 +83,7 @@ namespace OpenFreqAudio
         private const double SpeedOfLight = 299792458.0; // m/s
         private const double FourPi = 12.566370614359172; // 4 * π (precomputed)
         private const double MinimumGainDb = -60.0; // Below this, signal is completely lost
+        private const double FT_TO_M = HeightPyramid.FeetToMeters; // 0.3048; pyramid stores raw int16 feet
 
         // Default radio band configurations
         public static List<RadioBandConfig> bandConfigs = new()
@@ -167,16 +115,15 @@ namespace OpenFreqAudio
             )
         };
 
-        private readonly DEMReader dem;
+        private readonly HeightPyramid pyramid;
         private readonly double originX, originY, cellSizeMeters;
-        private readonly int maxSamplesPerPath = 512;
         private readonly double weatherDbPerKm = 0.02;
         private readonly ILogger<FastPathAudioSim> _logger;
 
-        public FastPathAudioSim(DEMReader dem, double originX, double originY, double cellSizeMeters,
+        public FastPathAudioSim(HeightPyramid pyramid, double originX, double originY, double cellSizeMeters,
             ILogger<FastPathAudioSim> logger)
         {
-            this.dem = dem;
+            this.pyramid = pyramid;
             this.originX = originX;
             this.originY = originY;
             this.cellSizeMeters = cellSizeMeters;
@@ -206,30 +153,20 @@ namespace OpenFreqAudio
         }
 
 
-        // Bilinear elevation sampling
+        // Get the elevation at the given location in meters.
+        // Deliberately use nearest-neighbor sampling.
+        // Bilinear/trilinear/sinc/etc. would bias towards _lower_ heights
+        // by averaging out peaks, when peak height is exactly what we want!
         public double SampleElevation(double xMeters, double yMeters)
         {
             // Convert world coordinates → DEM pixel coordinates
             double gx = (xMeters - originX) / cellSizeMeters;
             double gy = (yMeters - originY) / cellSizeMeters;
 
-            int col = (int)Math.Floor(gx);
-            int row = (int)Math.Floor(gy);
-            double fx = gx - col;
-            double fy = gy - row;
+            int col = (int)Math.Round(gx);
+            int row = (int)Math.Round(gy);
 
-            // Bilinear interpolation - sample four nearest grid points
-            float v00 = dem.Sample(row, col);
-            float v10 = dem.Sample(row, col + 1);
-            float v01 = dem.Sample(row + 1, col);
-            float v11 = dem.Sample(row + 1, col + 1);
-
-            // Interpolate horizontally and vertically
-            double v0 = v00 * (1 - fx) + v10 * fx;
-            double v1 = v01 * (1 - fx) + v11 * fx;
-            double val = v0 * (1 - fy) + v1 * fy;
-
-            return val;
+            return pyramid.SampleNativeFeet(col, row) * FT_TO_M;
         }
 
         // Free-space path loss (dB)
@@ -241,7 +178,7 @@ namespace OpenFreqAudio
         }
 
         // Knife-edge diffraction loss (dB) - ITU-R P.526
-        private static double KnifeEdgeLoss_dB(double v)
+        internal static double KnifeEdgeLoss_dB(double v)
         {
             if (v < -0.78) return 0.0;
             double term = Math.Sqrt((v - 0.1) * (v - 0.1) + 1.0) + (v - 0.1);
@@ -255,146 +192,22 @@ namespace OpenFreqAudio
                 ap.TerrainProfile = profile;
         }
 
-        // Adaptive sampling of terrain along the line.
-        //
-        // A coarse evenly-spaced backbone is refined by a max-priority subdivision:
-        // the interval with the largest expected error is always split first (instead
-        // of a single left-to-right pass), and BOTH halves of a split are pushed back
-        // so a sharp feature anywhere in a cell can still be found by recursion.
-        //
-        // Priority = chord deviation (how far the true mid-elevation departs from the
-        // linear interpolation of the interval endpoints) weighted by Fresnel-zone
-        // relevance. The chord deviation is LOS-independent so it catches narrow
-        // ridges regardless of the average ground slope; the Fresnel weight (which
-        // uses the actual TX/RX altitudes and frequency) biases the budget toward
-        // terrain that pokes into the real radio ray's first Fresnel zone.
-        //
-        // Each dequeue samples one new midpoint and commits it - there are no
-        // speculative samples, so the DEM-read count is bounded by desiredSamples.
-        // This keeps the cost predictable for the ~10 Hz call rate.
-        internal List<(double dist, double elev)> SampleProfileAdaptive(
+        // Sample the terrain profile along the path via the conservative max-pyramid
+        // traversal (HeightPyramid.SampleProfile). Returns the profile (dist meters from
+        // TX, ASL meters; dense at native resolution where terrain nears the first
+        // Fresnel zone, sparse where it clears) plus an all-clear verdict (true => terrain
+        // is below the zone everywhere, so the diffraction model can be skipped).
+        internal (List<(double dist, double elev)> profile, bool allClear) SampleProfile(
             double txX, double txY, double rxX, double rxY,
-            double txAlt, double rxAlt, double freqHz, int desiredSamples)
+            double txAlt, double rxAlt, double freqHz)
         {
-            var result = new List<(double dist, double elev)>(desiredSamples);
-            double dx = rxX - txX, dy = rxY - txY;
-            double D = Math.Sqrt(dx * dx + dy * dy);
-            if (D < 1.0)
-            {
-                result.Add((0.0, SampleElevation(txX, txY)));
-                return result;
-            }
-
-            // Sub-millimetre curvature is DEM quantization/float noise, not real terrain.
-            const double CurvatureEpsilonM = 1e-3;
-
-            double lambda = SpeedOfLight / freqHz;
-            double rxMinusTx = rxAlt - txAlt;
-
-            // Fresnel-relevance weight at fractional position t with terrain top elev.
-            // >1 when the terrain approaches/intrudes the first Fresnel zone of the ray.
-            double FresnelWeight(double t, double elev)
-            {
-                double d1 = t * D, d2 = D - d1;
-                if (d1 < 1.0 || d2 < 1.0) return 0.1;
-                double f1 = Math.Sqrt(lambda * d1 * d2 / D);
-                double losH = txAlt + rxMinusTx * t;
-                double intrusion = elev - (losH - f1); // terrain vs bottom of Fresnel zone
-                return 1.0 + Math.Max(0.0, intrusion) / Math.Max(f1, 1.0);
-            }
-
-            // Coarse backbone - leave most of the budget for adaptive refinement.
-            int coarse = Math.Clamp(desiredSamples / 8, 16, 64);
-            var coarseElev = new double[coarse + 1];
-            for (int i = 0; i <= coarse; i++)
-            {
-                double t = i / (double)coarse;
-                coarseElev[i] = SampleElevation(txX + t * dx, txY + t * dy);
-                result.Add((t * D, coarseElev[i]));
-            }
-
-            // Min-heap on negated key => largest (chordDev * weight) is split first.
-            var pq = new PriorityQueue<(double tA, double eA, double tB, double eB), double>();
-            for (int i = 0; i < coarse; i++)
-            {
-                double tA = i / (double)coarse, tB = (i + 1) / (double)coarse;
-                double eA = coarseElev[i], eB = coarseElev[i + 1];
-                // Seed priority from local curvature (second difference of already-sampled
-                // coarse points). Curvature - not slope - so a constant ramp seeds zero and
-                // is left unrefined. End intervals use a one-sided stencil.
-                double curv;
-                if (i > 0 && i < coarse - 1)
-                    curv = Math.Abs(coarseElev[i - 1] - 2.0 * coarseElev[i] + coarseElev[i + 1]);
-                else if (i == 0)
-                    curv = Math.Abs(coarseElev[0] - 2.0 * coarseElev[1] + coarseElev[2]);
-                else
-                    curv = Math.Abs(coarseElev[coarse - 2] - 2.0 * coarseElev[coarse - 1] + coarseElev[coarse]);
-                if (curv <= CurvatureEpsilonM) continue; // flat / linear cell - interpolation already exact
-                double w = FresnelWeight((tA + tB) * 0.5, 0.5 * (eA + eB));
-                pq.Enqueue((tA, eA, tB, eB), -(curv * w));
-            }
-
-            const double floorMeters = 2.0; // never refine below this - protects endpoints where F1->0
-            const double kFresnel = 0.25;   // resolve terrain to a quarter of the local Fresnel radius
-            while (result.Count < desiredSamples && pq.TryDequeue(out var iv, out _))
-            {
-                double tMid = (iv.tA + iv.tB) * 0.5;
-                double eMid = SampleElevation(txX + tMid * dx, txY + tMid * dy);
-                result.Add((tMid * D, eMid)); // commit every sample
-
-                double chordDev = Math.Abs(eMid - 0.5 * (iv.eA + iv.eB));
-
-                // Stop threshold scaled by the local Fresnel radius (with a fixed floor),
-                // instead of a wavelength-agnostic constant.
-                double d1 = tMid * D, d2 = D - d1;
-                double f1 = (d1 > 1.0 && d2 > 1.0) ? Math.Sqrt(lambda * d1 * d2 / D) : 0.0;
-                if (chordDev < Math.Max(floorMeters, kFresnel * f1))
-                    continue; // region flat enough - keep the sample, don't subdivide further
-
-                double w = FresnelWeight(tMid, eMid);
-                double childKey = -(chordDev * w);
-                pq.Enqueue((iv.tA, iv.eA, tMid, eMid), childKey);
-                pq.Enqueue((tMid, eMid, iv.tB, iv.eB), childKey);
-            }
-
-            // Consumer walks the profile in ascending distance.
-            result.Sort((a, b) => a.dist.CompareTo(b.dist));
-            return result;
-        }
-
-        /// <summary>
-        /// Calculate noise level from SNR and modulation type.
-        /// AM: analog static increases smoothly with decreasing SNR.
-        /// FM: threshold effect - noise suppression until below threshold.
-        /// </summary>
-        public static float CalculateNoiseLevel(double snrDb, ModulationType modulation)
-        {
-            if (modulation == ModulationType.AM)
-            {
-                // AM: Analog static increases smoothly with decreasing SNR
-                if (snrDb > 20.0)
-                    return 0.02f; // Clean signal
-                else if (snrDb > 10.0)
-                    return (float)(0.02 + (20.0 - snrDb) / 10.0 * 0.18); // 0.02 → 0.20
-                else if (snrDb > 0.0)
-                    return (float)(0.20 + (10.0 - snrDb) / 10.0 * 0.35); // 0.20 → 0.55
-                else
-                    return (float)(0.55 + Math.Min(-snrDb / 20.0, 0.30)); // 0.55 → 0.85
-            }
-            else // FM
-            {
-                // FM: FM threshold effect - noise suppression until below threshold
-                if (snrDb > 15.0)
-                    return 0.01f; // Excellent FM quieting
-                else if (snrDb > 10.0)
-                    return (float)(0.01 + (15.0 - snrDb) / 5.0 * 0.09); // 0.01 → 0.10
-                else if (snrDb > 5.0)
-                    return (float)(0.10 + (10.0 - snrDb) / 5.0 * 0.30); // 0.10 → 0.40 (FM threshold)
-                else if (snrDb > 0.0)
-                    return (float)(0.40 + (5.0 - snrDb) / 5.0 * 0.35); // 0.40 → 0.75
-                else
-                    return (float)(0.75 + Math.Min(-snrDb / 10.0, 0.20)); // 0.75 → 0.95
-            }
+            double wavelength = SpeedOfLight / freqHz;
+            double rEff = CalculateKAvg(txAlt, rxAlt) * EarthRadius;
+            double cell = cellSizeMeters;
+            return pyramid.SampleProfile(
+                (txX - originX) / cell, (txY - originY) / cell,
+                (rxX - originX) / cell, (rxY - originY) / cell,
+                txAlt, rxAlt, wavelength, rEff, cell);
         }
 
         /// <summary>
@@ -441,168 +254,6 @@ namespace OpenFreqAudio
                 deepFade *= 1.5;
 
             return (float)Math.Clamp(deepFade, 0.0, 0.5);
-        }
-
-        /// <summary>
-        /// Apply physics-informed smooth degradation based on terrain obstruction.
-        /// Uses knife-edge diffraction theory with wavelength-dependent corrections.
-        /// No discrete branches - single continuous function for realistic "degradation window".
-        /// </summary>
-        private double ApplyTerrainDegradation(double fresnelClearance, double diffLoss, RadioBandConfig bandConfig)
-        {
-#if DEBUG
-            _logger.LogDebug($"ApplyTerrainDegradation:");
-            _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
-            _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
-            _logger.LogDebug($"  Band: {bandConfig.BandName} ({bandConfig.Modulation})");
-#endif
-
-            // === CHECK FOR CLEAR LOS FIRST ===
-            // fresnelClearance >= 1.0 means terrain is below Fresnel zone edge (definitely clear)
-            // OR fresnelClearance >= 0.6 with low diffraction loss (mostly clear)
-            if (fresnelClearance >= 1.0 || (fresnelClearance >= 0.6 && diffLoss < 3.0))
-            {
-                _logger.LogDebug("  → Taking CLEAR LOS path");
-                return 0;
-            }
-
-            _logger.LogDebug("  → Taking OBSTRUCTED path");
-
-            // === PHYSICS-INFORMED SMOOTH DEGRADATION ===
-            // Based on knife-edge diffraction theory, but applied continuously
-
-            // Calculate approximate Fresnel parameter from clearance
-            // CORRECTED MAPPING:
-            // clearance = 1.0 (100% clear) → v = -2.0 (well below obstacle)
-            // clearance = 0.0 (obstacle at Fresnel zone) → v = 0.0 (grazing)
-            // clearance = -1.0 (obstacle beyond Fresnel zone) → v = +2.0 (blocked)
-            double v_approx = -2.0 * fresnelClearance;
-
-            // Calculate knife-edge diffraction loss (ITU-R P.526)
-            // Only applies when v > -0.78 (obstructed or grazing)
-            double theoreticalDiffractionLoss = 0.0;
-            if (v_approx > -0.78)
-            {
-                theoreticalDiffractionLoss = KnifeEdgeLoss_dB(v_approx);
-            }
-
-            // Apply wavelength-dependent corrections from band config
-            double wavelengthCorrection = bandConfig.DiffractionCorrection_dB;
-
-            // However, for obstructions beyond 1.5 Fresnel zones,
-            // wavelength advantage diminishes - you can't diffract around a mountain!
-            if (bandConfig.DiffractionCorrection_dB > 0 && fresnelClearance < -0.5)
-            {
-                // Start reducing wavelength advantage at 1.5 zones blocked
-                // Use aggressive exponential scaling - essentially eliminates advantage at 2+ zones
-                double excessBlocked = Math.Max(0.0, -fresnelClearance - 0.5); // 0 at -0.5, 1.5 at -2.0
-
-                // Exponential reduction: 2^(-2x) gives very fast decay
-                // At 1.5 zones (-0.5 clearance): factor ≈ 1.0 (no reduction)
-                // At 2.0 zones (-1.0 clearance): factor ≈ 0.25 (75% reduction)
-                // At 2.5 zones (-1.5 clearance): factor ≈ 0.06 (94% reduction)
-                double reductionFactor = Math.Pow(2.0, -2.0 * excessBlocked);
-                wavelengthCorrection *= reductionFactor;
-
-#if DEBUG
-                _logger.LogDebug(
-                    $"Wavelength advantage reduction: {excessBlocked:F2} excess → factor {reductionFactor:F3} → correction {wavelengthCorrection:F2} dB");
-#endif
-            }
-
-            // Combine theoretical loss with wavelength correction.
-            // Positive correction = better diffraction (VHF advantage) → reduces terrain loss.
-            // Negative correction = worse diffraction (UHF) → increases terrain loss.
-            double totalTerrainLoss = theoreticalDiffractionLoss - wavelengthCorrection;
-
-            // SMOOTH BLENDING: For severe obstruction, blend between theoretical and measured diffraction loss
-            // - clearance > 0.4: Use pure theoretical (approximation works well)
-            // - clearance 0.1-0.4: Smooth linear blend
-            // - clearance < 0.1: Use pure measured (multiple obstacles, theory breaks down)
-            if (fresnelClearance < 0.4)
-            {
-                double blendFactor;
-                if (fresnelClearance < 0.1)
-                {
-                    blendFactor = 1.0; // Full measured loss (severe obstruction)
-                }
-                else
-                {
-                    // Linear blend from 0.1 (full measured) to 0.4 (full theoretical)
-                    blendFactor = (0.4 - fresnelClearance) / 0.3;
-                }
-
-                // Blend: theoretical * (1 - blend) + measured * blend
-                totalTerrainLoss = totalTerrainLoss * (1.0 - blendFactor) + diffLoss * blendFactor;
-
-#if DEBUG
-                _logger.LogDebug(
-                    $"Blending: theoretical={theoreticalDiffractionLoss + wavelengthCorrection:F1} dB, measured={diffLoss:F1} dB, blend={blendFactor:F3} → final={totalTerrainLoss:F1} dB");
-#endif
-            }
-
-            // Knife-edge theory assumes single sharp obstacle and saturates ~30-40 dB.
-            // For mountains blocking multiple Fresnel zones, add additional loss factor.
-            if (fresnelClearance < 0.4 && diffLoss > 15.0)
-            {
-                // Calculate how many Fresnel radii the terrain penetrates into obstruction zone
-                double totalPenetration = Math.Max(0.0, 1.0 - fresnelClearance);
-
-                // Knife-edge theory handles up to ~0.6 clearance (40% obstruction)
-                // Apply penalty for deeper penetration
-                double additionalZonesBlocked = Math.Max(0.0, totalPenetration - 0.6);
-
-                if (additionalZonesBlocked > 0.1)
-                {
-                    // Multi-zone penalty with exponential scaling for severe obstructions
-                    // Base: 12 dB per zone for moderate obstruction (up to 1.5 zones)
-                    // Exponential: penalty increases dramatically beyond 1.5 zones
-                    double multiZonePenalty;
-
-                    if (additionalZonesBlocked < 1.0)
-                    {
-                        // Linear region: 12 dB per zone
-                        multiZonePenalty = additionalZonesBlocked * 12.0;
-                    }
-                    else
-                    {
-                        // Exponential region for severe obstruction (>2 total zones blocked)
-                        // First zone: 12 dB
-                        // Additional zones: 18 dB × (2.5^n) where n is zones beyond first
-                        // This creates very aggressive scaling for massive obstructions
-                        multiZonePenalty = 12.0; // First zone
-                        double excessZones = additionalZonesBlocked - 1.0;
-                        multiZonePenalty += 18.0 * (Math.Pow(2.5, excessZones) - 1.0);
-
-                        // Cap at 80 dB - beyond this the signal is completely gone anyway
-                        multiZonePenalty = Math.Min(multiZonePenalty, 80.0);
-                    }
-
-                    // Wavelength-dependent multi-zone behavior
-                    if (bandConfig.DiffractionCorrection_dB > 0) // Better diffraction (longer wavelength)
-                        multiZonePenalty *= 1.0;
-                    else // Worse diffraction (shorter wavelength)
-                        multiZonePenalty *= 1.3;
-
-                    totalTerrainLoss += multiZonePenalty;
-
-#if DEBUG
-                    _logger.LogDebug(
-                        $"Multi-zone blockage: {totalPenetration:F2} Fresnel radii, {additionalZonesBlocked:F2} zones → +{multiZonePenalty:F1} dB penalty");
-#endif
-                }
-            }
-
-            // Shorter wavelength hard cutoff: severe obstructions should completely block signal
-            // When 3+ Fresnel zones are blocked, signal is essentially gone
-            if (bandConfig.DiffractionCorrection_dB < 0 && fresnelClearance < -2.0)
-            {
-                return 200.0;
-            }
-            else
-            {
-                return totalTerrainLoss;
-            }
         }
 
         /// <summary>
@@ -679,9 +330,10 @@ namespace OpenFreqAudio
             ap.ReceivedDb = (float)(txPowerDbm - fspl - weatherLoss);
 
             // Sample terrain profile
-            var profile = SampleProfileAdaptive(txXVal, txYVal, rxXVal, rxYVal,
-                txAltVal, rxAltVal, freqHz, maxSamplesPerPath);
+            var (profile, allClear) = SampleProfile(txXVal, txYVal, rxXVal, rxYVal,
+                txAltVal, rxAltVal, freqHz);
             // Bail now if there's not any terrain to obstruct us.
+            // This should only fire for very short paths, so assume no additional losses.
             if (profile.Count < 2)
             {
                 ap.ReceivedSnrDb = ap.ReceivedDb - (float)rxSensitivity;
@@ -691,191 +343,109 @@ namespace OpenFreqAudio
                 return ap;
             }
 
-            // Calculate wavelength and First Fresnel zone radius
-            double lambda = SpeedOfLight / freqHz;
-            double F1_radius = 0.0;
-            double worstExcess = double.MinValue;
-            double diffLoss = 0.0;
+            // Wavelength (used by the two-ray model and the delta-Bullington diffraction below).
+            double wavelength = SpeedOfLight / freqHz;
 
-            // Cache frequently used calculations outside the loop
-            double invDist2D = 1.0 / dist2D;
-            double rxMinusTx = rxAltVal - txAltVal;
-            double invTwoEffectiveRadius = 1.0 / (2.0 * effectiveEarthRadius);
-            double lambdaInv = 1.0 / lambda;
-
-            // Find worst obstruction along path
-            for (int i = 1; i < profile.Count - 1; i++)
-            {
-                var (d, h) = profile[i];
-                double d1 = d;
-                double d2 = dist2D - d;
-                if (d2 < 1.0) continue;
-
-                // Fresnel zone radius at this point
-                double d1d2 = d1 * d2;
-                double F1 = Math.Sqrt((lambda * d1d2) / (d1 + d2));
-                if (F1 > F1_radius) F1_radius = F1;
-
-                // LOS height at this distance (accounting for Earth curvature)
-                double curvature = d1d2 * invTwoEffectiveRadius;
-                double losHeight = txAltVal + rxMinusTx * (d1 * invDist2D) - curvature;
-
-                // Clearance excess: negative = clear, positive = obstructed
-                double excess = h - (losHeight + F1);
-                if (excess > worstExcess)
-                {
-                    worstExcess = excess;
-
-                    // Calculate diffraction parameter
-                    double h_diff = h - losHeight;
-                    double v = h_diff * Math.Sqrt(2.0 * (d1 + d2) * lambdaInv / d1d2);
-                    diffLoss = KnifeEdgeLoss_dB(v);
-                }
-            }
-
-            // Calculate Fresnel clearance (1.0 = perfect, 0.0 = grazing, negative = blocked)
-            double fresnelClearance = F1_radius > 0 ? (1.0 - worstExcess / F1_radius) : 1.0;
-
-#if DEBUG
-            _logger.LogDebug($"Terrain Analysis:");
-            _logger.LogDebug($"  distance: {dist:F1}m");
-            _logger.LogDebug($"  worstExcess: {worstExcess:F1}m");
-            _logger.LogDebug($"  F1_radius: {F1_radius:F1}m");
-            _logger.LogDebug($"  fresnelClearance: {fresnelClearance:F3}");
-            _logger.LogDebug($"  diffLoss: {diffLoss:F1} dB");
-            _logger.LogDebug($"  Profile points: {profile.Count}");
-#endif
-
-            // === TWO-RAY GROUND REFLECTION (over sea) ===
-            // BMS engine quirk: negative elevation values are ocean tiles.
-            // Count ocean tiles in the terrain profile to determine ocean coverage fraction.
-            int oceanTileCount = 0;
-            foreach (var (_, elev) in profile)
-            {
-                if (elev < 0.0) oceanTileCount++;
-            }
-
-            double oceanFrac = (double)oceanTileCount / profile.Count;
-
+            // **Two-Ray (Sea) Reflection**
+            // The simplest multipath model - a ray from TX -> RX,
+            // and one bouncing off of the Earth and coming back up to the receiver.
+            // Only apply this over the sea - assume the ground is mostly diffuse,
+            // scattering the waves that bounce off of it.
+            // Only apply this model when the specular midpoint (where the waves would bounce)
+            // is over water.
+            // (BMS marks ocean tiles with negative elevation.)
+            // Reflection strength is set by the surface around that bounce point.
             double twoRayDb = 0.0;
-            if (oceanFrac > 0.2)
+            double txTop = Math.Max(0.0, txAltVal);
+            double rxTop = Math.Max(0.0, rxAltVal);
+            if (txTop + rxTop > 0.0 && dist2D > 1.0)
             {
-                // --- Tunables ---
-                const double seaR0 = 0.95; // baseline seawater reflection magnitude
-                const double sigmaSeaDefault = 0.25; // sea surface rms roughness (m) - moderate-rough swell
+                const double seaR0 = 0.95;           // baseline seawater reflection magnitude
+                const double sigmaSeaDefault = 0.25; // sea-surface rms roughness (m), moderate swell
 
-                // Two-ray ground-reflection model over a smooth ocean surface.
-                // Only applies when most of the path is over water and terrain at specular point is low.
-                // R = seawater reflection coeff (~-0.95 at grazing incidence).
-                double txTop = Math.Max(0.0, txAltVal);
-                double rxTop = Math.Max(0.0, rxAltVal);
-
-                // Central surface angle: use horizontal arc (dist2D), not 3D slant (dist).
                 double R_eff = effectiveEarthRadius;
-                double theta = dist2D / R_eff;
+                double theta = dist2D / R_eff;       // central surface angle (horizontal arc)
 
-                // Direct chord between antenna tops (law of cosines on curved Earth).
-                double Ld = Math.Sqrt(
-                    (R_eff + txTop) * (R_eff + txTop) +
-                    (R_eff + rxTop) * (R_eff + rxTop) -
-                    2.0 * (R_eff + txTop) * (R_eff + rxTop) * Math.Cos(theta));
+                // Specular point for unequal antenna heights: flat-earth proportional split
+                // (phi = theta·txTop/(txTop+rxTop)) — exact for a flat earth, good at grazing.
+                double specFrac = txTop / (txTop + rxTop);
+                double phi = theta * specFrac;
+                double specX = txXVal + specFrac * (rxXVal - txXVal);
+                double specY = txYVal + specFrac * (rxYVal - txYVal);
 
-                // Specular reflection point approximated at arc midpoint.
-                double phi = theta / 2.0;
-
-                double L1 = Math.Sqrt(
-                    (R_eff + txTop) * (R_eff + txTop) + R_eff * R_eff -
-                    2.0 * (R_eff + txTop) * R_eff * Math.Cos(phi));
-
-                double L2 = Math.Sqrt(
-                    (R_eff + rxTop) * (R_eff + rxTop) + R_eff * R_eff -
-                    2.0 * (R_eff + rxTop) * R_eff * Math.Cos(theta - phi));
-
-                // Check that terrain at the specular midpoint does not block the reflected path.
-                // Positive specElev means terrain rising above the sea surface at the bounce point.
-                double specX = 0.5 * (txXVal + rxXVal);
-                double specY = 0.5 * (txYVal + rxYVal);
-                // BMS ocean tiles return negative elevation values - clamp to 0 (sea level).
-                double specElev = Math.Max(0.0, SampleElevation(specX, specY));
-
-                if (specElev <= 10.0)
+                // Gate: only reflect when the bounce point itself is over water.
+                if (SampleElevation(specX, specY) < 0.0)
                 {
-                    double Lr = L1 + L2;
-                    double delta = Lr - Ld;
+                    // Curved-earth law-of-cosines geometry: specular path-length excess,
+                    // reflected legs L1/L2, and the grazing-angle sine.
+                    var (delta, L1, L2, sinPsi) = TwoRaySpecularGeometry(txTop, rxTop, dist2D, R_eff);
 
-                    // Cosine of incidence at TX side = sin(grazing angle).
-                    // Derived from law-of-cosines triangle (O, TX, specular point S):
-                    // Place S at (R_eff, 0), then the component of (T→S) along the surface normal
-                    // at S is: (R_eff+txTop)*cos(phi) - R_eff.
-                    double cosInc = Math.Abs(((R_eff + txTop) * Math.Cos(phi) - R_eff) /
-                                             Math.Max(1e-6, L1));
+                    // Ament/Miller-Brown specular roughness factor (power form → amplitude).
+                    double roughPow = Math.Exp(-Math.Pow(4.0 * Math.PI * sigmaSeaDefault * sinPsi / wavelength, 2.0));
+                    double roughAmp = Math.Sqrt(Math.Max(1e-8, roughPow));
 
-                    // Debye-Kirchhoff roughness factor (power form, then amplitude).
-                    double debPow = Math.Exp(-Math.Pow(4.0 * Math.PI * sigmaSeaDefault * cosInc / lambda, 2.0));
-                    debPow = Math.Max(1e-8, debPow);
-                    double debAmp = Math.Sqrt(debPow);
+                    // Divergence factor: the convex earth spreads the reflected ray, lowering its
+                    // amplitude. Full ITU-R P.528-5 §8 eq (59).
+                    // This holds at steeper reflection angles, not just grazing ones.
+                    // (The classic form from "Propagation of Short Radio Waves" (Kerr, 1951) is its sin²ψ→0 limit).
+                    // Rr is the reduced reflected-ray length r1·r2/(r1+r2)
+                    // (eqs 57-58, with our exact slant legs L1/L2 in place of D1,2/cosψ)
+                    // aa = effective Earth radius.
+                    // Replaces the old ad-hoc range fade.
+                    double sinPsiSafe = Math.Max(sinPsi, 1e-6);
+                    double rr = L1 * L2 / Math.Max(L1 + L2, 1.0);
+                    double divTerm2 = 2.0 * rr * (1.0 + sinPsi * sinPsi) / (R_eff * sinPsiSafe);
+                    double divTerm3 = 2.0 * rr / R_eff;
+                    double divergence = 1.0 / Math.Sqrt(1.0 + divTerm2 + divTerm3 * divTerm3);
 
-                    // Effective reflection amplitude. Sign is negative: Fresnel coefficient
-                    // at grazing incidence over seawater → phase inversion for both polarisations.
-                    // oceanScale reduces effect on mixed land/sea paths.
-                    double oceanScale = Math.Clamp(oceanFrac, 0.0, 1.0);
-                    double ReffMag = seaR0 * debAmp * oceanScale;
-                    double R = -ReffMag;
-
-                    // Distance-dependent attenuation: Progressively reduce two-ray effect with range.
-                    // Apply gentle fade starting at 40km.
-                    double rangeFactor = 1.0;
-                    if (dist2D > 40000.0) // Start fading at 40 km
+                    // Local ocean fraction over the projected first-Fresnel footprint around the
+                    // specular point (elongated along the path at grazing) — handles coastlines.
+                    double f1Spec = Math.Sqrt(wavelength * L1 * L2 / Math.Max(L1 + L2, 1.0));
+                    double halfLen = f1Spec / Math.Max(sinPsi, 1e-3);
+                    double ux = (rxXVal - txXVal) / dist2D, uy = (rxYVal - txYVal) / dist2D;
+                    const int footprintSamples = 7;
+                    int oceanHits = 0;
+                    for (int s = 0; s < footprintSamples; s++)
                     {
-                        // Smooth exponential fade: 100% at 40km → 37% at 80km → 14% at 100km
-                        double excessRange = dist2D - 40000.0;
-                        rangeFactor = Math.Exp(-excessRange / 40000.0); // 40km decay constant
+                        double frac = (s - (footprintSamples - 1) / 2.0) / ((footprintSamples - 1) / 2.0);
+                        double off = frac * halfLen;
+                        if (SampleElevation(specX + ux * off, specY + uy * off) < 0.0) oceanHits++;
                     }
+                    double oceanScale = (double)oceanHits / footprintSamples;
 
-                    R *= rangeFactor;
+                    // Ray-length factor (ITU-R P.528-5 §8 eq (60)/(61): Fr = min(r0/r12, 1)). The
+                    // reflected ray is longer than the direct ray (r12 = L1+L2; r0 = r12 − delta),
+                    // so it spreads more and arrives weaker: Fr = 1 − delta/(L1+L2). Bites only when
+                    // the direct ray dominates — both terminals high and close (two aircraft).
+                    double rayLengthFactor = Math.Min(1.0 - delta / Math.Max(L1 + L2, 1.0), 1.0);
 
-                    // Two-ray interference amplitude relative to free-space unit amplitude:
-                    //   |1 + R·exp(j·φ)|  =  sqrt(1 + R² + 2R·cos(φ))
-                    // 
-                    // Sample across voice bandwidth for averaging to simulate wider signal
-                    const int freqSamples = 15; // Sample ±1.5 kHz around center frequency
-                    double bw = bandConfig.VoiceBandwidth_Hz;
-                    double twoRayDbSum = 0.0;
+                    // Effective reflection amplitude (P.528 RTg = Rg·Dv·Fr). Negative: grazing
+                    // seawater inverts phase.
+                    double R = -seaR0 * roughAmp * oceanScale * divergence * rayLengthFactor;
 
-                    for (int i = 0; i < freqSamples; i++)
-                    {
-                        double fOffset = (i - freqSamples / 2.0) * (bw / freqSamples);
-                        double lambdaSample = SpeedOfLight / (freqHz + fOffset);
-                        double phiRad = 2.0 * Math.PI * delta / lambdaSample; // phase difference
-
-                        double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
-                        twoRayDbSum += 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
-                    }
-
-                    twoRayDb = twoRayDbSum / freqSamples;
-
-                    // Clamp limits to avoid sharp pops
-                    twoRayDb = Math.Clamp(twoRayDb, -8.0, 6.0);
+                    // Two-ray interference relative to free-space unit amplitude:
+                    //   |1 + R·exp(jφ)| = sqrt(1 + R² + 2R·cosφ).
+                    // Single evaluation at the centre frequency: averaging over the voice bandwidth
+                    // is a no-op (two-ray coherence bandwidth ≫ a few kHz).
+                    double phiRad = 2.0 * Math.PI * delta / wavelength;
+                    double totalAmp = Math.Sqrt(1.0 + R * R + 2.0 * R * Math.Cos(phiRad));
+                    // Cap at unity (no boost above free space): ITU-R P.528-5 §8 eq (64),
+                    // WRL = min(|1 + R|, 1). P.528 treats the LOS two-ray region as loss-only.
+                    totalAmp = Math.Min(totalAmp, 1.0);
+                    twoRayDb = 20.0 * Math.Log10(Math.Max(1e-12, totalAmp));
 
                     #if DEBUG
                     _logger.LogDebug($"Two-Ray Model:");
-                    _logger.LogDebug($"  oceanFrac={oceanFrac:F3}, specElev={specElev:F1}m");
-                    _logger.LogDebug($"  delta={delta:F2}m, phiRad={(2.0 * Math.PI * delta / lambda):F3}rad");
-                    _logger.LogDebug($"  cosInc={cosInc:F4}, debAmp={debAmp:F4}");
-                    _logger.LogDebug($"  oceanScale={oceanScale:F3}, R={R:F4}, twoRayDb={twoRayDb:F2} dB");
-                    #endif
-                }
-                else
-                {
-                    #if DEBUG
-                    _logger.LogDebug($"Two-Ray: specular midpoint terrain-blocked (specElev={specElev:F1}m), skipped");
+                    _logger.LogDebug($"  specFrac={specFrac:F3}, oceanScale={oceanScale:F3}");
+                    _logger.LogDebug($"  delta={delta:F2}m, sinPsi={sinPsi:F4}, divergence={divergence:F3}");
+                    _logger.LogDebug($"  R={R:F4}, twoRayDb={twoRayDb:F2} dB");
                     #endif
                 }
             }
 
-            // twoRayDb > 0: constructive interference (boost above free-space).
-            // twoRayDb < 0: destructive null. Applied before terrain degradation so that
-            // over-sea paths already in a null correctly accumulate terrain loss on top.
+            // twoRayDb ≤ 0: loss-only after the unity cap (P.528 eq 64) — a destructive null
+            // subtracts, constructive interference is capped at free space. Applied before terrain
+            // so an over-sea path already in a null still accumulates terrain loss on top.
             ap.ReceivedDb += (float)twoRayDb;
             
             // Doppler shift
@@ -894,8 +464,11 @@ namespace OpenFreqAudio
                 ap.TuneOffsetPPM += (float)shiftPpm;
             }
 
-            // === APPLY PHYSICS-INFORMED SMOOTH DEGRADATION ===
-            ap.ReceivedDb -= (float)ApplyTerrainDegradation(fresnelClearance, diffLoss, bandConfig);
+            // **Terrain Diffraction**
+            // Skipped entirely when the pyramid proved the first Fresnel zone is clear,
+            // otherwise see DeltaBullington for details.
+            if (!allClear)
+                ap.ReceivedDb -= (float)DeltaBullington.Loss(profile, txAltVal, rxAltVal, wavelength, effectiveEarthRadius);
             ap.ReceivedSnrDb = ap.ReceivedDb - (float)rxSensitivity;
             ap.DropoutRate = CalculateDropoutRate(ap.ReceivedSnrDb, bandConfig);
             ap.DeepFadeRate = CalculateDeepFadeRate(ap.ReceivedSnrDb, bandConfig);
@@ -903,11 +476,35 @@ namespace OpenFreqAudio
             return ap;
         }
 
+        /// <summary>
+        /// Two-ray specular geometry on a curved Earth. Returns the reflected-vs-direct path
+        /// length excess (delta, m), the reflected leg lengths L1/L2 (m), and the grazing-angle
+        /// sine. The specular point uses the flat-earth proportional split phi = theta·txTop/
+        /// (txTop+rxTop). For a flat earth (large rEff) the excess tends to 2·txTop·rxTop/dist.
+        /// </summary>
+        internal static (double delta, double L1, double L2, double sinPsi) TwoRaySpecularGeometry(
+            double txTop, double rxTop, double dist2D, double rEff)
+        {
+            double theta = dist2D / rEff;
+            double specFrac = (txTop + rxTop) > 0.0 ? txTop / (txTop + rxTop) : 0.5;
+            double phi = theta * specFrac;
+            double a = rEff + txTop, b = rEff + rxTop;
+            double Ld = Math.Sqrt(a * a + b * b - 2.0 * a * b * Math.Cos(theta));
+            double L1 = Math.Sqrt(a * a + rEff * rEff - 2.0 * a * rEff * Math.Cos(phi));
+            double L2 = Math.Sqrt(b * b + rEff * rEff - 2.0 * b * rEff * Math.Cos(theta - phi));
+            double delta = (L1 + L2) - Ld;
+            double sinPsi = Math.Abs((a * Math.Cos(phi) - rEff) / Math.Max(1e-6, L1));
+            return (delta, L1, L2, sinPsi);
+        }
+
+        /// <summary>
+        /// Calculates average atmospheric refractivity factor k_avg
+        /// Based on SAND2012-10690, section 3.2.3
+        /// Used to compute effective Earth radius: R_eff = k_avg * R_earth
+        /// </summary>
         public static double CalculateKAvg(double senderAltitude, double receiverAltitude)
         {
-            // Calculates average atmospheric refractivity factor k_avg
-            // Based on SAND2012-10690, section 3.2.3
-            // Used to compute effective Earth radius: R_eff = k_avg * R_earth
+
 
             if (senderAltitude < 0) senderAltitude = 0;
             if (receiverAltitude < 0) receiverAltitude = 0;

@@ -17,6 +17,7 @@ using Avalonia.Platform.Storage;
 using BMSAudioSim.ViewModels;
 using Microsoft.Extensions.Logging;
 using OpenFreqAudio;
+using OpenFreqAudio.TerrainSampling;
 using ReactiveUI;
 using ReactiveUI.Avalonia;
 using ScottPlot;
@@ -41,7 +42,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     // Simulation tick interval in milliseconds.
     private const int SIMULATION_TICK_MS = 100;
 
-    // Map cell size in metres per pixel — mirrors the value used when loading the heightmap.
+    // Map cell size in meters per pixel — mirrors the value used when loading the heightmap.
     private const double CELL_SIZE_METERS = 1024.0 * 1000.0 / HEIGHTMAP_SIZE; // ≈ 31.25 m/px
 
     private string? _previewImagePath;
@@ -50,7 +51,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     private (int x, int y)? _sender2Pos;
     private (int x, int y)? _receiverPos;
     private FastPathAudioSim? _fastPathAudioSim;
-    private DEMReader? _demReader;
+    private HeightPyramid? _pyramid;
     private AudioParams? _signal1Params;
     private AudioParams? _signal2Params;
     private RadioPlayback _radioPlayback;
@@ -219,7 +220,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
     /// </summary>
     private void OnCanvasPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (_demReader == null || HeightmapImage.Source == null) return;
+        if (_pyramid == null || HeightmapImage.Source == null) return;
 
         var canvasPos = e.GetPosition(MarkerCanvas);
         var target = FindDragTarget(canvasPos);
@@ -710,7 +711,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
         if (file.Count > 0)
         {
-            _demReader = new DEMReader(file[0].Path.LocalPath, HEIGHTMAP_SIZE, HEIGHTMAP_SIZE);
+            // HeightPyramid's ctor scans the full DEM to build the max-pyramid; keep the UI thread free.
+            _pyramid = await Task.Run(() => HeightPyramid.FromFile(file[0].Path.LocalPath, HEIGHTMAP_SIZE, HEIGHTMAP_SIZE));
             await LoadHeightmapAsync(file[0].Path.LocalPath);
         }
     }
@@ -723,8 +725,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
             // Load the raw heightmap data
             var cellSizeM = 1024d * 1000d / HEIGHTMAP_SIZE;
-            if (_demReader != null)
-                _fastPathAudioSim = new FastPathAudioSim(_demReader, originX: 0, originY: 0, cellSizeMeters: cellSizeM,
+            if (_pyramid != null)
+                _fastPathAudioSim = new FastPathAudioSim(_pyramid, originX: 0, originY: 0, cellSizeMeters: cellSizeM,
                     _loggerFactory.CreateLogger<FastPathAudioSim>());
 
             StatusText.Text = "Creating preview image (this can take a minute)...";
@@ -760,10 +762,10 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
 
     private void CreatePreviewImage(string outputPath)
     {
-        if (_demReader == null) return;
+        if (_pyramid == null) return;
 
-        int actualWidth  = _demReader.Width;
-        int actualHeight = _demReader.Height;
+        int actualWidth  = _pyramid.Width;
+        int actualHeight = _pyramid.Height;
 
         float minHeight = float.MaxValue;
         float maxHeight = float.MinValue;
@@ -772,7 +774,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         {
             for (int x = 0; x < actualWidth; x++)
             {
-                float h = _demReader.Sample(y, x);
+                float h = (float)(_pyramid.SampleNativeFeet(x, y) * HeightPyramid.FeetToMeters);
                 if (h < -12) h = -12;
                 if (h < minHeight) minHeight = h;
                 if (h > maxHeight) maxHeight = h;
@@ -793,7 +795,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
                 {
                     int sx = (int)(px * (actualWidth  - 1) / (float)(PREVIEW_SIZE - 1));
                     int sy = (int)(py * (actualHeight - 1) / (float)(PREVIEW_SIZE - 1));
-                    float height = _demReader.Sample(sy, sx);
+                    float height = (float)(_pyramid.SampleNativeFeet(sx, sy) * HeightPyramid.FeetToMeters);
                     float normalized = 1.0f - (height - minHeight) / range;
                     SKColor color = GetHeightColor(normalized);
                     pixels[py * PREVIEW_SIZE + px] = (uint)color;
