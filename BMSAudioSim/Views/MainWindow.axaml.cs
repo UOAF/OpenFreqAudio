@@ -712,7 +712,7 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         if (file.Count > 0)
         {
             // HeightPyramid's ctor scans the full DEM to build the max-pyramid; keep the UI thread free.
-            _pyramid = await Task.Run(() => new HeightPyramid(file[0].Path.LocalPath, HEIGHTMAP_SIZE, HEIGHTMAP_SIZE));
+            _pyramid = await Task.Run(() => HeightPyramid.FromFile(file[0].Path.LocalPath, HEIGHTMAP_SIZE, HEIGHTMAP_SIZE));
             await LoadHeightmapAsync(file[0].Path.LocalPath);
         }
     }

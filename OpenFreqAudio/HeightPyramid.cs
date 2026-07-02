@@ -106,12 +106,18 @@ class Level
 /// we still only have to walk at most 32 pixels of the base heightmap.
 /// </summary>
 /// <seealso cref="https://en.wikipedia.org/wiki/Quadtree"/>
-public class HeightPyramid : IDisposable
+public sealed class HeightPyramid : IDisposable
 {
     private readonly DEMReader map;
     private readonly List<Level> levels;
 
-    public HeightPyramid(string path, int width, int height)
+    public static HeightPyramid FromFile(string path, int width, int height)
+    {
+        return new HeightPyramid(path, width, height);
+    }
+
+    // Expensive construction hidden behind a factory method
+    private HeightPyramid(string path, int width, int height)
     {
         map = new DEMReader(path, width, height);
         levels = new List<Level>();

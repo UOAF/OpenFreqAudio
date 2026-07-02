@@ -45,7 +45,7 @@ namespace OpenFreqAudio.Tests
             }
             File.WriteAllBytes(_path, bytes);
 
-            _pyramid = new HeightPyramid(_path, width, height);
+            _pyramid = HeightPyramid.FromFile(_path, width, height);
             Sim = new FastPathAudioSim(_pyramid, originX: 0.0, originY: 0.0, cellSizeMeters: 1.0,
                 NullLogger<FastPathAudioSim>.Instance);
         }
