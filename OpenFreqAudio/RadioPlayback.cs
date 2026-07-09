@@ -1034,57 +1034,37 @@ public class RadioPlayback : IDisposable
                 list.Add(stream);
             }
 
-            // If anyone has anything to play,
-            // limit this round to the shortest length.
-            // If all is quiet, just use the provided length.
-            int? maxReady = null;
-            foreach (var stream in streams)
-            {
-                var avail = stream.Buffer.Available;
-                if (avail > 0)
-                {
-                    if (!maxReady.HasValue) maxReady = avail;
-                    else maxReady = Math.Min(maxReady.Value, avail);
-                    // No matter how much we have ready,
-                    // we can only handle `samples` at most.
-                    maxReady = Math.Min(samples, maxReady.Value);
-                }
-            }
-            // TODO: If we have nothing to play (maxReady is null)
-            // we could limit the number of samples returned to a small duration
-            // so that we're more responsive as soon as new ones arrive.
-            samples = maxReady ?? samples;
-            stereoOutputSamples = samples * 2;
+            // Each stream is its own radio: drain whatever it has this round
+            // (up to the full callback length) and mix that in.
+            // A stream that underruns just contributes fewer samples - the envelope loop holds
+            // its carrier (with zero voice modulation) to avoid introducing clicks from jitter,
+            // and a stream with nothing at all this round drops out of the mix.
+            // Either way we doesn't throttle every other stream down to the shortest one,
+            // which would ratchet their latency up over time.
             Array.Clear(_stereoBuffer, 0, stereoOutputSamples);
 
-            // No matter what else we do, keep the samples moving.
             foreach (var stream in streams)
             {
-                if (maxReady.HasValue)
-                {
-                    var mr = maxReady.Value;
-                    if (stream.Scratch.Length < mr)
-                    {
-                        stream.Scratch = new float[mr];
-                    }
-                    int drained = stream.Buffer.DrainTo(stream.Scratch.AsSpan()[..mr])!.Value;
-                    if (drained > 0 && drained != mr)
-                    {
-                        throw new Exception($"Expected {mr} samples, got {drained}");
-                    }
-
-                    // Apply radio effects
-                    if (Apply3dEffects)
-                    {
-                        stream.RadioEffect.Process(stream.Scratch, 0, drained, AmbientNoiseVolume);
-                    }
-
-                    stream.Samples = stream.Scratch.AsMemory()[..drained];
-                }
-                else
+                int take = Math.Min(samples, stream.Buffer.Available);
+                if (take == 0)
                 {
                     stream.Samples = new Memory<float>();
+                    continue;
                 }
+
+                if (stream.Scratch.Length < take)
+                {
+                    stream.Scratch = new float[take];
+                }
+                int drained = stream.Buffer.DrainTo(stream.Scratch.AsSpan()[..take])!.Value;
+
+                // Apply radio effects
+                if (Apply3dEffects)
+                {
+                    stream.RadioEffect.Process(stream.Scratch, 0, drained, AmbientNoiseVolume);
+                }
+
+                stream.Samples = stream.Scratch.AsMemory()[..drained];
             }
 
             // 2: Process each tuned slot (noise + envelope + AGC + squelch + band-pass + mix).
@@ -1106,13 +1086,6 @@ public class RadioPlayback : IDisposable
                 if (Apply3dEffects)
                 {
                     var transmittingStreams = freqStreams.Where(s => s.Samples.Length > 0).ToList();
-                    // Sanity check:
-                    // By our maxReady logic above, any streams _with_ samples should be the same length,
-                    // and that lengh should be `samples`.
-                    if (!transmittingStreams.Select(s => s.Samples.Length).All(l => l == samples))
-                    {
-                        throw new Exception("Active streams have different lengths");
-                    }
 
                     // TODO: Factor this out into a function.
 
@@ -1239,9 +1212,18 @@ public class RadioPlayback : IDisposable
                                     // θ_k is the phasor that rotates around at each beat frequency k.
                                     double theta = 2.0f * Math.PI * carrierOffsets[k] *
                                         (double)(n + _sampleNum) / (double)SampleRate;
+                                    // Even if we're past this stream's available samples
+                                    // (jitter buffer shenanigans make streams different lengths)
+                                    // still hold its carrier with no voice modulation.
+                                    // A mid-callback carrier edge produces as a click,
+                                    // worst at talkspurt start while the jitter buffer ramps up.
+                                    // A stream with no samples this round isn't in transmittingStreams,
+                                    // so a genuine dropout still falls back to noise within a callback.
+                                    //
                                     // Sum IQ components _before_ taking the length of the vector,
                                     // as that's a nonlinear operation.
-                                    float samp = transmittingStreams[k].Samples.Span[n];
+                                    var kSamples = transmittingStreams[k].Samples;
+                                    float samp = n < kSamples.Length ? kSamples.Span[n] : 0f;
                                     i += relativePowers[k] * (1 + samp * modIndex) * Math.Cos(theta);
                                     q += relativePowers[k] * (1 + samp * modIndex) * Math.Sin(theta);
                                 }
