@@ -171,10 +171,8 @@ public class RadioPlayback : IDisposable
     // Populated in Initialize() and updated on each successful ChangeOutputDevice.
     // Used as the fallback target when a new device switch fails.
     private int _currentDeviceIndex = -1;
-
-    private const int MaxBufferSize = 24576;
-    private float[] _dspScratch = new float[MaxBufferSize];
-    private float[] _stereoBuffer = new float[MaxBufferSize * 2];
+    private float[] _dspScratch = [];
+    private float[] _stereoBuffer = [];
 
     // Phase coherence is good - don't have phase jumps between DSP callbacks.
     private int _sampleNum = 0;
@@ -977,7 +975,7 @@ public class RadioPlayback : IDisposable
             int samples = stereoOutputSamples / 2;
 
             // Ensure buffers are large enough
-            if (samples > MaxBufferSize)
+            if (samples > _dspScratch.Length)
             {
                 lock (_lock)
                 {
