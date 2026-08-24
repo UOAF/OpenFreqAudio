@@ -31,6 +31,12 @@ public class RadioPlayback : IDisposable
         public required RadioEffect RadioEffect { get; set; }
         public required AudioParams CurrentParams { get; set; }
 
+        // Phase of this stream's carrier, relative to the channel frequency,
+        // in radians, wrapped to [0, 2π). Integrated per sample in so that a change
+        // in carrier frequency (e.g. Doppler shift) doesn't cause audible phase jumps.
+        // Only ever touched on the DSP thread.
+        public double CarrierPhase;
+
         // Audio to play is pushed here and pulled by playback.
         public SyncRope<float> Buffer { get; } = new();
         // Scratch space for decoding and FX application
@@ -74,6 +80,13 @@ public class RadioPlayback : IDisposable
         {
             Buffer.Clear();
         }
+    }
+
+    // Can a guy get a Complex<T> around here?
+    struct IQ<T>
+    {
+        public T I;
+        public T Q;
     }
 
     /// <summary>
@@ -174,14 +187,21 @@ public class RadioPlayback : IDisposable
     private float[] _dspScratch = [];
     private float[] _stereoBuffer = [];
 
-    // Phase coherence is good - don't have phase jumps between DSP callbacks.
-    private int _sampleNum = 0;
+    // Summed carrier I/Q for one frequency, built once per callback and shared by every slot
+    // tuned to it - all those slots hear the same transmitters, only the noise floor differs.
+    //
+    // TODO: With memory latency being what it is, we should compare perf of
+    // - Quantizing to IQ<Int16>
+    // - Just recalculating this each time.
+    private IQ<float>[] _mixIQ = [];
 
     // Baseband is 8 kHz (4kHz Nyquist)
     // NB: Opus only accepts 8000, 12000, 16000, 24000, or 48000 Hz
     public const int SampleRate = 48000;
 
     private const int NoiseFadeSamples = 2400;
+
+    private const double TwoPi = 2.0 * Math.PI;
 
     private static readonly Lock _bassInitLock = new();
 
@@ -981,6 +1001,7 @@ public class RadioPlayback : IDisposable
                 {
                     _dspScratch = new float[samples];
                     _stereoBuffer = new float[stereoOutputSamples];
+                    _mixIQ = new IQ<float>[samples];
                 }
             }
 
@@ -1069,10 +1090,10 @@ public class RadioPlayback : IDisposable
 
             // 2: Process each tuned slot (noise + envelope + AGC + squelch + band-pass + mix).
             //    Each slot is its own radio/receiver, with its own AGC, squelch, filters, and noise.
-            foreach (var (freq, tunedSlots) in tunedSlotsByFreq)
+            foreach (var (freqKhz, tunedSlots) in tunedSlotsByFreq)
             {
                 // Skip frequencies we're transmitting on — we mute our own TX.
-                if (transmittingFrequencies.Contains(freq))
+                if (transmittingFrequencies.Contains(freqKhz))
                 {
                     continue;
                 }
@@ -1080,7 +1101,7 @@ public class RadioPlayback : IDisposable
                 // Get pre-grouped streams for this frequency
                 // Don't bail early if these are empty;
                 // still want to apply squelch sound and other FX.
-                var freqStreams = streamsByFrequency.GetValueOrDefault(freq, []);
+                var freqStreams = streamsByFrequency.GetValueOrDefault(freqKhz, []);
 
                 // Mix transmitting streams
                 if (Apply3dEffects)
@@ -1130,11 +1151,17 @@ public class RadioPlayback : IDisposable
                     // where (I + jQ) is the representation of the signal as a complex number
                     // (see https://en.wikipedia.org/wiki/In-phase_and_quadrature_components).
                     //
-                    // And for each carrier frequency k (relative to θ_0),
+                    // If k people are talking on the same channel,
+                    // then each will have some signal modulated on a carrier frequency Fc_k
+                    // relative to our tune frequency. Then for each k,
                     // I_k = cos(θ_k[n])
                     // Q_k = sin(θ_k[n])
-                    // where θ_k[n] = 2π · beat[k] · n / F_s
+                    // where θ_k[n] = θ_k[n-1] + 2π · Fc_k / F_s
                     //   and F_s is the sample rate.
+                    // Our phases θ_k must *integrated* intead of calculated as
+                    // θ_k[n] = 2π · Fc_k · n / F_s
+                    // since Fc_k may change on the fly (buh dum) due to changing Doppler shift!
+                    //
                     // We'll multiply those terms by each AM signal A_k + v_k[n],
                     // where A_k is the received power of the carrier and v_k[n] is the modulated voice.
                     // All together, we get
@@ -1146,32 +1173,76 @@ public class RadioPlayback : IDisposable
                     // which gives us an envelope between 0 and 2.
                     // Shift that back to [-1, 1] and we have ourselves the envelope.
 
+                    // Sum carriers once for this channel, ahead of the per-slot loop,
+                    // since every slot tuned here hears the same transmitters.
+                    // This also keeps each stream's phase advancing exactly once per callback.
                     var numStreams = transmittingStreams.Count;
-                    var relativePowers = new List<float>(numStreams);
-                    var carrierOffsets = new List<float>(numStreams);
                     if (numStreams > 0)
                     {
-                        // We can make any of the carrier frequencies "0" and calculate the relative frequencies
-                        // of the other carriers off of it.
-                        // Just pick the first transmitter in the list.
-                        float zeroCarrier = (float)transmittingStreams[0].CurrentParams.RadioFrequencyKHz * 1e3f;
-                        zeroCarrier += zeroCarrier * transmittingStreams[0].CurrentParams.TuneOffsetPPM * 1e-6f;
-                        for (int i = 0; i < numStreams; ++i)
+                        Array.Clear(_mixIQ, 0, samples);
+                    }
+
+                    for (int k = 0; k < numStreams; ++k)
+                    {
+                        var txStream = transmittingStreams[k];
+                        // Read the current audio params.
+                        // Note that the physics calculations are swapping this out from under us as we go.
+                        // (See UpdatedStreamParams)
+                        var txParams = txStream.CurrentParams;
+
+                        // We need to convert from dB to linear power when weighing the signals.
+                        var relativePower = Math.Pow(10, txParams.ReceivedSnrDb / 20.0);
+
+                        // IRL the tune frequency of the _receiver_ is irrelevant so long as
+                        // all our transmitters fall within the RX bandwidth around it,
+                        // but we need a stable center frequency that all the other carriers
+                        // and their phases will be relative to.
+                        // (Previously we made everything relative to the first TX carrier,
+                        // but that might change from one callback to the next, which won't do
+                        // now that we're integrathing phase.)
+                        // This is Just Fine since our envelope is unbothered by a rotation
+                        // applied to all carriers at once - it's just the magnitude of the phasor.
+                        var offsetHz = (txParams.RadioFrequencyKHz - freqKhz) * 1e3
+                                       + txParams.RadioFrequencyKHz * 1e3 * (double)txParams.TuneOffsetPPM * 1e-6;
+
+                        var phaseStep = (TwoPi * offsetHz / SampleRate) % TwoPi;
+
+                        // Real aircraft radios don't have 100% modulation.
+                        // A bunch of the standards are paywalled, but those I've found
+                        // suggest minimum specs are 85% modulation, with 90-95% being common.
+                        // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
+                        // https://avweb.com/avionics/vhf-nav-comm-basics/
+                        const double modIndex = 0.95;
+
+                        // Even if we're past this stream's available samples
+                        // (jitter buffer shenanigans make streams different lengths)
+                        // still hold its carrier with no voice modulation.
+                        // A mid-callback carrier edge produces as a click,
+                        // worst at talkspurt start while the jitter buffer ramps up.
+                        // A stream with no samples this round isn't in transmittingStreams,
+                        // so a genuine dropout still falls back to noise within a callback.
+                        var txSamples = txStream.Samples.Span;
+                        var theta = txStream.CarrierPhase;
+                        for (int n = 0; n < samples; ++n)
                         {
-                            // We need to convert from dB to linear power when weighing the signals.
-                            var thisSnrLinear = Math.Pow(10, transmittingStreams[i].CurrentParams.ReceivedSnrDb / 20.0);
-                            relativePowers.Add((float)thisSnrLinear);
-                            if (i == 0)
-                            {
-                                carrierOffsets.Add(0);
-                            }
-                            else
-                            {
-                                var thisFreq = (float)transmittingStreams[i].CurrentParams.RadioFrequencyKHz * 1e3f;
-                                thisFreq += thisFreq * transmittingStreams[i].CurrentParams.TuneOffsetPPM * 1e-6f;
-                                carrierOffsets.Add(thisFreq - zeroCarrier);
-                            }
+                            var samp = n < txSamples.Length ? txSamples[n] : 0f;
+                            var amplitude = relativePower * (1 + samp * modIndex);
+
+                            // Sum IQ components _before_ taking the length of the vector,
+                            // as that's a nonlinear operation.
+                            _mixIQ[n].I += (float)(amplitude * Math.Cos(theta));
+                            _mixIQ[n].Q += (float)(amplitude * Math.Sin(theta));
+
+                            // Integrate the phase instead of evaluating it as
+                            // θ_k[n] = 2π · Fc_k · n / F_s,
+                            // so a carrier that changes frequency doesn't give us audible phase jumps.
+                            // Previously we would teleport the phase every physics update if Doppler changed.
+                            theta += phaseStep;
+                            if (theta >= TwoPi) theta -= TwoPi;
+                            else if (theta < 0) theta += TwoPi;
                         }
+
+                        txStream.CarrierPhase = theta;
                     }
 
                     // Run the full effects chain per slot — each slot is its own receiver
@@ -1198,38 +1269,12 @@ public class RadioPlayback : IDisposable
                             // Calculate E[n] for each sample n.
                             for (int n = 0; n < samples; ++n)
                             {
-                                // Start with our noise.
-                                double i = noiseGen?.NextSample() ?? 0.0;
-                                double q = noiseGen?.NextSample() ?? 0.0;
-                                // Real aircraft radios don't have 100% modulation.
-                                // A bunch of the standards are paywalled, but those I've found
-                                // suggest minimum specs are 85% modulation, with 90-95% being common.
-                                // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
-                                // https://avweb.com/avionics/vhf-nav-comm-basics/
-                                const double modIndex = 0.95;
-                                for (int k = 0; k < numStreams; ++k)
-                                {
-                                    // θ_k is the phasor that rotates around at each beat frequency k.
-                                    double theta = 2.0f * Math.PI * carrierOffsets[k] *
-                                        (double)(n + _sampleNum) / (double)SampleRate;
-                                    // Even if we're past this stream's available samples
-                                    // (jitter buffer shenanigans make streams different lengths)
-                                    // still hold its carrier with no voice modulation.
-                                    // A mid-callback carrier edge produces as a click,
-                                    // worst at talkspurt start while the jitter buffer ramps up.
-                                    // A stream with no samples this round isn't in transmittingStreams,
-                                    // so a genuine dropout still falls back to noise within a callback.
-                                    //
-                                    // Sum IQ components _before_ taking the length of the vector,
-                                    // as that's a nonlinear operation.
-                                    var kSamples = transmittingStreams[k].Samples;
-                                    float samp = n < kSamples.Length ? kSamples.Span[n] : 0f;
-                                    i += relativePowers[k] * (1 + samp * modIndex) * Math.Cos(theta);
-                                    q += relativePowers[k] * (1 + samp * modIndex) * Math.Sin(theta);
-                                }
+                                // Start with our noise, then add the carriers summed above.
+                                float i = (noiseGen?.NextSample() ?? 0.0f) + _mixIQ[n].I;
+                                float q = (noiseGen?.NextSample() ?? 0.0f) + _mixIQ[n].Q;
 
                                 // Take the envelope.
-                                _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
+                                _dspScratch[n] = MathF.Sqrt(i * i + q * q);
 
                                 // Update the AGC:
                                 slot.Agc.Apply(_dspScratch[n]);
@@ -1284,7 +1329,7 @@ public class RadioPlayback : IDisposable
 #if DEBUG
                             _logger.LogDebug(
                                 "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                                squelchOpened ? "OPEN" : "CLOSED", freq, slot.Agc.D1);
+                                squelchOpened ? "OPEN" : "CLOSED", freqKhz, slot.Agc.D1);
 #endif
                             slot.WasSquelchOpen = squelchOpened;
                         }
@@ -1401,9 +1446,6 @@ public class RadioPlayback : IDisposable
             }
 
             Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
-            // Keep sinusoids phase-coherent across callbacks.
-            // (At least until we roll over, but that's once every blue moon.)
-            _sampleNum += samples;
         };
 
         _masterDspProcHandle = Bass.ChannelSetDSP(_masterStream, _dspProc, IntPtr.Zero);
