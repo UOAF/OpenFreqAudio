@@ -35,7 +35,7 @@ public class RadioPlayback : IDisposable
         // in radians, wrapped to [0, 2π). Integrated per sample in so that a change
         // in carrier frequency (e.g. Doppler shift) doesn't cause audible phase jumps.
         // Only ever touched on the DSP thread.
-        public double CarrierPhase;
+        public float CarrierPhase;
 
         // Audio to play is pushed here and pulled by playback.
         public SyncRope<float> Buffer { get; } = new();
@@ -201,7 +201,7 @@ public class RadioPlayback : IDisposable
 
     private const int NoiseFadeSamples = 2400;
 
-    private const double TwoPi = 2.0 * Math.PI;
+    private const float TwoPi = 2.0f * MathF.PI;
 
     private static readonly Lock _bassInitLock = new();
 
@@ -1191,7 +1191,7 @@ public class RadioPlayback : IDisposable
                         var txParams = txStream.CurrentParams;
 
                         // We need to convert from dB to linear power when weighing the signals.
-                        var relativePower = Math.Pow(10, txParams.ReceivedSnrDb / 20.0);
+                        var relativePower = MathF.Pow(10, txParams.ReceivedSnrDb / 20.0f);
 
                         // IRL the tune frequency of the _receiver_ is irrelevant so long as
                         // all our transmitters fall within the RX bandwidth around it,
@@ -1202,8 +1202,8 @@ public class RadioPlayback : IDisposable
                         // now that we're integrathing phase.)
                         // This is Just Fine since our envelope is unbothered by a rotation
                         // applied to all carriers at once - it's just the magnitude of the phasor.
-                        var offsetHz = (txParams.RadioFrequencyKHz - freqKhz) * 1e3
-                                       + txParams.RadioFrequencyKHz * 1e3 * (double)txParams.TuneOffsetPPM * 1e-6;
+                        var offsetHz = (txParams.RadioFrequencyKHz - freqKhz) * 1e3f
+                                       + txParams.RadioFrequencyKHz * 1e3f * txParams.TuneOffsetPPM * 1e-6f;
 
                         var phaseStep = (TwoPi * offsetHz / SampleRate) % TwoPi;
 
@@ -1212,7 +1212,7 @@ public class RadioPlayback : IDisposable
                         // suggest minimum specs are 85% modulation, with 90-95% being common.
                         // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
                         // https://avweb.com/avionics/vhf-nav-comm-basics/
-                        const double modIndex = 0.95;
+                        const float modIndex = 0.95f;
 
                         // Even if we're past this stream's available samples
                         // (jitter buffer shenanigans make streams different lengths)
@@ -1230,8 +1230,8 @@ public class RadioPlayback : IDisposable
 
                             // Sum IQ components _before_ taking the length of the vector,
                             // as that's a nonlinear operation.
-                            _mixIQ[n].I += (float)(amplitude * Math.Cos(theta));
-                            _mixIQ[n].Q += (float)(amplitude * Math.Sin(theta));
+                            _mixIQ[n].I += amplitude * MathF.Cos(theta);
+                            _mixIQ[n].Q += amplitude * MathF.Sin(theta);
 
                             // Integrate the phase instead of evaluating it as
                             // θ_k[n] = 2π · Fc_k · n / F_s,
@@ -1299,9 +1299,9 @@ public class RadioPlayback : IDisposable
                         {
                             for (int n = 0; n < samples; ++n)
                             {
-                                double i = noiseGen?.NextSample() ?? 0.0;
-                                double q = noiseGen?.NextSample() ?? 0.0;
-                                _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
+                                float i = noiseGen?.NextSample() ?? 0.0f;
+                                float q = noiseGen?.NextSample() ?? 0.0f;
+                                _dspScratch[n] = MathF.Sqrt(i * i + q * q);
                                 slot.Agc.Apply(_dspScratch[n]);
 
                                 // See above.
