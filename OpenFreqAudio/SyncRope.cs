@@ -40,6 +40,17 @@ public class SyncRope<T>
         }
     }
 
+    /// <summary>Intended to immediately tell the receiver it's time to go on shutdown.</summary>
+    public void ClearAndClose()
+    {
+        lock (buffers)
+        {
+            buffers.Clear();
+            closed = true;
+            Monitor.Pulse(buffers);
+        }
+    }
+
     /// <summary>
     /// Total number of available elements
     /// </summary>
@@ -59,15 +70,16 @@ public class SyncRope<T>
     /// </summary>
     /// <returns>
     /// The number of elements copied,
-    /// or null once the channel is closed and no more are coming.
+    /// or null once the channel is closed and drained.
     /// Does NOT wait for enough elements to fill the span;
     /// see DrainExactly for that.
     /// </returns>
     public int? DrainTo(Span<T> to)
     {
         lock (buffers) {
-            if (closed) return null;
-            else return DrainLocked(to);
+            int copied = DrainLocked(to);
+            if (copied == 0 && closed) return null;
+            else return copied;
         }
     }
 
@@ -112,7 +124,9 @@ public class SyncRope<T>
     /// Extract exactly the given number of elements,
     /// blocking until at least that many have arrived.
     /// </summary>
-    /// <returns>false if we're closed and nothing more is coming.</returns>
+    /// <returns>
+    /// false once we're closed and fewer than to.Length elements remain.
+    /// </returns>
     public bool DrainExactly(Span<T> to)
     {
         lock (buffers)
@@ -127,7 +141,7 @@ public class SyncRope<T>
                     {
                         throw new Exception($"Expected to drain {to.Length} bytes, got {drained}");
                     }
-                    return !closed;
+                    return true;
                 }
                 else if (closed)
                 {

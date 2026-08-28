@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using ManagedBass;
-using ManagedBass.Enc;
 using ManagedBass.Mix;
 using Microsoft.Extensions.Logging;
 using NWaves.Filters.Butterworth;
@@ -220,12 +219,11 @@ public class RadioPlayback : IDisposable
     public void ClearSidetone() => _sidetoneBuffer.Clear();
 
     // --- Session capture (one combined stereo mix: incoming as heard with pan + own voice centered,
-    //     rendered as if heard from same position). The mix can be written to an Ogg/Vorbis file
+    //     rendered as if heard from same position). The mix can be written to an Ogg Opus file
     //     OR streamed to a separate playback device (e.g. a virtual cable). Exclusive in practice,
     //     but both sinks are supported independently here. ---
     private bool _recording;        // file sink active
-    private int _recordStream;      // dummy decode stream that sets the encoder format
-    private int _recordEncoder;     // BassEnc_Ogg handle
+    private OggOpusRecorder? _recorder;
     private bool _monitoring;       // device sink active
     private int _monitorStream;     // push stream on the monitor output device
     private OwnVoiceRadioRenderer? _ownVoiceRenderer;
@@ -310,9 +308,6 @@ public class RadioPlayback : IDisposable
                 // Use explicit path on non-Windows to avoid strange .NET lib*.so wrangling issues
                 // We don't need to free it explicitly, this is covered by BASS
                 NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassmix.so"));
-                // Session recording encoder. bassenc_ogg depends on bassenc, so load bassenc first.
-                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassenc.so"));
-                NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libbassenc_ogg.so"));
             }
         }
     }
@@ -667,10 +662,10 @@ public class RadioPlayback : IDisposable
     }
 
     /// <summary>
-    /// Start recording the session to a combined stereo Ogg/Vorbis file at <paramref name="filePath"/>.
+    /// Start recording the session to a combined stereo Ogg Opus file at <paramref name="filePath"/>.
     /// Captures incoming audio (as heard, post-FX, with pan) plus our own voice rendered as if heard
-    /// from the same position, panned centre. No-op if already recording. Encoding runs on BASSenc's
-    /// own thread.
+    /// from the same position, panned centre. No-op if already recording. Encoding runs on the
+    /// recorder's own thread.
     /// </summary>
     public void StartRecording(string filePath)
     {
@@ -678,26 +673,17 @@ public class RadioPlayback : IDisposable
         {
             if (_recording) return;
 
-            // Dummy decode stream only sets the encoder format (48k stereo float); never played.
-            int stream = Bass.CreateStream(SampleRate, 2, BassFlags.Float | BassFlags.Decode,
-                StreamProcedureType.Dummy);
-            if (stream == 0)
+            try
             {
-                RaiseUserFacingError($"Recording: failed to create encoder stream: {Bass.LastError}");
+                _recorder = new OggOpusRecorder(filePath, _logger);
+            }
+            catch (Exception ex)
+            {
+                _recorder = null;
+                RaiseUserFacingError($"Recording: failed to start Opus encoder: {ex.Message}");
                 return;
             }
 
-            // EncodeFlags.Queue → EncodeWrite copies to a queue and BASSenc encodes off the audio thread.
-            int enc = BassEnc_Ogg.Start(stream, "--quality=3", EncodeFlags.Queue, filePath);
-            if (enc == 0)
-            {
-                Bass.StreamFree(stream);
-                RaiseUserFacingError($"Recording: failed to start Ogg encoder: {Bass.LastError}");
-                return;
-            }
-
-            _recordStream = stream;
-            _recordEncoder = enc;
             EnsureCaptureRenderer();
             _recording = true;
             _logger.LogInformation("Recording started: {Path}", filePath);
@@ -707,21 +693,18 @@ public class RadioPlayback : IDisposable
     /// <summary>Stop and finalize the session recording. No-op if not recording.</summary>
     public void StopRecording()
     {
-        int enc, stream;
+        OggOpusRecorder? recorder;
         lock (_lock)
         {
             if (!_recording) return;
             _recording = false;
-            enc = _recordEncoder;
-            stream = _recordStream;
-            _recordEncoder = 0;
-            _recordStream = 0;
+            recorder = _recorder;
+            _recorder = null;
             ClearCaptureRendererIfIdle();
         }
 
-        // Free outside the lock — EncodeStop flushes the queue.
-        if (enc != 0) BassEnc.EncodeStop(enc);
-        if (stream != 0) Bass.StreamFree(stream);
+        // Dispose outside the lock — it drains the queue and joins the encode thread.
+        recorder?.Dispose();
         _logger.LogInformation("Recording stopped");
     }
 
@@ -1010,9 +993,9 @@ public class RadioPlayback : IDisposable
             Dictionary<int, List<RadioConfig>> tunedSlotsByFreq;
             // What should we mute because we're talking on it?
             HashSet<int> transmittingFrequencies;
-            // Capture state snapshot (encoder / monitor handles stay valid for this callback).
+            // Capture state snapshot (recorder / monitor handle stay valid for this callback).
             bool capturing;
-            int recordEncoder;
+            OggOpusRecorder? recorder;
             int monitorStream;
             OwnVoiceRadioRenderer? ownVoiceRenderer;
             lock (_lock)
@@ -1021,7 +1004,7 @@ public class RadioPlayback : IDisposable
                 streams = _streams.Values.ToList();
 
                 capturing = Capturing;
-                recordEncoder = _recordEncoder;
+                recorder = _recorder;
                 monitorStream = _monitorStream;
                 ownVoiceRenderer = _ownVoiceRenderer;
 
@@ -1402,7 +1385,7 @@ public class RadioPlayback : IDisposable
             // incoming side is "as heard" minus our own raw mic loopback. Our own voice
             // is added back rendered through the radio FX (CaptureRecordingFrame).
             if (capturing)
-                CaptureRecordingFrame(samples, recordEncoder, monitorStream, ownVoiceRenderer);
+                CaptureRecordingFrame(samples, recorder, monitorStream, ownVoiceRenderer);
 
             // Sidetone: mix own voice (mono) into stereo output
             // No AGC/ALC
@@ -1468,9 +1451,9 @@ public class RadioPlayback : IDisposable
     /// <summary>
     /// Build one stereo recording frame (incoming as heard, with pan, + own voice rendered as
     /// if heard from the same position and panned centre) and feed it to the encoder. Runs on
-    /// the DSP thread; the encode itself happens on BASSenc's thread (EncodeFlags.Queue).
+    /// the DSP thread; the encode itself happens on the recorder's own thread.
     /// </summary>
-    private void CaptureRecordingFrame(int samples, int encoder, int monitorStream,
+    private void CaptureRecordingFrame(int samples, OggOpusRecorder? recorder, int monitorStream,
         OwnVoiceRadioRenderer? renderer)
     {
         int stereo = samples * 2;
@@ -1505,11 +1488,11 @@ public class RadioPlayback : IDisposable
             }
         }
 
-        int bytes = stereo * sizeof(float);
-        // File sink: queued to BASSenc's own thread.
-        if (encoder != 0) BassEnc.EncodeWrite(encoder, _recordStereo, bytes);
+        // File sink: queued to the recorder's own encode thread.
+        recorder?.Write(_recordStereo.AsSpan(0, stereo));
         // Device sink: push to the monitor output stream (its device pulls at its own rate).
-        if (monitorStream != 0) Bass.StreamPutData(monitorStream, _recordStereo, bytes);
+        if (monitorStream != 0)
+            Bass.StreamPutData(monitorStream, _recordStereo, stereo * sizeof(float));
     }
 
     public async Task StopAll()
