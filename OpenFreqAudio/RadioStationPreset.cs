@@ -3,7 +3,6 @@ namespace OpenFreqAudio;
 /// <summary>
 /// Preset configuration for different types of radio stations with realistic parameters
 /// Platform altitude (MSL) is handled separately.
-/// Band-specific characteristics (VHF/UHF) are handled via RadioType enum.
 /// </summary>
 public class RadioStationPreset
 {
@@ -61,34 +60,6 @@ public class RadioStationPreset
 
     public override int GetHashCode() => Name?.GetHashCode() ?? 0;
 
-    /// <summary>
-    /// Get TX power for the specified radio type
-    /// </summary>
-    public double GetTxPower(BackgroundNoiseGenerator.RadioType radioType)
-    {
-        return radioType switch
-        {
-            BackgroundNoiseGenerator.RadioType.VHF_AM => TxPower_VHF_W,
-            BackgroundNoiseGenerator.RadioType.UHF_AM => TxPower_UHF_W,
-            BackgroundNoiseGenerator.RadioType.UHF_FM => TxPower_UHF_W * 1.5, // FM typically uses more power
-            _ => TxPower_VHF_W
-        };
-    }
-
-    /// <summary>
-    /// Get RX sensitivity for the specified radio type
-    /// </summary>
-    public double GetRxSensitivity(BackgroundNoiseGenerator.RadioType radioType)
-    {
-        return radioType switch
-        {
-            BackgroundNoiseGenerator.RadioType.VHF_AM => RxSensitivity_VHF_dBm,
-            BackgroundNoiseGenerator.RadioType.UHF_AM => RxSensitivity_UHF_dBm,
-            BackgroundNoiseGenerator.RadioType.UHF_FM => RxSensitivity_UHF_dBm + 3.0, // FM has worse sensitivity (less negative)
-            _ => RxSensitivity_VHF_dBm
-        };
-    }
-    
     public static bool IsVHF(int frequencyKhz)
     {
         return frequencyKhz < 200000; // 200 MHz = 200000 kHz
@@ -121,7 +92,7 @@ public static class RadioStationPresets
         antennaElevation: 2.0,
         txPowerVhf: 10.0, // AN/ARC-210: 10W VHF
         rxSensitivityVhf: -110.0,
-        txPowerUhf: 10.0, // AN/ARC-210: 10W UHF AM (20W FM handled in GetTxPower)
+        txPowerUhf: 10.0, // AN/ARC-210: 10W UHF AM
         rxSensitivityUhf: -107.0,
         minPpm: 0.1, // Modern OCXO in AN/ARC-210
         maxPpm: 0.5,

@@ -16,8 +16,38 @@ namespace OpenFreqAudio;
 /// </summary>
 public class RadioPlayback : IDisposable
 {
+    // AGC attack and decay are exponential functions -
+    // for a time constant tau, if Fs is our sample rate,
+    // AGC ramps down each sample at e^(-1/tau * Fs).
+    // This means we ramp about 95% of the way in 3 tau,
+    // 99% of the way in 4.6 tau, etc.
+    // See: https://en.wikipedia.org/wiki/RC_circuit
+    //
+    // Radio specifications I found suggest AGC should attack
+    // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms;
+    // published figures for AM put the decay at 0.1-0.3 s.
+    // (We want to quickly attenuate as someone starts talking,
+    // then hold their level constant-ish, not crank the gain if they pause.)
+    // Pick time constants which are about a third of those.
+    // (Feel free to tune these by ear!)
     public const double AgcAttack = 0.003f / 3;
-    public const double AgcDecay = 0.01f / 3;
+    public const double AgcDecay = 0.1f / 3;
+
+    // Time constant of the squelch detector, which is deliberately separate from the AGC
+    // and about ten times slower.
+    //
+    // The AGC needs a fast attack, but this makes it a peak tracker,
+    // and VHF background noise is impulsive — along with a constnat Gaussian "hiss"
+    // from thermal noise, it has a crackle that comes from Poisson-distributed spikes,
+    // both man-made and cosmic. (See BackgroundNoiseGenerator for more details.)
+    // Driving the gate from the AGC therefore lets these sudden peaks break squelch even
+    // with nobody transmitting. Their short duration (~125 us based on the passband) means
+    // they're too fast for AGC to respond, which makes them quite loud as well.
+    //
+    // A real noise-operated or RSSI squelch instead averages over tens of ms, where a 125 us
+    // impulse is worth about 1% of the window. Measured over 295 s of noise at 127 MHz, at
+    // the same threshold: 1.01 breaks/s from the AGC, 0.25/s at tau = 3 ms, none at 10 ms.
+    public const double SquelchTau = 0.010;
 
     private class RadioStream
     {
@@ -126,21 +156,8 @@ public class RadioPlayback : IDisposable
         // according to attack and decay params below.
         public AttackDecayFilter Agc = AttackDecayFilter.MakeAttackDecayFilter(AgcAttack, AgcDecay, SampleRate);
 
-        // AGC attack and decay are exponential functions -
-        // for a time constant tau, if Fs is our sample rate,
-        // AGC ramps down each sample at e^(-1/tau * Fs).
-        // This means we ramp about 95% of the way in 3 tau,
-        // 99% of the way in 4.6 tau, etc.
-        // See: https://en.wikipedia.org/wiki/RC_circuit
-        //
-        // Radio specifications I found suggest AGC should attack
-        // (ramp up) in about ~3ms, and decay (ramp down) in ~100ms,
-        // but ramping down faster (say 10-20ms) gives us quick clicks
-        // even when in close formation, and produces cool-sounding
-        // distortions when barely coming through.
-        // Pick time constants about a third of those values
-        // to get the intended effect. (Feel free to tune these by ear!)
-        // Values live on RadioPlayback.AgcAttack/AgcDecay (shared with OwnVoiceRadioRenderer).
+        public FirstOrderFilter SquelchDetector =
+            FirstOrderFilter.MakeFirstOrderFilter(SquelchTau, SampleRate, 1.0);
     }
 
 
@@ -1160,10 +1177,7 @@ public class RadioPlayback : IDisposable
                     // since every slot tuned here hears the same transmitters.
                     // This also keeps each stream's phase advancing exactly once per callback.
                     var numStreams = transmittingStreams.Count;
-                    if (numStreams > 0)
-                    {
-                        Array.Clear(_mixIQ, 0, samples);
-                    }
+                    Array.Clear(_mixIQ, 0, samples);
 
                     for (int k = 0; k < numStreams; ++k)
                     {
@@ -1235,68 +1249,53 @@ public class RadioPlayback : IDisposable
                         if (slot.IsNoiseMuted) continue;
 
                         // Typical squelch is at +6 dB, which is a factor of 2x.
+                        // The detector tracks mean power, so gate on the square of that.
                         float squelchThreshold = slot.SquelchLevel * 2.0f;
+                        float squelchPower = squelchThreshold * squelchThreshold;
                         // True if squelch opened at any point in this set of samples.
                         bool squelchOpened = false;
 
                         // Noise is always there!
                         // The question is just "how loud compared to the signal?"
                         // (What's the SNR?)
-                        // We draw independent I and Q noise per sample below - if we used
-                        // I_noise[n] = Q_noise[n], we wouldn't have random noise,
-                        // we'd have a single signal with a fixed phase (45 deg).
+                        // I and Q have to stay independent - if they're correlated at all,
+                        // the detected noise power depends on where the carriers sit in
+                        // phase, and that phase rotates with Doppler. See
+                        // BackgroundNoiseGenerator, which is built around exactly that.
+                        // With no transmitters _mixIQ is zeroed, so this is also the
+                        // noise-only case: the AGC just decays back to unity.
                         var noiseGen = slot.NoiseGenerator;
 
-                        if (numStreams > 0)
+                        // Calculate E[n] for each sample n.
+                        for (int n = 0; n < samples; ++n)
                         {
-                            // Calculate E[n] for each sample n.
-                            for (int n = 0; n < samples; ++n)
+                            // Start with our noise, then add the carriers summed above.
+                            float ni = 0f, nq = 0f;
+                            noiseGen?.Next(out ni, out nq);
+                            float i = ni + _mixIQ[n].I;
+                            float q = nq + _mixIQ[n].Q;
+
+                            // Take the envelope.
+                            _dspScratch[n] = MathF.Sqrt(i * i + q * q);
+
+                            // Update the AGC, which sets the playback level...
+                            slot.Agc.Apply(_dspScratch[n]);
+
+                            // ...and the squelch detector, which decides whether we hear
+                            // anything at all. It follows mean power over a longer
+                            // window, so a noise impulses gets ignored.
+                            slot.SquelchDetector.Apply(_dspScratch[n] * _dspScratch[n]);
+
+                            // NB: Handle squelch per sample, before the band-pass smooths the edges!
+                            // We don't want to gate the whole buffer (or not!) based on a single value.
+                            if (slot.SquelchDetector.D1 >= squelchPower)
                             {
-                                // Start with our noise, then add the carriers summed above.
-                                float i = (noiseGen?.NextSample() ?? 0.0f) + _mixIQ[n].I;
-                                float q = (noiseGen?.NextSample() ?? 0.0f) + _mixIQ[n].Q;
-
-                                // Take the envelope.
-                                _dspScratch[n] = MathF.Sqrt(i * i + q * q);
-
-                                // Update the AGC:
-                                slot.Agc.Apply(_dspScratch[n]);
-
-                                // Squelch is driven by the AGC gain.
-                                // When it starts attenuating, we know we hear something.
-                                // NB: Handle squelch per sample, before the band-pass smooths the edges!
-                                // We don't want to gate the whole buffer (or not!) based on a single AGC value.
-                                if (slot.Agc.D1 >= squelchThreshold)
-                                {
-                                    _dspScratch[n] = _dspScratch[n] / slot.Agc.D1;
-                                    squelchOpened = true;
-                                }
-                                else
-                                {
-                                    _dspScratch[n] = 0;
-                                }
+                                _dspScratch[n] = _dspScratch[n] / slot.Agc.D1;
+                                squelchOpened = true;
                             }
-                        }
-                        // Nothing is transmitting except noise, decay AGC back to unity.
-                        else
-                        {
-                            for (int n = 0; n < samples; ++n)
+                            else
                             {
-                                double i = noiseGen?.NextSample() ?? 0.0;
-                                double q = noiseGen?.NextSample() ?? 0.0;
-                                _dspScratch[n] = (float)Math.Sqrt(i * i + q * q);
-                                slot.Agc.Apply(_dspScratch[n]);
-
-                                // See above.
-                                if (slot.Agc.D1 >= squelchThreshold)
-                                {
-                                    _dspScratch[n] = _dspScratch[n] / slot.Agc.D1;
-                                    squelchOpened = true;
-                                }
-                                else
-                                {
-                                    _dspScratch[n] = 0;
-                                }
+                                _dspScratch[n] = 0;
                             }
                         }
 
@@ -1310,9 +1309,13 @@ public class RadioPlayback : IDisposable
                         if (squelchOpened != slot.WasSquelchOpen)
                         {
 #if DEBUG
+                            // The detector is mean power against a unit-power noise floor,
+                            // so this is an honest C/N in dB — unlike the AGC gain it replaced,
+                            // which this line had been printing with a dB suffix.
                             _logger.LogDebug(
-                                "SQUELCH {State} (Freq: {Frequency}, SNR={SNR:F1}dB)",
-                                squelchOpened ? "OPEN" : "CLOSED", freqKhz, slot.Agc.D1);
+                                "SQUELCH {State} (Freq: {Frequency}, Carrier SNR={CarrierToNoise:F1}dB)",
+                                squelchOpened ? "OPEN" : "CLOSED", freqKhz,
+                                10.0 * Math.Log10(Math.Max(slot.SquelchDetector.D1, 1e-12f)));
 #endif
                             slot.WasSquelchOpen = squelchOpened;
                         }
@@ -1363,9 +1366,10 @@ public class RadioPlayback : IDisposable
                     {
                         if (slot.IsNoiseMuted) continue;
 
-                        // Set AGC back to unity so there's not sudden jumps
-                        // when we turn FX back on.
+                        // Drop both detectors back down so there's not sudden jumps when we
+                        // turn FX back on.
                         slot.Agc.D1 = 1;
+                        slot.SquelchDetector.D1 = 1;
 
                         float mv = MasterVolume;
                         float panAngle  = (slot.Pan + 100) / 200f * MathF.PI / 2f;

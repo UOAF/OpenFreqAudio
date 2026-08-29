@@ -14,7 +14,7 @@ namespace OpenFreqAudio;
 ///   2. AM envelope + background noise + AGC: the radio sound. The AGC is bounded here
 ///      (unlike a bare-voice AGC) because the carrier + noise floor are always present.
 ///   3. 300–3000 Hz band-pass
-///   4. squelch gate: opens when the AGC-tracked signal level crosses the threshold and
+///   4. squelch gate: opens when the slowly-tracked received power crosses the threshold and
 ///      tails out (noise swell) when the carrier drops on key-up, exactly like the incoming
 ///      per-slot gate.
 ///
@@ -29,11 +29,15 @@ public sealed class OwnVoiceRadioRenderer
 
     // Default per-slot squelch gate: slot.SquelchLevel (1.0) * 2f, as in RadioPlayback fan-out.
     private const float SquelchThreshold = 2f;
+    // The squelch detector follows mean power, so gate on the square of that.
+    private const float SquelchPowerThreshold = SquelchThreshold * SquelchThreshold;
 
     private readonly RadioEffect _effect;
 
     // ALC + AGC time constants are shared with the receive chain — see RadioPlayback.
     private readonly AttackDecayFilter _agc;
+    // Squelch runs off its own, much slower detector; see RadioPlayback.SquelchTau.
+    private readonly FirstOrderFilter _squelch;
     private readonly HighPassFilter _highPass;
     private readonly LowPassFilter _lowPass;
     private readonly int _sampleRate;
@@ -58,6 +62,9 @@ public sealed class OwnVoiceRadioRenderer
         _effect = new RadioEffect(sampleRate, 1, initial, logger);
         _agc = AttackDecayFilter.MakeAttackDecayFilter(
             RadioPlayback.AgcAttack, RadioPlayback.AgcDecay, sampleRate);
+        // Unit-power noise, so 1.0 is the floor the gate is measured against.
+        _squelch = FirstOrderFilter.MakeFirstOrderFilter(
+            RadioPlayback.SquelchTau, sampleRate, 1.0);
         _highPass = new HighPassFilter(300.0 / sampleRate, 3);
         _lowPass = new LowPassFilter(3000.0 / sampleRate, 6);
         ApplyParams(initial);
@@ -114,19 +121,24 @@ public sealed class OwnVoiceRadioRenderer
             float a = carrierOn ? _relativePower : 0f;
             float samp = carrierOn ? buffer[i] : 0f;
 
-            double iComp = _noise.NextSample() + a * (1 + samp * ModIndex);
-            double qComp = _noise.NextSample();
+            // I and Q must come from independent draws; see BackgroundNoiseGenerator.
+            _noise.Next(out float ni, out float nq);
+            double iComp = ni + a * (1 + samp * ModIndex);
+            double qComp = nq;
             float env = (float)Math.Sqrt(iComp * iComp + qComp * qComp);
 
             _agc.Apply(env);
+            _squelch.Apply(env * env);
             float norm = env / _agc.D1;
 
             // 3. Band-pass for the radio tone (run the filters every sample for continuity).
             norm = _lowPass.Process(_highPass.Process(norm));
 
-            // 4. Squelch gate: open while the signal level is above threshold; tails out as
-            //    the AGC decays after the carrier drops, then cuts to silence.
-            buffer[i] = _agc.D1 >= SquelchThreshold ? norm : 0f;
+            // 4. Squelch gate: open while the mean received power is above threshold; tails
+            //    out as the detector decays after the carrier drops, then cuts to silence.
+            //    Gated on that rather than on the AGC so impulsive VHF noise can't pop it
+            //    open between transmissions — see RadioPlayback.SquelchTau.
+            buffer[i] = _squelch.D1 >= SquelchPowerThreshold ? norm : 0f;
         }
     }
 }
