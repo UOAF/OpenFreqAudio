@@ -52,6 +52,14 @@ namespace OpenFreqAudio
         // SNR compared to the noise floor of the receiver (thermal + noise figure)
         public float ReceivedSnrDb;
 
+        // Free-space path loss (dB, >= 0) over the slant range. Already folded into ReceivedDb;
+        // kept so the receive path can log the budget. Zero when we had no positions to work with.
+        public float FreeSpaceLossDb;
+
+        // Delta-Bullington terrain diffraction loss (dB, >= 0). Also already folded into ReceivedDb.
+        // Zero when the first Fresnel zone was proven clear, or the path was too short to profile.
+        public float TerrainLossDb;
+
         // fast multipath flutter (events per second, can exceed 1.0). A function of SNR, but cached here.
         public float DropoutRate;
 
@@ -68,7 +76,7 @@ namespace OpenFreqAudio
 
         public override string ToString()
         {
-            return $"ReceivedDb: {ReceivedDb}, ReceivedSnrDb: {ReceivedSnrDb}, DropoutRate : {DropoutRate}, DeepFadeRate: {DeepFadeRate}, TuneOffsetPPM: {TuneOffsetPPM}";
+            return $"ReceivedDb: {ReceivedDb}, ReceivedSnrDb: {ReceivedSnrDb}, FreeSpaceLossDb: {FreeSpaceLossDb}, TerrainLossDb: {TerrainLossDb}, DropoutRate : {DropoutRate}, DeepFadeRate: {DeepFadeRate}, TuneOffsetPPM: {TuneOffsetPPM}";
         }
         
     }
@@ -311,6 +319,7 @@ namespace OpenFreqAudio
             // Free-space path loss
             double freqHz = frequencyKhz * 1e3; // kHz to Hz
             double fspl = FSPL_dB(dist, freqHz);
+            ap.FreeSpaceLossDb = (float)fspl;
 
             // Weather attenuation (light rain/fog)
             double weatherLoss = weatherDbPerKm * (dist / 1000.0);
@@ -468,7 +477,10 @@ namespace OpenFreqAudio
             // Skipped entirely when the pyramid proved the first Fresnel zone is clear,
             // otherwise see DeltaBullington for details.
             if (!allClear)
-                ap.ReceivedDb -= (float)DeltaBullington.Loss(profile, txAltVal, rxAltVal, wavelength, effectiveEarthRadius);
+            {
+                ap.TerrainLossDb = (float)DeltaBullington.Loss(profile, txAltVal, rxAltVal, wavelength, effectiveEarthRadius);
+                ap.ReceivedDb -= ap.TerrainLossDb;
+            }
             ap.ReceivedSnrDb = ap.ReceivedDb - (float)rxSensitivity;
             ap.DropoutRate = CalculateDropoutRate(ap.ReceivedSnrDb, bandConfig);
             ap.DeepFadeRate = CalculateDeepFadeRate(ap.ReceivedSnrDb, bandConfig);
