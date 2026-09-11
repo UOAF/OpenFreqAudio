@@ -519,10 +519,6 @@ public class RadioPlayback : IDisposable
 
             _logger.LogInformation("Stream '{StreamId}' on {Frequency:F3} MHz", streamId,
                 audioParams.RadioFrequencyKHz / 1000.0);
-            _logger.LogInformation("  SampleRate={SampleRate}, Channels={Channels}", sampleRate, channels);
-            _logger.LogInformation(
-                "  RingBuffer: {RingFrames} frames × {Channels} ch = {RingCapacity} samples ({Duration:F1}s)",
-                ringFrames, Math.Max(1, channels), ringCapacity, (float)ringFrames / sampleRate);
 
             _streams.Add(streamId, newStream);
         }
