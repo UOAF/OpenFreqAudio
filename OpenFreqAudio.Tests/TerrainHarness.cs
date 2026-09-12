@@ -9,8 +9,9 @@ namespace OpenFreqAudio.Tests
     /// <summary>
     /// Builds a synthetic DEM on disk from a 1-D elevation function (terrain varies
     /// along columns/x, constant along rows/y) and wires up a <see cref="FastPathAudioSim"/>
-    /// over it. cellSize = 1 m and origin = (0,0), so world-x equals the DEM column and a
-    /// horizontal path's along-track distance equals (sampleX - txX) in meters.
+    /// over it. Origin = (0,0) and cellSize defaults to 1 m, so by default world-x equals the
+    /// DEM column and a horizontal path's along-track distance equals (sampleX - txX) in meters.
+    /// Pass a larger cellSize for long paths.
     ///
     /// The DEM stores int16 feet; HeightPyramid/FastPathAudioSim convert with *0.3048, so
     /// elevations round-trip to within ~0.15 m of the requested meters.
@@ -23,7 +24,8 @@ namespace OpenFreqAudio.Tests
         private readonly HeightPyramid _pyramid;
         private readonly string _path;
 
-        public TerrainHarness(int width, int height, Func<int, double> elevationMetersByCol)
+        public TerrainHarness(int width, int height, Func<int, double> elevationMetersByCol,
+            double cellSizeMeters = 1.0)
         {
             // HeightPyramid requires a DEM at least 32×32 (its first level is a 32× max-pool).
             // Terrain varies only along columns here, so padding rows is behaviourally inert.
@@ -46,7 +48,7 @@ namespace OpenFreqAudio.Tests
             File.WriteAllBytes(_path, bytes);
 
             _pyramid = HeightPyramid.FromFile(_path, width, height);
-            Sim = new FastPathAudioSim(_pyramid, originX: 0.0, originY: 0.0, cellSizeMeters: 1.0,
+            Sim = new FastPathAudioSim(_pyramid, originX: 0.0, originY: 0.0, cellSizeMeters: cellSizeMeters,
                 NullLogger<FastPathAudioSim>.Instance);
         }
 

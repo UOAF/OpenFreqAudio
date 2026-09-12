@@ -509,37 +509,58 @@ namespace OpenFreqAudio
             return (delta, L1, L2, sinPsi);
         }
 
+        // Refractivity model constants (SAND2012-10690 §3.1, eqs 23-25)
+        private const double GlobalSurfaceRefractivity = 324.8; // N_s: average global surface refractivity (Altshuler)
+        private const double RefractivityBreakpointAltitude = 12192.0; // h_b: 40 kft, chosen for the 0-50 kft range
+        private const double BreakpointRefractivity = 66.65; // N_b: Bean & Thayer's upper segment evaluated at h_b
+
         /// <summary>
-        /// Calculates average atmospheric refractivity factor k_avg
-        /// Based on SAND2012-10690, section 3.2.3
-        /// Used to compute effective Earth radius: R_eff = k_avg * R_earth
+        /// Average effective Earth radius factor k for a path between two altitudes (m MSL),
+        /// used as R_eff = k * EarthRadius. Symmetric in its arguments.
         /// </summary>
-        public static double CalculateKAvg(double senderAltitude, double receiverAltitude)
+        /// <remarks>
+        /// SAND2012-10690 §3.2.3, "Method 2 - Average Radius of Curvature", which the report
+        /// recommends as the best single formula (§3.5). Refractivity decays exponentially above
+        /// the surface h_s: N(h) = N_s e^{-(h - h_s)/H_b}, with H_b = (h_b - h_s) / ln(N_s / N_b)
+        /// (eqs 23-24). That makes a ray's radius of curvature
+        /// rho(h) = H_b e^{(h - h_s)/H_b} / (1e-6 N_s cos psi) (eq 30), and k = 1 / (1 - R_e / rho_avg) (eq 37).
+        ///
+        /// The report derives this for a radar looking down at a target on the ground, averaging
+        /// rho from h_s up to the aircraft. We need any two antennas, so:
+        /// - h_s is sea level. N_s stays anchored to the ground instead of either antenna,
+        ///   and elevated sites still see thinner air (N ≈ 267 at 1500 m), consistent with the
+        ///   report's note that high terrain has lower surface refractivity.
+        /// - rho is averaged over the altitudes the path spans, [lo, hi]. With lo = 0 this is exactly
+        ///   eq 37. It ignores long paths sagging below the lower antenna, which underestimates k a bit.
+        /// - cos psi = 1, as the report allows for shallow angles. Steep paths are short enough that
+        ///   Earth curvature barely matters for them.
+        ///
+        /// This previously used the receiver's altitude as h_s, which drove H_b to zero as the receiver
+        /// approached h_b: k went negative, and the two-ray divergence term produced NaN.
+        /// </remarks>
+        public static double CalculateKAvg(double altitudeA, double altitudeB)
+            => CalculateKAvg(altitudeA, altitudeB, GlobalSurfaceRefractivity);
+
+        /// <summary>
+        /// <see cref="CalculateKAvg(double, double)"/> with a given surface refractivity N_s, in N-units.
+        /// </summary>
+        internal static double CalculateKAvg(double altitudeA, double altitudeB, double surfaceRefractivity)
         {
+            double lo = Math.Max(0.0, Math.Min(altitudeA, altitudeB));
+            double hi = Math.Max(0.0, Math.Max(altitudeA, altitudeB));
 
+            // H_b, the height over which refractivity decays by a factor of e (eq 24, h_s = 0)
+            double scaleHeight = RefractivityBreakpointAltitude / Math.Log(surfaceRefractivity / BreakpointRefractivity);
+            // R_e / rho at sea level
+            double surfaceCurvatureRatio = 1e-6 * surfaceRefractivity * EarthRadius / scaleHeight;
 
-            if (senderAltitude < 0) senderAltitude = 0;
-            if (receiverAltitude < 0) receiverAltitude = 0;
+            // Averaging rho over [lo, hi] gives rho(lo) * (e^u - 1) / u, where u = (hi - lo) / H_b.
+            // We need the reciprocal, u / (e^u - 1), which goes to 1 as the altitudes meet.
+            // Use its series there instead of dividing 0 by 0.
+            double u = (hi - lo) / scaleHeight;
+            double spanFactor = u < 1e-6 ? 1.0 - 0.5 * u : u / (Math.Exp(u) - 1.0);
 
-            double altitudeDiff = senderAltitude - receiverAltitude;
-            if (altitudeDiff == 0) return 1.0;
-
-            // Atmospheric refractivity constants
-            const double N_s = 324.8; // Average global surface refractivity (Altshuler)
-            const double h_b = 12192; // Breakpoint altitude in meters (~40k ft)
-            // const double N_b = 66.65; // Breakpoint refractivity
-            const double LogNsOverNb = 1.5829767628777844; // Precomputed Math.Log(N_s / N_b)
-
-            double H_b = (h_b - receiverAltitude) / LogNsOverNb;
-            double altDiffOverHb = altitudeDiff / H_b;
-
-            // psi_g = 0 (grazing angle negligible per section 3.2)
-            // Therefore Math.Cos(psi_g) = 1.0
-            double term1 = (1e-6 * N_s * EarthRadius) / H_b;
-            double term3 = Math.Exp(altDiffOverHb) - 1.0;
-            double kAvg = 1.0 / (1.0 - term1 * (altDiffOverHb / term3));
-
-            return kAvg;
+            return 1.0 / (1.0 - surfaceCurvatureRatio * Math.Exp(-lo / scaleHeight) * spanFactor);
         }
 
         public static AudioParams GetDefaultAudioParams(int frequencyKhz, float ppm = 0f)
