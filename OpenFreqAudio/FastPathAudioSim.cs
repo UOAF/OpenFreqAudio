@@ -125,7 +125,6 @@ namespace OpenFreqAudio
 
         private readonly HeightPyramid pyramid;
         private readonly double originX, originY, cellSizeMeters;
-        private readonly double weatherDbPerKm = 0.02;
         private readonly ILogger<FastPathAudioSim> _logger;
 
         public FastPathAudioSim(HeightPyramid pyramid, double originX, double originY, double cellSizeMeters,
@@ -321,12 +320,11 @@ namespace OpenFreqAudio
             double fspl = FSPL_dB(dist, freqHz);
             ap.FreeSpaceLossDb = (float)fspl;
 
-            // Weather attenuation (light rain/fog)
-            double weatherLoss = weatherDbPerKm * (dist / 1000.0);
-
             // Atmospheric refraction (effective Earth radius)
             double kAvg = CalculateKAvg(txAltVal, rxAltVal);
             double effectiveEarthRadius = kAvg * EarthRadius;
+
+            // No atmospheric absorption: per ITU-R P.676/P.838 it's under ~1 dB even at the radio horizon.
 
             // Get band configuration for this frequency
             RadioBandConfig bandConfig = GetBandConfig(frequencyKhz);
@@ -336,7 +334,7 @@ namespace OpenFreqAudio
                                    (RadioStationPreset.IsVHF(frequencyKhz) ? -113.0 : -107.0);
 
             // Received power before terrain effects
-            ap.ReceivedDb = (float)(txPowerDbm - fspl - weatherLoss);
+            ap.ReceivedDb = (float)(txPowerDbm - fspl);
 
             // Sample terrain profile
             var (profile, allClear) = SampleProfile(txXVal, txYVal, rxXVal, rxYVal,
