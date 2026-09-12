@@ -858,8 +858,7 @@ public class RadioPlayback : IDisposable
                 slot = new RadioConfig();
                 _slots[key] = slot;
             }
-            // Headroom up to 4x (+12 dB)
-            slot.Volume = Math.Clamp(volume, -4f, 4f);
+            slot.Volume = volume;
         }
     }
 
