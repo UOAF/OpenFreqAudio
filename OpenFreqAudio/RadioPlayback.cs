@@ -51,7 +51,6 @@ public class RadioPlayback : IDisposable
 
     private class RadioStream
     {
-        private ILogger _logger;
         public string StreamId { get; set; } = "";
         public int FrequencyKHz { get; set; }
         public int BassStreamHandle { get; set; } // 0 for push streams
@@ -73,11 +72,6 @@ public class RadioPlayback : IDisposable
         // A view of Scratch that contains valid samples.
         // (Should we have some method fill scratch and set this?)
         public Memory<float> Samples { get; set; }
-
-        public RadioStream(ILogger logger)
-        {
-            _logger = logger;
-        }
 
         // For file-based streams we run a reader task that decodes and pushes into the ring
         public CancellationTokenSource? FileReaderCts { get; set; }
@@ -102,12 +96,6 @@ public class RadioPlayback : IDisposable
                 FileReaderCts = null;
                 FileReaderTask = null;
             }
-        }
-
-        // Clear ring buffer (used for timeout/crash cleanup)
-        public void ClearRingBuffer()
-        {
-            Buffer.Clear();
         }
     }
 
@@ -240,8 +228,6 @@ public class RadioPlayback : IDisposable
     // Baseband is 8 kHz (4kHz Nyquist)
     // NB: Opus only accepts 8000, 12000, 16000, 24000, or 48000 Hz
     public const int SampleRate = 48000;
-
-    private const int NoiseFadeSamples = 2400;
 
     private const double TwoPi = 2.0 * Math.PI;
 
@@ -388,7 +374,7 @@ public class RadioPlayback : IDisposable
             if (info.Channels != 1)
                 throw new Exception($"BASS error: expected mono, got {info.Channels} channels");
 
-            var stream = new RadioStream(_logger)
+            var stream = new RadioStream
             {
                 StreamId = streamId,
                 FrequencyKHz = audioParams.RadioFrequencyKHz,
@@ -523,7 +509,7 @@ public class RadioPlayback : IDisposable
         }
 
         // Build the stream object outside the lock
-        var newStream = new RadioStream(_loggerFactory.CreateLogger<RadioStream>())
+        var newStream = new RadioStream
         {
             StreamId = streamId,
             FrequencyKHz = audioParams.RadioFrequencyKHz,
@@ -885,14 +871,6 @@ public class RadioPlayback : IDisposable
                 _slots[key] = slot;
             }
             slot.Volume = volume;
-        }
-    }
-
-    public float GetFrequencyVolume(int frequencyKHz, Guid slotId)
-    {
-        lock (_lock)
-        {
-            return _slots.TryGetValue((frequencyKHz, slotId), out var slot) ? slot.Volume : 0f;
         }
     }
 
@@ -1618,38 +1596,9 @@ public class RadioPlayback : IDisposable
         lock (_lock) return _streams.Keys.ToList();
     }
 
-    public List<string> GetStreamsOnFrequency(int frequencyKHz)
-    {
-        lock (_lock)
-            return _streams.Values.Where(s => s.FrequencyKHz == frequencyKHz).Select(s => s.StreamId).ToList();
-    }
-
     public bool IsStreamActive(string id)
     {
         lock (_lock) return _streams.TryGetValue(id, out _);
-    }
-
-    public List<int> GetActiveFrequencies()
-    {
-        lock (_lock) return _streams.Values.Select(s => s.FrequencyKHz).Distinct().OrderBy(x => x).ToList();
-    }
-
-    public AudioParams? GetStreamParams(string id)
-    {
-        lock (_lock)
-        {
-            if (_streams.TryGetValue(id, out var s)) return s.CurrentParams;
-            return null;
-        }
-    }
-
-    public int? GetStreamFrequency(string id)
-    {
-        lock (_lock)
-        {
-            if (_streams.TryGetValue(id, out var s)) return s.FrequencyKHz;
-            return null;
-        }
     }
 
     public void ChangeOutputDevice(int newDeviceIndex)
@@ -1758,22 +1707,6 @@ public class RadioPlayback : IDisposable
             RaiseUserFacingError(
                 "Audio playback lost — failed to restore previous output device. Please select a device in Settings.");
             _logger.LogError(ex, "Failed to restore BASS playback on device {Index}", deviceIndex);
-        }
-    }
-
-
-    /// <summary>
-    /// Called when WebSocket signals PTT press (optional - RTP markers are primary)
-    /// </summary>
-    public void OnWebSocketPTTPress(string streamId)
-    {
-        lock (_lock)
-        {
-            if (!_streams.TryGetValue(streamId, out var stream)) return;
-
-            // WebSocket arrives before RTP packets typically
-            // Just log for validation - RTP start marker will trigger actual transmission start
-            _logger.LogDebug("PTT pressed - expecting RTP start marker (StreamId: {StreamId})", streamId);
         }
     }
 

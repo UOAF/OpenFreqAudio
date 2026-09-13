@@ -1,8 +1,5 @@
 // ReSharper disable InconsistentNaming
 
-using System;
-using System.Collections.Generic;
-
 namespace OpenFreqAudio;
 
 /// <summary>The acoustic environment of the transmitting station.</summary>

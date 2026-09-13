@@ -90,7 +90,6 @@ namespace OpenFreqAudio
         private const double EarthRadius = 6378000.0; // meters
         private const double SpeedOfLight = 299792458.0; // m/s
         private const double FourPi = 12.566370614359172; // 4 * π (precomputed)
-        private const double MinimumGainDb = -60.0; // Below this, signal is completely lost
         private const double FT_TO_M = HeightPyramid.FeetToMeters; // 0.3048; pyramid stores raw int16 feet
 
         // Default radio band configurations

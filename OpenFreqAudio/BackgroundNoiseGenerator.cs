@@ -164,11 +164,9 @@ public class BackgroundNoiseGenerator
     private readonly LowPassFilter _ifI;
     private readonly LowPassFilter _ifQ;
 
-    // Σh² and (Σh²)²/Σh⁴ for the IF filter, measured from its own impulse response so
-    // that changing the design above can't silently move the noise level or the
-    // impulse duration out from under the scaling.
+    // Σh² for the IF filter, measured from its own impulse response so that changing
+    // the design above can't silently move the noise level out from under the scaling.
     private readonly double _noiseGain;
-    private readonly double _effectiveTaps;
 
     private readonly int _frequencyKhz;
     private BandNoise _band;
@@ -198,7 +196,7 @@ public class BackgroundNoiseGenerator
         double cutoff = IfBandwidthHz / 2.0 / sampleRate;
         _ifI = new LowPassFilter(cutoff, IfFilterOrder);
         _ifQ = new LowPassFilter(cutoff, IfFilterOrder);
-        _noiseGain = MeasureImpulseResponse(cutoff, IfFilterOrder, out _effectiveTaps);
+        _noiseGain = MeasureImpulseResponse(cutoff, IfFilterOrder);
 
         _frequencyKhz = frequencyKhz;
         UpdateScales();
@@ -264,22 +262,18 @@ public class BackgroundNoiseGenerator
     }
 
     /// <summary>
-    /// Run a unit impulse through a scratch copy of the IF filter to get Σh² and Σh⁴.
+    /// Run a unit impulse through a scratch copy of the IF filter to get Σh².
     /// An order-4 Butterworth at Fs/12 is long dead well inside this window.
     /// </summary>
-    private static double MeasureImpulseResponse(double cutoff, int order, out double effectiveTaps)
+    private static double MeasureImpulseResponse(double cutoff, int order)
     {
         var probe = new LowPassFilter(cutoff, order);
         double sumH2 = 0.0;
-        double sumH4 = 0.0;
         for (int n = 0; n < 4096; ++n)
         {
             double h = probe.Process(n == 0 ? 1.0f : 0.0f);
-            double h2 = h * h;
-            sumH2 += h2;
-            sumH4 += h2 * h2;
+            sumH2 += h * h;
         }
-        effectiveTaps = sumH2 * sumH2 / sumH4;
         return sumH2;
     }
 

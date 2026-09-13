@@ -2,9 +2,7 @@
 using System;
 using Avalonia.Controls;
 using Avalonia.Media;
-using Microsoft.Extensions.DependencyInjection;
 using ReactiveUI.Avalonia;
-using Serilog;
 
 namespace BMSAudioSim;
 

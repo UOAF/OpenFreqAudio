@@ -1,5 +1,3 @@
-using System;
-using System.IO;
 using System.Text;
 using Concentus.Oggfile;
 using Concentus.Structs;

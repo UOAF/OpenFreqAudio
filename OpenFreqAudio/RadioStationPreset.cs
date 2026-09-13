@@ -336,24 +336,6 @@ public static class RadioStationPresets
     // UTILITY METHODS
     // ================================================================
 
-    /// <summary>
-    /// Get all available presets
-    /// </summary>
-    public static IEnumerable<RadioStationPreset> GetAllPresets()
-    {
-        return new[]
-        {
-            // Airborne
-            AWACS, FighterF16, FighterF15, FighterGeneric, Tanker, Transport, Helicopter,
-            // Ground Military
-            GCI_LowTower, GCI_HighTower,
-            FACC_Standard, FACC_Extended,
-            GroundFAC, JTAC, TacticalVehicle,
-            // Civilian
-            ATC_Small, ATC_Major, UNICOM, FlightService
-        };
-    }
-
     // For UI bindings
     public static readonly IEnumerable<RadioStationPreset> AllPresets =
     [
@@ -366,31 +348,6 @@ public static class RadioStationPresets
         // Civilian
         ATC_Small, ATC_Major, UNICOM, FlightService
     ];
-
-    /// <summary>
-    /// Get presets filtered by category
-    /// </summary>
-    public static IEnumerable<RadioStationPreset> GetPresetsByCategory(string category)
-    {
-        return GetAllPresets().Where(p => p.Category == category);
-    }
-
-    /// <summary>
-    /// Get all unique categories
-    /// </summary>
-    public static IOrderedEnumerable<string?> GetCategories()
-    {
-        return GetAllPresets().Select(p => p.Category).Distinct().OrderBy(c => c);
-    }
-
-    /// <summary>
-    /// Find a preset by name (case-insensitive)
-    /// </summary>
-    public static RadioStationPreset? FindByName(string name)
-    {
-        return GetAllPresets().FirstOrDefault(p =>
-            p.Name != null && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-    }
     
     public static RadioStationPreset GetPresetByBmsAircraftNctr(string? aircraftNctr)
     {

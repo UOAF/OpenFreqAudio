@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 
 namespace OpenFreqAudio.TerrainSampling;

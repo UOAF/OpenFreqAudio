@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-
 namespace OpenFreqAudio.Tests
 {
     /// <summary>
