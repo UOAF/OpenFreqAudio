@@ -888,31 +888,13 @@ public class RadioPlayback : IDisposable
         }
     }
 
-    public void AddTransmittingFrequencies(IEnumerable<int> frequencies)
+    // Replaces the whole set in one step, so the DSP never snapshots it half-updated.
+    public void SetTransmittingFrequencies(IReadOnlySet<int> frequencies)
     {
         lock (_lock)
         {
-            foreach (var frequency in frequencies)
-            {
-                _transmittingFrequencies.Add(frequency);
-            }
-
-            // Log changes
-            _logger.LogDebug(_transmittingFrequencies.Count > 0
-                    ? "Now blocking: {Frequencies}"
-                    : "Not blocking any frequencies",
-                string.Join(", ", _transmittingFrequencies.Select(f => $"{f / 1000.0:F3} MHz")));
-        }
-    }
-
-    public void RemoveTransmittingFrequencies(IEnumerable<int> frequencies)
-    {
-        lock (_lock)
-        {
-            foreach (var frequency in frequencies)
-            {
-                _transmittingFrequencies.Remove(frequency);
-            }
+            _transmittingFrequencies.Clear();
+            _transmittingFrequencies.UnionWith(frequencies);
 
             // Log changes
             _logger.LogDebug(_transmittingFrequencies.Count > 0
