@@ -123,8 +123,15 @@ public class RadioPlayback : IDisposable
     /// Each slot is its own receiver — it owns the full signal-processing chain
     /// (noise, AGC, band-pass filters, squelch) as well as its output params (volume, pan).
     /// </summary>
-    private class RadioConfig
+    internal class RadioConfig
     {
+        // Which slot this is, for logs.
+        public Guid SlotId { get; init; }
+
+        // True while this slot's receiver state is non-finite and being reset,
+        // so that's logged once per run instead of every callback. DSP thread only.
+        public bool WasNonFinite { get; set; }
+
         public bool IsTuned { get; set; }
         public float Volume { get; set; } = 1.0f;
         /// <summary>Pan position: -100 = full left, 0 = center (both), +100 = full right.</summary>
@@ -158,6 +165,25 @@ public class RadioPlayback : IDisposable
 
         public FirstOrderFilter SquelchDetector =
             FirstOrderFilter.MakeFirstOrderFilter(SquelchTau, SampleRate, 1.0);
+
+        /// <summary>
+        /// False if the detectors or the band-pass have gone NaN or infinite.
+        /// Every sample passes through all four, and all four latch a bad value,
+        /// so checking once per callback catches one anywhere in it.
+        /// </summary>
+        /// <param name="output">This callback's band-passed output. The band-pass state isn't
+        /// visible, but a bad value in it shows up in the last sample.</param>
+        public bool IsFinite(ReadOnlySpan<float> output) =>
+            float.IsFinite(Agc.D1) && float.IsFinite(SquelchDetector.D1) &&
+            (output.IsEmpty || float.IsFinite(output[^1]));
+
+        public void ResetReceiver()
+        {
+            Agc.D1 = 1;
+            SquelchDetector.D1 = 1;
+            HighPass.Reset();
+            LowPass.Reset();
+        }
     }
 
 
@@ -802,7 +828,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioConfig();
+                slot = new RadioConfig { SlotId = slotId };
                 _slots[key] = slot;
             }
 
@@ -841,7 +867,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioConfig();
+                slot = new RadioConfig { SlotId = slotId };
                 _slots[key] = slot;
             }
             slot.SquelchLevel = squelchLevel;
@@ -855,7 +881,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioConfig();
+                slot = new RadioConfig { SlotId = slotId };
                 _slots[key] = slot;
             }
             slot.Volume = volume;
@@ -877,7 +903,7 @@ public class RadioPlayback : IDisposable
             var key = (frequencyKHz, slotId);
             if (!_slots.TryGetValue(key, out var slot))
             {
-                slot = new RadioConfig();
+                slot = new RadioConfig { SlotId = slotId };
                 _slots[key] = slot;
             }
             slot.Pan = Math.Clamp(pan, -100, 100);
@@ -1301,6 +1327,23 @@ public class RadioPlayback : IDisposable
                                 slot.HighPass.Process(_dspScratch[n]));
                         }
 
+                        // Catch a NaN or infinity before it reaches the shared mix, where it would take out
+                        // every radio. Silence this slot for this callback and start its receiver over.
+                        // (Don't let NaN open the squelch gate instead: that's how it would get into the mix.)
+                        if (!slot.IsFinite(_dspScratch.AsSpan(0, samples)))
+                        {
+                            if (!slot.WasNonFinite)
+                                LogNonFiniteSlot(freqKhz, slot, _dspScratch.AsSpan(0, samples), transmittingStreams);
+                            slot.WasNonFinite = true;
+                            slot.ResetReceiver();
+                            Array.Clear(_dspScratch, 0, samples);
+                            squelchOpened = false;
+                        }
+                        else
+                        {
+                            slot.WasNonFinite = false;
+                        }
+
                         if (squelchOpened != slot.WasSquelchOpen)
                         {
 #if DEBUG
@@ -1446,6 +1489,36 @@ public class RadioPlayback : IDisposable
             throw new Exception($"BASS error starting master stream playback: {Bass.LastError}");
     }
 
+
+    /// <summary>
+    /// A slot's detectors or band-pass went NaN or infinite, and are about to be reset.
+    /// Called on the DSP thread, so this takes a snapshot and logs it from the thread pool.
+    /// </summary>
+    private void LogNonFiniteSlot(int freqKhz, RadioConfig slot, ReadOnlySpan<float> output,
+        List<RadioStream> transmittingStreams)
+    {
+        var slotId = slot.SlotId;
+        float agc = slot.Agc.D1;
+        float squelchDetector = slot.SquelchDetector.D1;
+        float lastOutput = output.IsEmpty ? 0f : output[^1];
+        var transmitters = transmittingStreams.Select(s => (s.StreamId, s.CurrentParams)).ToList();
+
+        LogOffDspThread(logger => logger.LogError(
+            "Reset receiver on {Frequency:F3} MHz (slot {SlotId}) after it went non-finite: " +
+            "AGC {Agc}, squelch detector {SquelchDetector}, last output sample {LastOutput}. " +
+            "Transmitters: {Transmitters}",
+            freqKhz / 1000.0, slotId, agc, squelchDetector, lastOutput,
+            transmitters.Count == 0
+                ? "none"
+                : string.Join("; ", transmitters.Select(t => $"{t.StreamId}: {t.CurrentParams}"))));
+    }
+
+    /// <summary>
+    /// Log from the thread pool, so the DSP thread never waits on a log sink.
+    /// Each call queues work, so keep this to rare events.
+    /// </summary>
+    private void LogOffDspThread(Action<ILogger> log) =>
+        ThreadPool.QueueUserWorkItem(_ => log(_logger));
 
     /// <summary>
     /// Build one stereo recording frame (incoming as heard, with pan, + own voice rendered as
