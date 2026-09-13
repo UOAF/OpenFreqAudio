@@ -12,14 +12,13 @@ Models radio propagation over terrain and AM radio demodulation.
 
 Radio frequency propagation modeling based on ITU-R standards:
 
-- **Knife-edge diffraction** (ITU-R P.526) for terrain obstruction
-- **Two-ray ground reflection model** with curved-Earth geometry
-  - Sea surface reflections with Debye-Kirchhoff roughness
+- **Delta-Bullington terrain diffraction** (ITU-R P.526-16, ERDC/CRREL TR-22-1) for terrain obstruction
+- **Two-ray sea reflection model** with curved-Earth geometry (ITU-R P.528-5)
+  - Sea surface roughness from the Ament / Miller-Brown factor
 - **Fresnel zone clearance** for path obstruction
 - **Atmospheric refraction** using altitude-dependent refractivity (SAND2012-10690)
 - **Doppler shift** from transmitter and receiver velocities
 - **Multipath fading**: fast flutter (dropout rate) and slow deep fades
-- **Weather attenuation** (0.02 dB/km)
 
 ### Audio Processing
 
@@ -113,11 +112,22 @@ Native BASS libraries are automatically copied from `Assets/windows/` or `Assets
 
 ## Physics References
 
-- **ITU-R P.526**: Propagation by diffraction
-- **SAND2012-10690**: Radar horizon and target visibility calculations (atmospheric refraction)
-- **Debye-Kirchhoff roughness model**: Sea surface reflection attenuation
-- **Two-ray propagation model**: Ground reflection interference
-- **Fresnel zones**: Obstacle clearance and diffraction analysis
+- **ITU-R P.526-16**: Propagation by diffraction (knife-edge and smooth-Earth diffraction)
+- **ITU-R P.528-5**: A propagation prediction method for aeronautical mobile and radionavigation
+  services using the VHF, UHF and SHF bands (two-ray divergence, ray-length factor, and unity cap)
+- **ITU-R P.452-18**: Prediction procedure for the evaluation of interference between stations
+  on the surface of the Earth at frequencies above about 0.1 GHz (diffraction-corrected smooth heights)
+- **ITU-R P.372**: Radio noise (external noise level and slope)
+- **ITU-R P.676-8**: Attenuation by atmospheric gases (why gas absorption is omitted)
+- **ITU-R P.838-3**: Specific attenuation model for rain for use in prediction methods
+  (why rain attenuation is omitted)
+- **ERDC/CRREL TR-22-1**: D. J. Breton, *A Study on the Delta-Bullington Irregular Terrain
+  Radiofrequency Propagation Model* (U.S. Army ERDC, 2022)
+- **SAND2012-10690**: A. W. Doerry, *Earth Curvature and Atmospheric Refraction Effects on
+  Radar Signal Propagation* (Sandia National Laboratories, 2013)
+- **Kerr (1951)**: *Propagation of Short Radio Waves* (classic grazing-angle divergence factor)
+- **Ament; Miller & Brown**: Rough-surface specular reflection factor (sea surface roughness)
+- **ETSI ETS 300 676**: VHF aeronautical AM radio equipment (AM modulation depth)
 
 ## License
 
