@@ -49,6 +49,13 @@ public class RadioPlayback : IDisposable
     // the same threshold: 1.01 breaks/s from the AGC, 0.25/s at tau = 3 ms, none at 10 ms.
     public const double SquelchTau = 0.010;
 
+    // Real aircraft radios don't have 100% modulation.
+    // A bunch of the standards are paywalled, but those I've found
+    // suggest minimum specs are 85% modulation, with 90-95% being common.
+    // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
+    // https://avweb.com/avionics/vhf-nav-comm-basics/
+    public const double ModIndex = 0.95;
+
     private class RadioStream
     {
         public string StreamId { get; set; } = "";
@@ -248,7 +255,7 @@ public class RadioPlayback : IDisposable
     public void ClearSidetone() => _sidetoneBuffer.Clear();
 
     // --- Session capture (one combined stereo mix: incoming as heard with pan + own voice centered,
-    //     rendered as if heard from same position). The mix can be written to an Ogg Opus file
+    //     with the radio tone of OwnVoiceRadioRenderer). The mix can be written to an Ogg Opus file
     //     OR streamed to a separate playback device (e.g. a virtual cable). Exclusive in practice,
     //     but both sinks are supported independently here. ---
     private bool _recording;        // file sink active
@@ -270,24 +277,34 @@ public class RadioPlayback : IDisposable
         if (Capturing) _recordOwnVoiceBuffer.Write(samples);
     }
 
-    /// <summary>Set the radio params + transmitter ambient SFX used to render own voice. Call at TX start.</summary>
-    public void SetOwnVoiceRecordParams(AudioParams p, AmbientNoiseType ambient)
-        => _ownVoiceRenderer?.SetParams(p, ambient);
+    /// <summary>
+    /// Transmitter ambient SFX for own voice in the capture. The SFX run for the whole capture,
+    /// so set this before it starts. A capture that starts later picks up the current value.
+    /// </summary>
+    public AmbientNoiseType OwnVoiceAmbient
+    {
+        get;
+        set
+        {
+            // Under the lock, so a renderer that EnsureCaptureRenderer creates at the same time
+            // can't miss the new value.
+            lock (_lock)
+            {
+                field = value;
+                if (_ownVoiceRenderer != null) _ownVoiceRenderer.AmbientNoise = value;
+            }
+        }
+    }
 
     public bool IsRecording => _recording;
     public bool IsMonitoring => _monitoring;
     public bool IsCapturing => Capturing;
 
-    /// <summary>When false, own voice is captured clean (no radio FX/AGC/squelch). Default true.</summary>
-    public bool OwnVoiceSfxEnabled
-    {
-        get;
-        set
-        {
-            field = value;
-            if (_ownVoiceRenderer != null) _ownVoiceRenderer.ApplySfx = value;
-        }
-    } = true;
+    /// <summary>
+    /// Wet/dry blend (0..1) of the ambient SFX on own voice in the capture.
+    /// The band-pass runs at any setting, so own voice keeps the radio tone even at 0.
+    /// </summary>
+    public float OwnVoiceSfxVolume { get; set; } = 1.0f;
 
     public bool Apply3dEffects { get; set; }
 
@@ -672,7 +689,7 @@ public class RadioPlayback : IDisposable
             FastPathAudioSim.GetDefaultAudioParams(0),
             _loggerFactory.CreateLogger<OwnVoiceRadioRenderer>())
         {
-            ApplySfx = OwnVoiceSfxEnabled
+            AmbientNoise = OwnVoiceAmbient
         };
         _recordOwnVoiceBuffer.Clear();
     }
@@ -687,8 +704,8 @@ public class RadioPlayback : IDisposable
 
     /// <summary>
     /// Start recording the session to a combined stereo Ogg Opus file at <paramref name="filePath"/>.
-    /// Captures incoming audio (as heard, post-FX, with pan) plus our own voice rendered as if heard
-    /// from the same position, panned centre. No-op if already recording. Encoding runs on the
+    /// Captures incoming audio (as heard, post-FX, with pan) plus our own voice with the radio tone
+    /// (see <see cref="OwnVoiceRadioRenderer"/>), panned centre. No-op if already recording. Encoding runs on the
     /// recorder's own thread.
     /// </summary>
     public void StartRecording(string filePath)
@@ -1184,13 +1201,6 @@ public class RadioPlayback : IDisposable
 
                         var phaseStep = (TwoPi * offsetHz / SampleRate) % TwoPi;
 
-                        // Real aircraft radios don't have 100% modulation.
-                        // A bunch of the standards are paywalled, but those I've found
-                        // suggest minimum specs are 85% modulation, with 90-95% being common.
-                        // https://www.etsi.org/deliver/etsi_i_ets/300600_300699/300676/01_20_91/ets_300676e01c.pdf
-                        // https://avweb.com/avionics/vhf-nav-comm-basics/
-                        const double modIndex = 0.95;
-
                         // Even if we're past this stream's available samples
                         // (jitter buffer shenanigans make streams different lengths)
                         // still hold its carrier with no voice modulation.
@@ -1203,7 +1213,7 @@ public class RadioPlayback : IDisposable
                         for (int n = 0; n < samples; ++n)
                         {
                             var samp = n < txSamples.Length ? txSamples[n] : 0f;
-                            var amplitude = relativePower * (1 + samp * modIndex);
+                            var amplitude = relativePower * (1 + samp * ModIndex);
 
                             // Sum IQ components _before_ taking the length of the vector,
                             // as that's a nonlinear operation.
@@ -1480,8 +1490,8 @@ public class RadioPlayback : IDisposable
         ThreadPool.QueueUserWorkItem(_ => log(_logger));
 
     /// <summary>
-    /// Build one stereo recording frame (incoming as heard, with pan, + own voice rendered as
-    /// if heard from the same position and panned centre) and feed it to the encoder. Runs on
+    /// Build one stereo recording frame (incoming as heard, with pan, + own voice with the
+    /// radio tone, panned centre) and feed it to the encoder. Runs on
     /// the DSP thread; the encode itself happens on the recorder's own thread.
     /// </summary>
     private void CaptureRecordingFrame(int samples, OggOpusRecorder? recorder, int monitorStream,
@@ -1494,8 +1504,7 @@ public class RadioPlayback : IDisposable
         Array.Copy(_stereoBuffer, _recordStereo, stereo);
 
         // Own voice, rendered through the radio FX, mixed in centre. The renderer runs EVERY
-        // frame (not just when voice is present) so its noise / AGC / squelch state machine
-        // stays continuous and produces the key-down crackle and key-up squelch tail.
+        // frame (not just when voice is present) so its ambient SFX are continuous.
         if (renderer != null)
         {
             if (_ownVoiceScratch.Length < samples) _ownVoiceScratch = new float[samples];
@@ -1503,10 +1512,10 @@ public class RadioPlayback : IDisposable
             int drained = voiceAvail > 0
                 ? _recordOwnVoiceBuffer.Read(_ownVoiceScratch.AsSpan()[..voiceAvail])
                 : 0;
-            // Carrier-off remainder of the buffer (key released) → squelch tail develops.
+            // The rest of the buffer is silence (key released, or the mic is behind).
             for (int i = drained; i < samples; i++) _ownVoiceScratch[i] = 0f;
 
-            renderer.Process(_ownVoiceScratch, drained, samples, AmbientNoiseVolume);
+            renderer.Process(_ownVoiceScratch, samples, OwnVoiceSfxVolume);
 
             // Centre pan: each channel gets cos45° = sin45° ≈ 0.707, scaled by MasterVolume —
             // matches the gain staging a centre-panned, unity-volume incoming stream receives.
