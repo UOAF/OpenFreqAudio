@@ -11,7 +11,7 @@ namespace OpenFreqAudio.Tests
     /// </summary>
     public class OggOpusRecorderTests
     {
-        private const int SampleRate = RadioPlayback.SampleRate;
+        private const int SampleRate = AudioFormat.SampleRate;
         private const int Channels = 2;
         private const int SamplesPerChannel = SampleRate * 2; // 2 seconds
 

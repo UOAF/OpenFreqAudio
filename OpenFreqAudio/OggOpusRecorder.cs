@@ -17,8 +17,9 @@ namespace OpenFreqAudio;
 /// </remarks>
 internal sealed class OggOpusRecorder : IDisposable
 {
-    // 20ms @ 48kHz stereo, interleaved. Matches OpusOggWriteStream's own internal frame size.
-    private const int FrameSamplesPerChannel = RadioPlayback.SampleRate / 50;
+    // One Opus frame, stereo and interleaved. Matches OpusOggWriteStream's own internal
+    // frame size, and the frame the network path encodes and paces with.
+    private const int FrameSamplesPerChannel = AudioFormat.OpusSamplesPerFrame;
     private const int FrameFloats = FrameSamplesPerChannel * Channels;
 
     private const int Channels = 2;
@@ -48,7 +49,7 @@ internal sealed class OggOpusRecorder : IDisposable
         try
         {
 #pragma warning disable CS0618 // Do not use the factory - it does not work with Linux
-            _encoder = new OpusEncoder(RadioPlayback.SampleRate, Channels,
+            _encoder = new OpusEncoder(AudioFormat.SampleRate, Channels,
                 OpusApplication.OPUS_APPLICATION_AUDIO);
 #pragma warning restore CS0618
             // Do *not* use VOIP mode since we don't want to filter the radio FX

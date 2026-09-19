@@ -89,13 +89,13 @@ namespace OpenFreqAudio.Tests
         /// receive chain it does, and it is the thing whose peaks used to drive the gate.
         /// </summary>
         private static (double SquelchFloor, double Duty, double BreaksPerSecond)
-            RunDetectors(int freqKhz, int seed, int seconds, float gate = 2.0f)
+            RunDetectors(int freqKhz, int seed, int seconds, float gate = 1.0f)
         {
             var gen = new BackgroundNoiseGenerator(Fs, freqKhz, seed);
             var agc = AttackDecayFilter.MakeAttackDecayFilter(
                 RadioPlayback.AgcAttack, RadioPlayback.AgcDecay, Fs);
-            var squelch = FirstOrderFilter.MakeFirstOrderFilter(RadioPlayback.SquelchTau, Fs, 1.0);
-            float gatePower = gate * gate;
+            var slot = new RadioPlayback.RadioConfig { SquelchLevel = gate };
+            var (openPower, closePower) = slot.SquelchPowers();
             long total = 0, open = 0;
             int breaks = 0;
             bool wasOpen = false;
@@ -105,13 +105,12 @@ namespace OpenFreqAudio.Tests
                 gen.Next(out float i, out float q);
                 float env = MathF.Sqrt(i * i + q * q);
                 agc.Apply(env);
-                squelch.Apply(env * env);
-                bool isOpen = squelch.D1 >= gatePower;
+                bool isOpen = slot.StepSquelch(env * env, openPower, closePower);
                 if (n <= Fs) { wasOpen = isOpen; continue; } // let the detectors settle
                 if (isOpen) open++;
                 if (isOpen && !wasOpen) breaks++;
                 wasOpen = isOpen;
-                squelchSum += squelch.D1;
+                squelchSum += slot.SquelchDetector.D1;
                 total++;
             }
             return (squelchSum / total, (double)open / total, breaks / (double)(seconds - 1));
@@ -147,6 +146,9 @@ namespace OpenFreqAudio.Tests
             // SquelchTau averages over 10 ms instead, where such an impulse is worth about 1%
             // of the window. Measured over 295 s at 127 MHz: 1.01 breaks/s off the AGC,
             // 0.25/s at tau = 3 ms, none at 10 ms.
+            //
+            // SquelchReleaseTau is 2 ms and would break here, which is why it can only close
+            // the gate. This runs the whole two-detector gate to prove that separation holds.
             foreach (var khz in new[] { VhfKhz, UhfKhz, ThermalKhz })
             {
                 var run = RunDetectors(khz, seed: 2, seconds: 30);
