@@ -13,12 +13,11 @@ Models radio propagation over terrain and AM radio demodulation.
 Radio frequency propagation modeling based on ITU-R standards:
 
 - **Delta-Bullington terrain diffraction** (ITU-R P.526-16, ERDC/CRREL TR-22-1) for terrain obstruction
-- **Two-ray sea reflection model** with curved-Earth geometry (ITU-R P.528-5)
+- **Two-ray sea reflection model** with curved-Earth geometry (ITU-R P.528-5) for multipath fading over water.
   - Sea surface roughness from the Ament / Miller-Brown factor
 - **Fresnel zone clearance** for path obstruction
 - **Atmospheric refraction** using altitude-dependent refractivity (SAND2012-10690)
 - **Doppler shift** from transmitter and receiver velocities
-- **Multipath fading**: fast flutter (dropout rate) and slow deep fades
 
 ### Audio Processing
 
@@ -67,7 +66,7 @@ Demo application for testing and visualization:
 - **3D position simulation** with velocity controls
 - **Heterodyne testing**: adjustable PPM offset
 
-Allows testing of Doppler effects, terrain fading, multipath interference, and distance-dependent propagation.
+Allows testing of Doppler effects, terrain diffraction, multipath interference, and distance-dependent propagation.
 
 ### Technology Stack
 

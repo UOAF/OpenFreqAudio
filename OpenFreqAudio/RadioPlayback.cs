@@ -381,7 +381,7 @@ public class RadioPlayback : IDisposable
                 BassStreamHandle = bassStream,
                 BassMixerHandle = mixer,
                 IsPush = false,
-                RadioEffect = new RadioEffect(SampleRate, info.Channels, audioParams,
+                RadioEffect = new RadioEffect(SampleRate, info.Channels,
                         _loggerFactory.CreateLogger<RadioEffect>())
                     { AmbientNoise = ambientNoise },
                 CurrentParams = audioParams,
@@ -515,7 +515,7 @@ public class RadioPlayback : IDisposable
             FrequencyKHz = audioParams.RadioFrequencyKHz,
             BassStreamHandle = 0,
             IsPush = true,
-            RadioEffect = new RadioEffect(sampleRate, channels, audioParams,
+            RadioEffect = new RadioEffect(sampleRate, channels,
                 _loggerFactory.CreateLogger<RadioEffect>()),
             CurrentParams = audioParams,
         };
@@ -638,7 +638,6 @@ public class RadioPlayback : IDisposable
         {
             if (!_streams.TryGetValue(streamId, out var stream)) return;
             stream.CurrentParams = newParams;
-            stream.RadioEffect.Params = newParams;
         }
     }
 

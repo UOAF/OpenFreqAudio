@@ -146,10 +146,6 @@ public class BackgroundNoiseGenerator
             // (thermal is 1 by definition), but the generator normalizes whatever it
             // is handed to unit power, so the extra floor has to be reapplied
             // afterwards as an amplitude — hence the square root.
-            //
-            // The floor genuinely rises, which is what buries the voice and what lets
-            // the roar break squelch. NB: this is invisible to DropoutRate and
-            // DeepFadeRate, which FastPathAudioSim computes from ReceivedSnrDb alone.
             // The link budget is this term's right home once weather gets plumbed.
             double gain = Math.Sqrt((1.0 + impulsive) / (1.0 + external));
 

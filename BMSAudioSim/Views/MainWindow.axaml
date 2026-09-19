@@ -146,13 +146,9 @@
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
                         <TextBlock Text="Power (dBm):" FontWeight="Bold" />
-                        <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
-                        <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right">
                         <TextBlock Name="Power1Text" Text="n/a" />
-                        <TextBlock Name="Dropout1Text" Text="n/a" />
-                        <TextBlock Name="DeepFade1Text" Text="n/a" />
                     </StackPanel>
                 </Grid>
             </StackPanel>
@@ -182,13 +178,9 @@
                 <Grid ColumnDefinitions="6*,4*">
                     <StackPanel Grid.Column="0">
                         <TextBlock Text="Power (dBm):" FontWeight="Bold" />
-                        <TextBlock Text="Dropout Rate:" FontWeight="Bold" />
-                        <TextBlock Text="Deep Fade Rate:" FontWeight="Bold" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right">
                         <TextBlock Name="Power2Text" Text="n/a" />
-                        <TextBlock Name="Dropout2Text" Text="n/a" />
-                        <TextBlock Name="DeepFade2Text" Text="n/a" />
                     </StackPanel>
                 </Grid>
             </StackPanel>

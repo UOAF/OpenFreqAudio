@@ -891,12 +891,8 @@ public partial class MainWindow : ReactiveWindow<MainWindowViewModel>
         UpdateProfileGraph(audioParams1, audioParams2);
 
         Power1Text.Text = audioParams1.ReceivedDb.ToString("F1");
-        Dropout1Text.Text = audioParams1.DropoutRate.ToString();
-        DeepFade1Text.Text = audioParams1.DeepFadeRate.ToString();
 
         Power2Text.Text = audioParams2.ReceivedDb.ToString("F1");
-        Dropout2Text.Text = audioParams2.DropoutRate.ToString();
-        DeepFade2Text.Text = audioParams2.DeepFadeRate.ToString();
 
         _signal1Params = audioParams1;
         _signal2Params = audioParams2;
