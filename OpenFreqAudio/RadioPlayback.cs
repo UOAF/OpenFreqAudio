@@ -1418,25 +1418,8 @@ public class RadioPlayback : IDisposable
                 }
             }
 
-            // Peak-limit the mixed output: find the highest absolute sample,
-            // and if it would clip, scale the entire buffer down uniformly.
-            // Necessary when dealing with multiple incoming channels at once.
-            var peak = 0f;
-            for (int i = 0; i < stereoOutputSamples; ++i)
-            {
-                peak = MathF.Max(peak, MathF.Abs(_stereoBuffer[i]));
-            }
-
-            // True brickwall limiter: leave the mix alone unless a peak would clip the
-            // BASS float output (full scale ±1), then scale the whole buffer down so the
-            // loudest sample sits at ±1. No makeup boost here - headroom is what lets the
-            // per-radio volume knob (slot.Volume) and the Master Volume slider (0–200 %)
-            // actually control loudness instead of everything pinning at the clip.
-            var limitGain = peak > 1f ? 1f / peak : 1f;
-            for (var i = 0; i < stereoOutputSamples; ++i)
-            {
-                _stereoBuffer[i] = Math.Clamp(_stereoBuffer[i] * limitGain, -1f, 1f);
-            }
+            // In case several channels transmitting at once make us clip:
+            PeakLimit(_stereoBuffer.AsSpan(0, stereoOutputSamples));
 
             Marshal.Copy(_stereoBuffer, 0, bufferPtr, stereoOutputSamples);
         };
@@ -1489,6 +1472,39 @@ public class RadioPlayback : IDisposable
         ThreadPool.QueueUserWorkItem(_ => log(_logger));
 
     /// <summary>
+    /// A brickwall limiter: leave the buffer alone unless a peak would clip full scale (±1),
+    /// then scale the whole buffer down so the loudest sample sits at ±1.
+    /// No makeup boost here - headroom is what lets the per-radio volume knob (slot.Volume)
+    /// and the Master Volume slider (0–200 %) actually control loudness instead of everything
+    /// pinning at the clip.
+    /// </summary>
+    /// <remarks>
+    /// Since every sink (BASS and Opus encoders) saturates at full scale,
+    /// and saturation is nonlinear, clipping creates loud, broadband pops,
+    /// well outside our 300-3000 Hz passband. This sounds very loud by comparison
+    /// and breaks our radio illusions without this limiter.
+    /// </remarks>
+    private static void PeakLimit(Span<float> buffer)
+    {
+        var peak = 0f;
+        foreach (var sample in buffer)
+        {
+            peak = MathF.Max(peak, MathF.Abs(sample));
+        }
+
+        // A NaN peak fails this test, so a poisoned buffer goes through untouched.
+        // The non-finite check in the DSP loop catches it instead.
+        if (peak > 1f)
+        {
+            var limitGain = 1f / peak;
+            for (var i = 0; i < buffer.Length; ++i)
+            {
+                buffer[i] = Math.Clamp(buffer[i] * limitGain, -1f, 1f);
+            }
+        }
+    }
+
+    /// <summary>
     /// Build one stereo recording frame (incoming as heard, with pan, + own voice with the
     /// radio tone, panned centre) and feed it to the encoder. Runs on
     /// the DSP thread; the encode itself happens on the recorder's own thread.
@@ -1526,6 +1542,9 @@ public class RadioPlayback : IDisposable
                 _recordStereo[i * 2 + 1] += s;
             }
         }
+
+        // In case multiple RX channels plus our own voice make us clip:
+        PeakLimit(_recordStereo.AsSpan(0, stereo));
 
         // File sink: queued to the recorder's own encode thread.
         recorder?.Write(_recordStereo.AsSpan(0, stereo));
