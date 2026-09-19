@@ -26,9 +26,9 @@ public sealed class OwnVoiceRadioRenderer
     private readonly HighPassFilter _highPass;
     private readonly LowPassFilter _lowPass;
 
-    public OwnVoiceRadioRenderer(int sampleRate, AudioParams initial, ILogger logger)
+    public OwnVoiceRadioRenderer(int sampleRate, ILogger logger)
     {
-        _effect = new RadioEffect(sampleRate, 1, initial, logger);
+        _effect = new RadioEffect(sampleRate, 1, logger);
         _highPass = new HighPassFilter(300.0 / sampleRate, 3);
         _lowPass = new LowPassFilter(3000.0 / sampleRate, 6);
     }

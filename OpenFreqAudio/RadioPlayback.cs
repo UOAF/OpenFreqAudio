@@ -686,7 +686,6 @@ public class RadioPlayback : IDisposable
     {
         if (_ownVoiceRenderer != null) return;
         _ownVoiceRenderer = new OwnVoiceRadioRenderer(SampleRate,
-            FastPathAudioSim.GetDefaultAudioParams(0),
             _loggerFactory.CreateLogger<OwnVoiceRadioRenderer>())
         {
             AmbientNoise = OwnVoiceAmbient
