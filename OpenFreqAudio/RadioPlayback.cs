@@ -172,8 +172,6 @@ public class RadioPlayback : IDisposable
 
         public BackgroundNoiseGenerator? NoiseGenerator { get; set; }
 
-        public bool IsNoiseMuted { get; set; }
-
         // Regardless of our sample rate, we want to band-pass between ~300 and 3000 khz
         // to get our radio sound. Chain two filters
         // (a high-pass to remove low freqs & DC, then a low-pass).
@@ -1295,8 +1293,6 @@ public class RadioPlayback : IDisposable
                     // with its own noise, AGC, squelch, and band-pass filters.
                     foreach (var slot in tunedSlots)
                     {
-                        if (slot.IsNoiseMuted) continue;
-
                         var (squelchOpenPower, squelchClosePower) = slot.SquelchPowers();
 
                         // Noise is always there!
@@ -1423,8 +1419,6 @@ public class RadioPlayback : IDisposable
                     // Fan out the dry mix to each slot with its pan and volume.
                     foreach (var slot in tunedSlots)
                     {
-                        if (slot.IsNoiseMuted) continue;
-
                         // Drop the detectors back down so there's not sudden jumps when we
                         // turn FX back on.
                         slot.Agc.D1 = 1;
