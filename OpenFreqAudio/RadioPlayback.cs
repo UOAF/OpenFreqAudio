@@ -675,22 +675,13 @@ public class RadioPlayback : IDisposable
 
     public async Task StopStream(string streamId)
     {
-        bool shouldStopMaster = false;
-
         await Task.Run(() =>
         {
             lock (_lock)
             {
                 StopStreamInternal(streamId);
-                shouldStopMaster = ShouldStopMasterStream();
             }
         });
-
-        // Must release lock before calling StopMasterStream!
-        if (shouldStopMaster)
-        {
-            StopMasterStream();
-        }
     }
 
     private void StopStreamInternal(string streamId)
@@ -714,15 +705,6 @@ public class RadioPlayback : IDisposable
         }
 
         _streams.Remove(streamId);
-
-        // Note: Don't call StopMasterStream here - let the caller handle it
-        // since this method is called from within locks
-    }
-
-    private bool ShouldStopMasterStream()
-    {
-        bool hasTuned = _slots.Values.Any(s => s.IsTuned);
-        return _streams.Count == 0 && !hasTuned && _masterStream != 0;
     }
 
     public void UpdateStreamParams(string streamId, AudioParams newParams)
@@ -739,14 +721,17 @@ public class RadioPlayback : IDisposable
         // Always start master stream during initialization
         // This eliminates race conditions when adding streams later
         // The stream will just output silence until streams are added
+        //
+        // It then runs until StopAll, even with nothing tuned. Nothing that tunes a slot
+        // or adds a stream starts it again, so an idle stop would leave us silent.
         StartMasterStream();
         _isInitialized = true;
     }
 
     /// <summary>
     /// Restart the master stream if it is not running. No-op if already playing.
-    /// Guards against edge cases where the stream was stopped (e.g. all slots were
-    /// untuned during a shutdown) and the same RadioPlayback instance is reused on reconnect.
+    /// Guards against edge cases where the stream was stopped (e.g. a device switch
+    /// failed to restore it) and the same RadioPlayback instance is reused on reconnect.
     /// </summary>
     public void EnsureMasterStreamRunning()
     {
@@ -921,19 +906,11 @@ public class RadioPlayback : IDisposable
 
     public void UntuneFrequency(int frequencyKHz, Guid slotId)
     {
-        bool shouldStopMaster;
-
         lock (_lock)
         {
             var key = (frequencyKHz, slotId);
             if (_slots.TryGetValue(key, out var slot))
                 slot.IsTuned = false;
-            shouldStopMaster = ShouldStopMasterStream();
-        }
-
-        if (shouldStopMaster)
-        {
-            StopMasterStream();
         }
     }
 
@@ -1025,7 +1002,7 @@ public class RadioPlayback : IDisposable
         SetupDSPAndPlay();
     }
 
-    private void StopMasterStream()
+    private void StopMasterStream(string reason)
     {
         int streamToStop = 0;
         int dspHandleToRemove = 0;
@@ -1054,6 +1031,8 @@ public class RadioPlayback : IDisposable
 
             Bass.ChannelStop(streamToStop);
             Bass.StreamFree(streamToStop);
+
+            _logger.LogInformation("Master stream stopped ({Reason})", reason);
         }
     }
 
@@ -1704,7 +1683,7 @@ public class RadioPlayback : IDisposable
         }
 
         // 3. Stop master stream
-        StopMasterStream();
+        StopMasterStream("StopAll");
 
         // 4. Clear slot configs
         lock (_lock)
@@ -1755,7 +1734,7 @@ public class RadioPlayback : IDisposable
             previousDeviceIndex, newDeviceIndex);
 
         // Stop the current master stream regardless — StopMasterStream is a no-op if none running.
-        StopMasterStream();
+        StopMasterStream("switching output device");
 
         // Initialize the new device if BASS hasn't seen it yet.
         // NOTE: a device that was disconnected and reconnected still shows IsInitialized = true —
